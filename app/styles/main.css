@@ -1,0 +1,360 @@
+:root {
+    --bg: #0b0d0f;
+    --panel: #12161a;
+    --panel-2: #171c21;
+    --panel-3: #1f252b;
+    --border: #2b333b;
+    --text: #f3efe7;
+    --muted: #a6adb4;
+    --muted-2: #747d86;
+    --green: #38a169;
+    --amber: #d6a33a;
+    --red: #d45d5d;
+    --blue: #6ea8d9;
+    --shadow: 0 18px 42px rgba(0, 0, 0, 0.28);
+}
+
+.stApp {
+    background: var(--bg);
+    color: var(--text);
+}
+
+section[data-testid="stSidebar"] {
+    background: #0e1114;
+    border-right: 1px solid var(--border);
+}
+
+section[data-testid="stSidebar"] [data-testid="stMarkdownContainer"] p,
+section[data-testid="stSidebar"] span {
+    color: var(--muted);
+}
+
+.block-container {
+    padding-top: 2rem;
+    padding-bottom: 3rem;
+    max-width: 1320px;
+}
+
+h1, h2, h3, h4 {
+    color: var(--text);
+    letter-spacing: 0;
+}
+
+p, li, label {
+    color: var(--muted);
+}
+
+.eyebrow {
+    color: var(--blue);
+    font-size: 0.78rem;
+    font-weight: 700;
+    letter-spacing: 0;
+    margin-bottom: 0.35rem;
+    text-transform: uppercase;
+}
+
+.sidebar-brand {
+    border-bottom: 1px solid var(--border);
+    margin-bottom: 1rem;
+    padding: 0.35rem 0 1rem;
+}
+
+.sidebar-title {
+    color: var(--text);
+    font-size: 1.05rem;
+    font-weight: 800;
+}
+
+.sidebar-subtitle {
+    color: var(--muted);
+    font-size: 0.82rem;
+    margin-top: 0.1rem;
+}
+
+.sidebar-section-title {
+    color: var(--muted-2);
+    font-size: 0.72rem;
+    font-weight: 800;
+    margin: 1.2rem 0 0.55rem;
+    text-transform: uppercase;
+}
+
+.workflow-row {
+    align-items: flex-start;
+    background: transparent;
+    border: 1px solid transparent;
+    border-radius: 8px;
+    display: flex;
+    gap: 0.7rem;
+    margin-bottom: 0.45rem;
+    padding: 0.65rem;
+}
+
+.workflow-active {
+    background: var(--panel);
+    border-color: var(--border);
+}
+
+.workflow-index {
+    align-items: center;
+    background: var(--panel-3);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+    color: var(--text);
+    display: flex;
+    flex: 0 0 1.7rem;
+    font-size: 0.8rem;
+    font-weight: 800;
+    height: 1.7rem;
+    justify-content: center;
+}
+
+.workflow-name {
+    color: var(--text);
+    font-size: 0.9rem;
+    font-weight: 700;
+    line-height: 1.2;
+    margin-bottom: 0.35rem;
+}
+
+.status-badge {
+    border: 1px solid;
+    border-radius: 999px;
+    display: inline-flex;
+    font-size: 0.72rem;
+    font-weight: 800;
+    line-height: 1;
+    padding: 0.28rem 0.5rem;
+    text-transform: uppercase;
+    white-space: nowrap;
+}
+
+.badge-complete {
+    background: rgba(56, 161, 105, 0.14);
+    border-color: rgba(56, 161, 105, 0.4);
+    color: #7ed39d;
+}
+
+.badge-active {
+    background: rgba(110, 168, 217, 0.14);
+    border-color: rgba(110, 168, 217, 0.42);
+    color: #9dc7e9;
+}
+
+.badge-warning {
+    background: rgba(214, 163, 58, 0.14);
+    border-color: rgba(214, 163, 58, 0.45);
+    color: #e5bd68;
+}
+
+.badge-risk {
+    background: rgba(212, 93, 93, 0.14);
+    border-color: rgba(212, 93, 93, 0.45);
+    color: #ef9a9a;
+}
+
+.badge-upcoming {
+    background: rgba(166, 173, 180, 0.09);
+    border-color: rgba(166, 173, 180, 0.24);
+    color: var(--muted);
+}
+
+.sidebar-package,
+.metric-card,
+.empty-state,
+.package-summary,
+.roadmap-panel,
+.document-card {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    box-shadow: var(--shadow);
+}
+
+.sidebar-package {
+    box-shadow: none;
+    padding: 0.75rem;
+}
+
+.sidebar-package div {
+    display: flex;
+    flex-direction: column;
+    gap: 0.12rem;
+    margin-bottom: 0.55rem;
+}
+
+.sidebar-package span,
+.summary-grid span {
+    color: var(--muted-2);
+    font-size: 0.72rem;
+    font-weight: 800;
+    text-transform: uppercase;
+}
+
+.sidebar-package strong,
+.summary-grid strong {
+    color: var(--text);
+    font-size: 0.88rem;
+}
+
+.metric-card {
+    min-height: 142px;
+    padding: 1rem;
+}
+
+.metric-label {
+    color: var(--muted);
+    font-size: 0.82rem;
+    font-weight: 700;
+}
+
+.metric-value {
+    color: var(--text);
+    font-size: 2rem;
+    font-weight: 850;
+    line-height: 1.1;
+    margin-top: 0.35rem;
+}
+
+.metric-help {
+    color: var(--muted-2);
+    font-size: 0.78rem;
+    margin-top: 0.6rem;
+}
+
+.empty-state {
+    padding: 1.35rem;
+}
+
+.empty-state-title {
+    color: var(--text);
+    font-size: 1rem;
+    font-weight: 800;
+}
+
+.empty-state-body {
+    color: var(--muted);
+    margin-top: 0.3rem;
+}
+
+.package-summary {
+    margin-top: 1rem;
+    padding: 1.2rem;
+}
+
+.package-summary-header {
+    align-items: flex-start;
+    display: flex;
+    justify-content: space-between;
+    gap: 1rem;
+}
+
+.package-summary h3 {
+    margin: 0;
+}
+
+.summary-grid {
+    display: grid;
+    gap: 0.85rem;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
+    margin-top: 1rem;
+}
+
+.summary-grid div {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.18rem;
+    padding: 0.75rem;
+}
+
+.roadmap-panel {
+    display: grid;
+    gap: 0.8rem;
+    grid-template-columns: repeat(3, minmax(0, 1fr));
+    padding: 1rem;
+}
+
+.roadmap-item {
+    background: var(--panel-2);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 0.9rem;
+}
+
+.roadmap-item strong {
+    color: var(--text);
+    display: block;
+    margin-bottom: 0.35rem;
+}
+
+.roadmap-item span {
+    color: var(--muted);
+    font-size: 0.88rem;
+}
+
+.roadmap-ready {
+    border-color: rgba(56, 161, 105, 0.38);
+}
+
+.document-card {
+    box-shadow: none;
+    margin-bottom: 0.75rem;
+    padding: 1rem;
+}
+
+.document-card-title {
+    color: var(--text);
+    font-weight: 800;
+}
+
+.document-card-body {
+    color: var(--muted);
+    margin-top: 0.2rem;
+}
+
+.document-card-meta {
+    color: var(--amber);
+    font-size: 0.76rem;
+    font-weight: 800;
+    margin-top: 0.6rem;
+    text-transform: uppercase;
+}
+
+div[data-testid="stDataFrame"] {
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    overflow: hidden;
+}
+
+.stTextInput input,
+.stTextArea textarea,
+.stSelectbox [data-baseweb="select"],
+.stDateInput input {
+    background: var(--panel-2);
+    border-color: var(--border);
+    color: var(--text);
+}
+
+.stButton button,
+[data-testid="stPageLink"] a {
+    border-radius: 8px;
+    font-weight: 800;
+}
+
+hr {
+    border-color: var(--border);
+}
+
+@media (max-width: 760px) {
+    .roadmap-panel,
+    .summary-grid {
+        grid-template-columns: 1fr;
+    }
+
+    .metric-card {
+        min-height: auto;
+    }
+}

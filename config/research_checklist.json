@@ -1,0 +1,74 @@
+{
+  "profiles": {
+    "Common Equity": {
+      "required": [
+        "Latest annual filing",
+        "Latest quarterly filing",
+        "Recent material current reports",
+        "Latest earnings release",
+        "Latest earnings presentation",
+        "Investor presentation or equivalent company overview"
+      ],
+      "recommended": [
+        "Earnings transcript",
+        "Bloomberg DES",
+        "Bloomberg FA",
+        "Bloomberg ANR",
+        "Bloomberg DRSK",
+        "Sell-side research",
+        "Industry research",
+        "Historical valuation analysis",
+        "Credit research, when relevant",
+        "Activist or bearish research, when available"
+      ],
+      "optional": [
+        "ESG report",
+        "Executive compensation",
+        "Investor day materials",
+        "Rating agency report",
+        "Internal analyst notes"
+      ]
+    },
+    "Convertible Security": {
+      "additional_required": [
+        "Convertible terms",
+        "Conversion price",
+        "Conversion premium",
+        "Coupon",
+        "Maturity",
+        "Call provisions",
+        "Bond floor analysis",
+        "Equity sensitivity",
+        "Credit analysis",
+        "Up/down analysis"
+      ]
+    },
+    "Credit / Debt": {
+      "required": [
+        "Debt terms",
+        "Maturity schedule",
+        "Covenant information",
+        "Credit ratings",
+        "Liquidity analysis",
+        "Interest coverage",
+        "Recovery or downside analysis"
+      ]
+    },
+    "Other": {
+      "required": [
+        "Company overview"
+      ],
+      "recommended": [
+        "Supporting research"
+      ]
+    }
+  },
+  "statuses": [
+    "AVAILABLE",
+    "MISSING",
+    "NOT_AVAILABLE",
+    "NOT_APPLICABLE",
+    "NEEDS_REVIEW",
+    "STALE"
+  ]
+}
