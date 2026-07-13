@@ -249,9 +249,7 @@ def store_uploaded_files(
         db_path=db_path,
     )
     summary = {"uploaded": 0, "duplicated": 0, "skipped": 0, "failed": 0, "bytes": 0}
-    by_original = {candidate.original_filename: candidate for candidate in candidates}
-    for result in validations:
-        candidate = by_original[result.original_filename]
+    for result, candidate in zip(validations, candidates, strict=False):
         details = metadata_by_name.get(result.original_filename, {})
         document_id = f"DOC-UPLOAD-{secrets.token_hex(8).upper()}"
         if not result.is_valid:

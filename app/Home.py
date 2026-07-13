@@ -54,6 +54,10 @@ def _render_recent_packages() -> None:
                 for item in database.list_checklist_items(package["package_id"])
                 if item["effective_status"] in {"MISSING", "NEEDS_REVIEW", "STALE"}
             ),
+            "Latest Version": (database.latest_package_version(package["package_id"]) or {}).get("version_id", ""),
+            "Version Status": (database.latest_package_version(package["package_id"]) or {}).get("status", ""),
+            "Version Docs": (database.latest_package_version(package["package_id"]) or {}).get("document_count", ""),
+            "Last Build": (database.latest_package_version(package["package_id"]) or {}).get("created_at", ""),
             "Last Collection": package.get("last_collection_at") or "",
             "Resolution": package.get("resolution_status") or "Unresolved",
             "Research Cutoff": package["research_cutoff_date"],
@@ -82,9 +86,13 @@ def _render_roadmap() -> None:
                 <strong>Phase 3</strong>
                 <span>Manual licensed-file uploads, classification suggestions, document inventory, and research checklist review.</span>
             </div>
+            <div class="roadmap-item roadmap-ready">
+                <strong>Phase 4</strong>
+                <span>Readiness validation, manifests, inventory files, immutable versions, locking, and ZIP exports.</span>
+            </div>
             <div class="roadmap-item">
                 <strong>Future Phases</strong>
-                <span>Package ZIP generation, locking, investment analysis, PM approval, and report generation.</span>
+                <span>Document analysis, evidence extraction, investment recommendations, PM approval, and final reports.</span>
             </div>
         </div>
         """,
@@ -111,12 +119,14 @@ def main() -> None:
         metrics = package_service.get_dashboard_metrics()
         collection_metrics = database.dashboard_public_collection_metrics()
         phase3_metrics = database.phase3_dashboard_metrics()
+        phase4_metrics = database.phase4_dashboard_metrics()
     except DatabaseError:
         logger.exception("Unable to initialize dashboard metrics")
         st.error("The database could not be initialized. Check file permissions and try again.")
         metrics = {"total": 0, "draft": 0, "completed": 0, "awaiting_review": 0}
         collection_metrics = {"public_documents": 0, "resolved_packages": 0, "failed_items": 0}
         phase3_metrics = {"licensed_documents": 0, "packages_needing_review": 0, "missing_core_items": 0}
+        phase4_metrics = {"built_versions": 0, "locked_versions": 0, "packages_ready_to_build": 0, "integrity_failures": 0}
 
     metric_columns = st.columns(4)
     with metric_columns[0]:
@@ -157,6 +167,15 @@ def main() -> None:
         render_metric_card("Missing Core Items", phase3_metrics["missing_core_items"], "Required checklist items missing")
     with review_columns[2]:
         render_metric_card("Reports Awaiting Review", metrics["awaiting_review"], "Future PM review queue")
+    export_columns = st.columns(4)
+    with export_columns[0]:
+        render_metric_card("Built Versions", phase4_metrics["built_versions"], "Package export snapshots")
+    with export_columns[1]:
+        render_metric_card("Locked Versions", phase4_metrics["locked_versions"], "Immutable package corpora")
+    with export_columns[2]:
+        render_metric_card("Ready To Build", phase4_metrics["packages_ready_to_build"], "Checklist reviewed packages")
+    with export_columns[3]:
+        render_metric_card("Integrity Failures", phase4_metrics["integrity_failures"], "Build or verification failures")
 
     st.divider()
     _render_recent_packages()

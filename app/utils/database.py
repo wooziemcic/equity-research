@@ -67,6 +67,8 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase2_tables(connection)
         _ensure_document_columns(connection)
         _create_phase3_tables(connection)
+        _ensure_phase4_package_columns(connection)
+        _create_phase4_tables(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -267,6 +269,109 @@ def _create_phase3_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_audit_package_id ON audit_events (package_id)",
         "CREATE INDEX IF NOT EXISTS idx_documents_final_category ON documents (final_category_code)",
         "CREATE INDEX IF NOT EXISTS idx_documents_is_public ON documents (is_public)",
+    ):
+        connection.execute(sql)
+
+
+def _ensure_phase4_package_columns(connection: sqlite3.Connection) -> None:
+    """Add package-level checklist review fields for Phase 4."""
+    columns = _table_columns(connection, "packages")
+    additions = {
+        "checklist_reviewed": "INTEGER NOT NULL DEFAULT 0",
+        "reviewed_by": "TEXT",
+        "reviewed_timestamp": "TEXT",
+        "review_note": "TEXT",
+        "missing_core_acknowledged": "INTEGER NOT NULL DEFAULT 0",
+        "stale_documents_acknowledged": "INTEGER NOT NULL DEFAULT 0",
+        "needs_review_acknowledged": "INTEGER NOT NULL DEFAULT 0",
+    }
+    for column, definition in additions.items():
+        if column not in columns:
+            connection.execute(f"ALTER TABLE packages ADD COLUMN {column} {definition}")
+
+
+def _create_phase4_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS package_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id TEXT NOT NULL UNIQUE,
+            parent_package_id TEXT NOT NULL,
+            version_number INTEGER NOT NULL,
+            previous_version_id TEXT,
+            ticker TEXT NOT NULL,
+            company_name TEXT,
+            security_type TEXT NOT NULL,
+            research_cutoff_date TEXT NOT NULL,
+            status TEXT NOT NULL,
+            document_count INTEGER NOT NULL DEFAULT 0,
+            public_document_count INTEGER NOT NULL DEFAULT 0,
+            licensed_document_count INTEGER NOT NULL DEFAULT 0,
+            total_size_bytes INTEGER NOT NULL DEFAULT 0,
+            checklist_snapshot_json TEXT,
+            manifest_path TEXT,
+            manifest_sha256 TEXT,
+            inventory_path TEXT,
+            checklist_report_path TEXT,
+            integrity_report_path TEXT,
+            integrity_status TEXT,
+            zip_path TEXT,
+            zip_sha256 TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            locked_at TEXT,
+            notes TEXT,
+            error_message TEXT,
+            UNIQUE(parent_package_id, version_number),
+            FOREIGN KEY (parent_package_id) REFERENCES packages(package_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS package_version_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            version_id TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            original_document_id TEXT NOT NULL,
+            category TEXT,
+            title TEXT,
+            source_name TEXT,
+            source_url TEXT,
+            publication_date TEXT,
+            original_filename TEXT,
+            package_filename TEXT,
+            relative_package_path TEXT NOT NULL,
+            file_size INTEGER NOT NULL,
+            sha256_hash TEXT NOT NULL,
+            mime_type TEXT,
+            is_public INTEGER NOT NULL,
+            included_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (version_id) REFERENCES package_versions(version_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS package_version_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            event_id TEXT NOT NULL UNIQUE,
+            version_id TEXT,
+            parent_package_id TEXT NOT NULL,
+            event_type TEXT NOT NULL,
+            event_details_json TEXT,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_package_versions_parent ON package_versions (parent_package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_package_versions_status ON package_versions (status)",
+        "CREATE INDEX IF NOT EXISTS idx_package_version_documents_version ON package_version_documents (version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_package_version_events_version ON package_version_events (version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_package_version_events_parent ON package_version_events (parent_package_id)",
     ):
         connection.execute(sql)
 
@@ -1234,3 +1339,333 @@ def document_counts_for_package(
             else:
                 result["licensed"] += count
     return result
+
+
+def update_package_review_acknowledgement(
+    package_id: str,
+    *,
+    checklist_reviewed: bool,
+    reviewed_by: str,
+    review_note: str,
+    missing_core_acknowledged: bool,
+    stale_documents_acknowledged: bool,
+    needs_review_acknowledged: bool,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE packages
+            SET checklist_reviewed = ?, reviewed_by = ?, reviewed_timestamp = ?,
+                review_note = ?, missing_core_acknowledged = ?,
+                stale_documents_acknowledged = ?, needs_review_acknowledged = ?,
+                updated_at = ?
+            WHERE package_id = ?
+            """,
+            (
+                int(checklist_reviewed),
+                reviewed_by,
+                utc_now_iso(),
+                review_note,
+                int(missing_core_acknowledged),
+                int(stale_documents_acknowledged),
+                int(needs_review_acknowledged),
+                utc_now_iso(),
+                package_id,
+            ),
+        )
+    return get_package_by_package_id(package_id, db_path=db_path)
+
+
+def next_package_version_number(
+    package_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(version_number), 0) + 1 AS next_version FROM package_versions WHERE parent_package_id = ?",
+            (package_id,),
+        ).fetchone()
+    return int(row["next_version"])
+
+
+def latest_package_version(
+    package_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM package_versions
+            WHERE parent_package_id = ?
+            ORDER BY version_number DESC
+            LIMIT 1
+            """,
+            (package_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def create_package_version(
+    version: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO package_versions (
+                version_id, parent_package_id, version_number, previous_version_id,
+                ticker, company_name, security_type, research_cutoff_date, status,
+                document_count, public_document_count, licensed_document_count,
+                total_size_bytes, checklist_snapshot_json, created_by, created_at,
+                notes, error_message
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                version["version_id"],
+                version["parent_package_id"],
+                version["version_number"],
+                version.get("previous_version_id"),
+                version["ticker"],
+                version.get("company_name"),
+                version["security_type"],
+                version["research_cutoff_date"],
+                version["status"],
+                version.get("document_count", 0),
+                version.get("public_document_count", 0),
+                version.get("licensed_document_count", 0),
+                version.get("total_size_bytes", 0),
+                version.get("checklist_snapshot_json"),
+                version.get("created_by", "analyst"),
+                version.get("created_at", utc_now_iso()),
+                version.get("notes"),
+                version.get("error_message"),
+            ),
+        )
+    return get_package_version(version["version_id"], db_path=db_path) or {}
+
+
+def get_package_version(
+    version_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM package_versions WHERE version_id = ?",
+            (version_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_package_version(
+    version_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "status",
+        "document_count",
+        "public_document_count",
+        "licensed_document_count",
+        "total_size_bytes",
+        "checklist_snapshot_json",
+        "manifest_path",
+        "manifest_sha256",
+        "inventory_path",
+        "checklist_report_path",
+        "integrity_report_path",
+        "integrity_status",
+        "zip_path",
+        "zip_sha256",
+        "locked_at",
+        "notes",
+        "error_message",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_package_version(version_id, db_path=db_path)
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"UPDATE package_versions SET {sql} WHERE version_id = ?",
+            (*selected.values(), version_id),
+        )
+    return get_package_version(version_id, db_path=db_path)
+
+
+def list_package_versions(
+    package_id: str | None = None,
+    *,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM package_versions"
+    params: list[Any] = []
+    if package_id:
+        sql += " WHERE parent_package_id = ?"
+        params.append(package_id)
+    sql += " ORDER BY created_at DESC, version_number DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_package_version_document(
+    document: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO package_version_documents (
+                version_id, document_id, original_document_id, category, title,
+                source_name, source_url, publication_date, original_filename,
+                package_filename, relative_package_path, file_size, sha256_hash,
+                mime_type, is_public, included_status, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document["version_id"],
+                document["document_id"],
+                document["original_document_id"],
+                document.get("category"),
+                document.get("title"),
+                document.get("source_name"),
+                document.get("source_url"),
+                document.get("publication_date"),
+                document.get("original_filename"),
+                document.get("package_filename"),
+                document["relative_package_path"],
+                document["file_size"],
+                document["sha256_hash"],
+                document.get("mime_type"),
+                int(bool(document.get("is_public"))),
+                document.get("included_status", "INCLUDED"),
+                document.get("created_at", utc_now_iso()),
+            ),
+        )
+    return document
+
+
+def list_package_version_documents(
+    version_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM package_version_documents WHERE version_id = ? ORDER BY relative_package_path",
+            (version_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_package_version_event(
+    *,
+    event_id: str,
+    parent_package_id: str,
+    event_type: str,
+    version_id: str | None = None,
+    event_details_json: str | None = None,
+    actor: str = "analyst",
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            INSERT INTO package_version_events (
+                event_id, version_id, parent_package_id, event_type,
+                event_details_json, actor, created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event_id,
+                version_id,
+                parent_package_id,
+                event_type,
+                event_details_json,
+                actor,
+                utc_now_iso(),
+            ),
+        )
+    return {"event_id": event_id}
+
+
+def list_package_version_events(
+    package_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM package_version_events
+            WHERE parent_package_id = ?
+            ORDER BY created_at DESC
+            """,
+            (package_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def lock_package_version(
+    version_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    version = get_package_version(version_id, db_path=db_path)
+    if not version or version["status"] == "LOCKED":
+        return version
+    return update_package_version(
+        version_id,
+        {"status": "LOCKED", "locked_at": utc_now_iso()},
+        db_path=db_path,
+    )
+
+
+def phase4_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str, int]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        built = connection.execute(
+            "SELECT COUNT(*) AS count FROM package_versions WHERE status IN ('BUILT', 'LOCKED')"
+        ).fetchone()
+        locked = connection.execute(
+            "SELECT COUNT(*) AS count FROM package_versions WHERE status = 'LOCKED'"
+        ).fetchone()
+        failures = connection.execute(
+            "SELECT COUNT(*) AS count FROM package_versions WHERE integrity_status = 'FAILED' OR status = 'BUILD_FAILED'"
+        ).fetchone()
+        ready = connection.execute(
+            "SELECT COUNT(*) AS count FROM packages WHERE checklist_reviewed = 1"
+        ).fetchone()
+    return {
+        "built_versions": int(built["count"]),
+        "locked_versions": int(locked["count"]),
+        "integrity_failures": int(failures["count"]),
+        "packages_ready_to_build": int(ready["count"]),
+    }

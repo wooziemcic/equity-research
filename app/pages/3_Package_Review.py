@@ -11,6 +11,7 @@ from app.components.cards import render_empty_state
 from app.components.layout import bootstrap_page
 from app.components.sidebar import render_sidebar
 from app.services.checklist_service import coverage_summary, ensure_package_checklist, recategorize_document, set_override
+from app.services.package_builder import build_package_version, compare_versions, lock_version, validate_package_readiness
 from app.services.taxonomy import category_options
 from app.services.upload_service import remove_uploaded_document
 from app.utils import database
@@ -218,6 +219,130 @@ def _missing_panel(package: dict, items: list[dict]) -> None:
         st.caption("Use checklist actions above to mark Not Available or Not Applicable with notes.")
 
 
+def _build_package_section(package: dict) -> None:
+    st.subheader("Build Package")
+    st.caption("Working package changes remain editable. Built and locked versions are immutable snapshots.")
+    readiness = validate_package_readiness(package)
+    cols = st.columns(4)
+    cols[0].metric("Readiness", readiness.status.replace("_", " ").title())
+    cols[1].metric("Blocking Errors", len(readiness.errors))
+    cols[2].metric("Warnings", len(readiness.warnings))
+    cols[3].metric("Notices", len(readiness.notices))
+    if readiness.errors:
+        st.error("Blocking errors")
+        for error in readiness.errors:
+            st.write(f"- {error}")
+    if readiness.warnings:
+        st.warning("Warnings")
+        for warning in readiness.warnings:
+            st.write(f"- {warning}")
+    if readiness.notices:
+        st.info("Notices")
+        for notice in readiness.notices:
+            st.write(f"- {notice}")
+
+    st.write("Checklist review acknowledgement")
+    acknowledgement = st.checkbox(
+        "I reviewed the package checklist and understand that missing, stale, unavailable, or not-applicable research may affect later analysis.",
+        value=bool(package.get("checklist_reviewed")),
+    )
+    missing_ack = st.checkbox("Acknowledge missing core items", value=bool(package.get("missing_core_acknowledged")))
+    stale_ack = st.checkbox("Acknowledge stale documents or checklist items", value=bool(package.get("stale_documents_acknowledged")))
+    needs_ack = st.checkbox("Acknowledge needs-review checklist items", value=bool(package.get("needs_review_acknowledged")))
+    review_note = st.text_area("Package review note", value=package.get("review_note") or "")
+    if st.button("Save Checklist Review Acknowledgement"):
+        database.update_package_review_acknowledgement(
+            package["package_id"],
+            checklist_reviewed=acknowledgement,
+            reviewed_by="analyst",
+            review_note=review_note,
+            missing_core_acknowledged=missing_ack,
+            stale_documents_acknowledged=stale_ack,
+            needs_review_acknowledged=needs_ack,
+        )
+        database.create_package_version_event(
+            event_id=f"PVE-ACK-{package['package_id']}-{len(database.list_package_version_events(package['package_id'])) + 1}",
+            parent_package_id=package["package_id"],
+            event_type="REVIEW_ACKNOWLEDGEMENT",
+            event_details_json='{"source":"package_review"}',
+        )
+        st.success("Review acknowledgement saved.")
+        st.rerun()
+
+    notes = st.text_area("Build notes", key="build_notes")
+    if st.button("Build Package Version", type="primary", disabled=bool(readiness.errors)):
+        try:
+            version = build_package_version(package, notes=notes)
+            st.success(f"Built package version {version['version_id']}. Integrity: {version.get('integrity_status')}")
+            st.rerun()
+        except Exception as exc:
+            logger.exception("Package build failed")
+            st.error(f"Package build failed: {exc}")
+
+    _version_history(package)
+
+
+def _version_history(package: dict) -> None:
+    st.subheader("Version History")
+    versions = database.list_package_versions(package["package_id"])
+    if not versions:
+        st.info("No package versions have been built yet.")
+        return
+    st.dataframe(
+        [
+            {
+                "Version ID": version["version_id"],
+                "Status": version["status"],
+                "Created": version["created_at"],
+                "Locked": version.get("locked_at") or "",
+                "Documents": version["document_count"],
+                "Public": version["public_document_count"],
+                "Licensed": version["licensed_document_count"],
+                "Integrity": version.get("integrity_status") or "",
+                "ZIP": "Available" if version.get("zip_path") else "",
+            }
+            for version in versions
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    labels = {version["version_id"]: version for version in versions}
+    selected = st.selectbox("Selected version", options=list(labels.keys()))
+    version = labels[selected]
+    col1, col2 = st.columns(2)
+    with col1:
+        if version["status"] == config.VERSION_STATUS_BUILT and st.button("Lock Selected Version"):
+            try:
+                locked = lock_version(version["version_id"])
+                st.success(f"Locked {locked['version_id']}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+    with col2:
+        if version.get("zip_path") and Path(version["zip_path"]).exists():
+            with Path(version["zip_path"]).open("rb") as handle:
+                st.download_button(
+                    "Download ZIP",
+                    data=handle.read(),
+                    file_name=Path(version["zip_path"]).name,
+                    mime="application/zip",
+                )
+            database.create_package_version_event(
+                event_id=f"PVE-DOWNLOAD-{version['version_id']}-{len(database.list_package_version_events(package['package_id'])) + 1}",
+                parent_package_id=package["package_id"],
+                version_id=version["version_id"],
+                event_type="DOWNLOAD_REQUESTED",
+                event_details_json='{"ui":"package_review"}',
+            )
+    if len(versions) >= 2:
+        st.write("Version comparison")
+        left = st.selectbox("Compare from", options=list(labels.keys()), key="compare_left")
+        right = st.selectbox("Compare to", options=list(labels.keys()), index=1 if len(labels) > 1 else 0, key="compare_right")
+        if st.button("Compare Versions") and left != right:
+            comparison = compare_versions(left, right)
+            st.json(comparison, expanded=False)
+
+
 def main() -> None:
     bootstrap_page("Package Review")
     render_sidebar()
@@ -233,6 +358,8 @@ def main() -> None:
     _document_inventory(package)
     st.divider()
     _missing_panel(package, items)
+    st.divider()
+    _build_package_section(database.get_package_by_package_id(package["package_id"]) or package)
 
 
 if __name__ == "__main__":
