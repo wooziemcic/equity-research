@@ -1,181 +1,197 @@
 # Cutler Equity Research Workbench
 
-Cutler Research AI is an internal Streamlit workbench for creating research workspaces, collecting public documents, uploading authorized licensed materials, building locked research package versions, and processing those locked corpora into searchable cited evidence.
+Cutler Research AI is an internal Streamlit workbench for building locked research packages, processing those packages into cited evidence, and turning verified evidence into auditable investment-analysis drafts for analyst and portfolio-manager review.
 
 ## Current Status
 
-Implemented through Phase 5:
+Implemented through Phase 6:
 
-- Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and multi-page navigation.
+- Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
 - Phase 3: licensed-file uploads, classification suggestions, analyst category correction, upload history, audit events, ZIP inspection, document inventory editing, controlled deletion, and checklist review.
 - Phase 4: readiness validation, manifest generation, inventory exports, checklist snapshots, integrity reports, immutable package snapshots, ZIP generation, explicit locking, and version comparison.
-- Phase 5: closed-corpus document processing, native extraction, optional local OCR, spreadsheet-safe parsing, citation-preserving chunks, keyword retrieval, deterministic evidence extraction, citation verification, duplicate grouping, conflict detection, analyst review, and evidence/conflict exports.
+- Phase 5: closed-corpus document processing, native extraction, optional local OCR, spreadsheet-safe parsing, citation-preserving chunks, keyword retrieval, deterministic evidence extraction, citation verification, duplicate grouping, conflict detection, analyst evidence review, and exports.
+- Phase 6: deterministic financial metrics, evidence-backed scorecards, bull/base/bear scenarios, Buy/Hold/Sell/Insufficient Evidence/Analyst Review Required recommendations, analyst review, PM approval, DOCX/PDF reports, citation audits, report versioning, and report hashes.
 
-Not implemented:
+Not implemented: authentication, cloud deployment, continuous monitoring, trading integration, or external narrative-model workflows. The system does not execute trades.
 
-- Buy/Sell/Hold or Insufficient Evidence recommendations, valuation conclusions, financial-model calculations, final investment memos, PM approval, trading integration, continuous monitoring, authentication, cloud deployment, RAG over open internet, or external LLM/API extraction.
-- Buy/Sell/Hold and final investment reports begin in Phase 6.
+## Closed-Corpus Analysis Rule
 
-## Closed-Corpus Guarantee
+Phase 6 operates only on:
 
-Phase 5 only processes documents included in a selected locked package version. It does not refresh SEC, investor-relations, market-data, Bloomberg, sell-side, web, or model-memory facts during processing or retrieval.
+- A selected package version with status `LOCKED`.
+- Integrity status `VERIFIED` or `VERIFIED_WITH_WARNINGS`.
+- A completed Phase 5 processing run for that exact version.
+- Evidence records from that processing run.
 
-Every evidence record is tied to:
+The analysis pipeline does not use web search, live market data, external research, Bloomberg calls, external documents, OpenAI embeddings, or facts from model memory. Source files are hash-verified before analysis eligibility succeeds. Unsupported citations are not silently used.
 
-- A locked package version document.
-- A source locator such as page, sheet, row, line, cell range, or section.
-- Supporting source text and source-text hash.
-- A deterministic citation-verification status.
+## Evidence And Citation Foundation
 
-Unsupported evidence is not marked verified.
+Phase 5 evidence records include claim text, source text, evidence type, source document, page/sheet/row/cell/line/section locator, source-text hash, verification status, analyst status, and optional value/unit/currency/period fields.
 
-## Locked Package Versions
+Phase 6 uses verified or partially verified evidence that has not been rejected by an analyst. Evidence coverage is separate from Phase 3 package checklist coverage.
 
-The working package remains editable. A built package version is a snapshot copied into:
+## Calculation Engine
+
+Arithmetic is deterministic Python, not LLM-driven. The engine uses `Decimal` where precision matters and stores formula descriptions with source evidence IDs.
+
+Supported calculations include:
+
+- Revenue and revenue growth
+- Margin and free-cash-flow conversion
+- Cash flow
+- Cash, gross debt, net debt
+- Debt/EBITDA
+- EPS and price-target evidence
+- Reference price when present in the locked package
+- Guidance midpoint helper when package-supported low/high values exist
+
+The engine abstains with warnings when inputs are ambiguous, incompatible, cross-period, cross-currency, missing, OCR-derived with low confidence, cached-spreadsheet-dependent, or otherwise unsafe to combine.
+
+## Valuation Boundary
+
+Reference share price is used only when it appears in the locked package evidence. If no reliable package-contained reference price exists, the system does not fetch a live price or invent upside/downside. The recommendation can become `INSUFFICIENT_EVIDENCE` or `ANALYST_REVIEW_REQUIRED`.
+
+## Scorecard Methodology
+
+Scorecard profiles are versioned and stored in reviewable code configuration. Weights total 100%.
+
+Default Common Equity pillars:
+
+- Business Quality
+- Revenue and Earnings Direction
+- Profitability and Cash Flow
+- Balance Sheet and Liquidity
+- Valuation
+- Catalysts
+- Downside Risk
+- Evidence Quality
+
+Convertible and credit profiles include security-specific pillars such as bond floor, conversion premium, leverage, interest coverage, covenant risk, maturity profile, recovery/downside, and rating direction.
+
+Missing evidence receives an explicit missing-evidence score and rationale; it is not treated as neutral. Analyst overrides preserve the system score and require a rationale.
+
+## Recommendation Outcomes
+
+Recommendations are generated by transparent deterministic rules:
+
+- `BUY`
+- `HOLD`
+- `SELL`
+- `INSUFFICIENT_EVIDENCE`
+- `ANALYST_REVIEW_REQUIRED`
+
+Rules consider effective score, evidence coverage, valuation availability, package-contained upside/downside, unresolved conflicts, unsupported citations, and confidence. The system can abstain instead of forcing Hold.
+
+Every decision stores:
+
+- Preliminary rating
+- Effective rating
+- Main rationale
+- Why not Buy
+- Why not Hold
+- Why not Sell
+- Confidence
+- Evidence coverage
+- Abstention reason, when applicable
+
+## Evidence Coverage And Confidence
+
+The app tracks separate concepts:
+
+- Research Package Coverage: Phase 3 checklist completeness.
+- Evidence Coverage: material analysis areas supported by verified evidence.
+- Recommendation Confidence: verification quality, source quality, conflicts, OCR/cached input reliance, missing valuation, and review state.
+
+Confidence levels are `HIGH`, `MEDIUM`, `LOW`, and `INSUFFICIENT`.
+
+## Scenarios
+
+Bull, base, and bear scenarios use package-supported assumptions only. When price targets and reference prices exist in the package, implied values and upside/downside are shown. Otherwise valuation abstains with warnings.
+
+Scenario assumptions are labeled as package-reported, system-derived, analyst-entered, or system-abstained. Probabilities are absent until an analyst enters them, and entered probabilities must total 100%.
+
+## Analyst Review
+
+Analysts can:
+
+- Accept or change the preliminary recommendation.
+- Override scorecard items with rationale.
+- Enter scenario probabilities.
+- Add review notes.
+- Mark the analysis ready for PM review.
+
+Analyst edits do not modify original evidence or locked package files.
+
+## PM Approval
+
+PM approval is separate from package locking and analyst review. PM actions:
+
+- Approve
+- Reject
+- Return for revision
+- Add PM notes
+
+Final reports require PM approval. Approval does not execute trades.
+
+## DOCX/PDF Reports
+
+Phase 6 generates both DOCX and PDF reports. DOCX uses `python-docx`; PDF uses ReportLab and does not require Microsoft Word.
+
+Reports include:
+
+- Package version, processing run, analysis run, research cutoff
+- Closed-corpus limitation and no-trade disclaimer
+- Recommendation status and PM approval status
+- Investment conclusion and why-not explanations
+- Financial metrics and formulas
+- Scorecard
+- Bull/base/bear scenarios
+- Thesis, catalysts, and risks
+- Evidence coverage and citation audit
+- Source inventory
+- Analyst and PM review sections
+
+Reports are written under:
 
 ```text
-data/packages/<package_id>/<version_id>/
+data/reports/<version_id>/<analysis_run_id>/
 ```
 
-Only versions with status `LOCKED` and integrity `VERIFIED` or `VERIFIED_WITH_WARNINGS` can be processed. Phase 5 verifies file existence, size, and SHA-256 before reading. If a locked file is missing or mutated, processing is blocked and an audit event is recorded. Create a new package version instead of modifying a locked version.
-
-## Processing Runs
-
-Each Phase 5 run is version-level and reproducible. A new configuration creates a new processing run rather than mutating old results.
-
-Processing runs store:
-
-- Pipeline and parser configuration versions.
-- OCR, retrieval, and local embedding configuration metadata.
-- Started/completed timestamps and status.
-- Document, page, sheet, table, chunk, evidence, warning, and error counts.
-- Created-by placeholder and audit events.
-
-Statuses include `PENDING`, `RUNNING`, `COMPLETED`, `COMPLETED_WITH_WARNINGS`, `FAILED`, `CANCELLED`, and `STALE`.
-
-## Processed Storage
-
-Generated extraction artifacts are separate from immutable package snapshots:
+Example names:
 
 ```text
-data/processed/<version_id>/<processing_run_id>/
-  documents/<version_document_id>/
-    document_metadata.json
-    full_text.txt
-    pages/
-    sheets/
-    tables/
-    warnings.json
-  chunks/
-  evidence/
-  indexes/
-  run_summary.json
+QXO_Investment_Report_V001_DRAFT.docx
+QXO_Investment_Report_V002_PM_APPROVED.pdf
 ```
 
-`data/processed/` is ignored by Git. Original locked files are not modified.
+Reports are never overwritten. DOCX/PDF SHA-256 hashes are stored in SQLite.
 
-## Supported Formats
+## Citation Audit
 
-Phase 5 supports:
-
-- PDF: PyMuPDF native text first, pypdf fallback, page counts, page text, image-only classification, mixed-page warnings, and OCR-needed state.
-- DOCX: headings, paragraphs, tables, section order, and paragraph/table citations. Page numbers are not invented.
-- TXT: encoding fallback and line-range citations.
-- CSV: headers, row text, delimiter detection, row citations, and encoding capture.
-- XLSX/XLSM: sheet names, hidden state, used ranges, cell references, literal values, formula text, formula-without-cached-value warnings, cached-value warnings, external-link metadata, and macro-safe handling.
-- PNG/JPG/JPEG: metadata and optional local OCR.
-- ZIP: stored as archive-only. Contents are not processed automatically in Phase 5.
-
-## OCR Behavior
-
-OCR is disabled by default and used only as a fallback for image-only or nearly image-only content when enabled by configuration. OCR is local only, limited by `MAX_OCR_PAGES`, and records confidence when available. If OCR dependencies or the local OCR engine are unavailable, documents are marked as requiring OCR rather than sent to any external service.
-
-Low-confidence OCR-derived numeric evidence is left for analyst review.
-
-## Spreadsheet Safety
-
-Spreadsheets are read with `openpyxl`.
-
-The pipeline never:
-
-- Executes macros.
-- Refreshes formulas.
-- Uses Excel COM automation.
-- Calls Bloomberg, FactSet, Morningstar, or other add-ins.
-- Treats formula text as a calculated value.
-- Follows external links.
-
-Cell values are labeled as `LITERAL_VALUE`, `CACHED_FORMULA_VALUE`, `FORMULA_WITHOUT_CACHED_VALUE`, `EXTERNAL_LINK_VALUE`, or `UNKNOWN` where practical. Cached formula values are warned as potentially stale.
-
-## Chunking And Retrieval
-
-Chunks are deterministic and citation-preserving:
-
-- PDFs are chunked by page.
-- DOCX files keep headings and table context.
-- TXT/CSV files keep line and row locators.
-- Spreadsheets are chunked by sheet and row/cell range.
-
-Retrieval is keyword-only by default and restricted to one selected locked version and one selected processing run. It deduplicates exact repeated chunks and returns source locators with scores. Hybrid/vector metadata can be recorded, but no external embeddings are used by default.
-
-## Evidence And Citations
-
-The evidence ledger stores structured rows for company facts, revenue, growth, margin, EPS, cash flow, debt, liquidity, guidance, analyst estimates, analyst ratings, price targets, credit ratings, covenants, capital allocation, risks, legal/regulatory facts, valuation multiples, convertible terms, and other facts.
-
-Each evidence record includes claim text, evidence type, subject, metric, optional value/unit/currency/period, source text, citation locator JSON, extraction method, confidence, verification status, analyst status, and notes.
-
-Example citation forms:
-
-```text
-[QXO Q1 2026 Earnings Release, p. 4]
-[QXO Bloomberg ANR, Estimates sheet, cells F24:F30]
-[QXO Earnings Transcript, lines 412-427]
-[QXO 2025 10-K, Item 7, p. 63]
-```
-
-## Citation Verification
-
-Every deterministic extracted evidence record is verified against its cited chunk. The verifier checks that the cited source exists, the stored source text hash still matches, the source text appears in the cited region, and numeric values/periods/metric terms are supported where possible.
-
-Support statuses include:
-
-- `SUPPORTS`
-- `PARTIALLY_SUPPORTS`
-- `DOES_NOT_SUPPORT`
-- `SOURCE_MISSING`
-- `AMBIGUOUS`
-- `SOURCE_TEXT_HASH_MISMATCH`
-
-## Duplicates, Conflicts, And Review
-
-Phase 5 detects exact file duplicates, exact chunk duplicates, and near-identical text groups. Duplicate groups are shown without deleting source documents.
-
-Conflict detection surfaces value differences, unit mismatches, forecast disagreements, and GAAP/adjusted mismatches for matching subject/metric/period groupings. The app does not automatically choose a winner.
-
-Analysts can accept, reject, flag as needs review, annotate evidence, and add analyst-created evidence tied to an existing source chunk. Analyst-created evidence starts as pending verification.
+Before report generation, Phase 6 checks material thesis items for supported or partially supported citations. Draft reports may carry citation-audit warnings. Final report generation fails if unsupported material claims remain.
 
 ## Configuration
 
-Key Phase 5 settings are centralized in `app/config.py` and shown in `.env.example`:
+Key Phase 6 settings:
 
-- `MAX_PDF_PAGES`
-- `MAX_SPREADSHEET_SHEETS`
-- `MAX_SPREADSHEET_CELLS`
-- `MAX_EXTRACTED_CHARACTERS`
-- `OCR_ENABLED`
-- `MAX_OCR_PAGES`
-- `OCR_CONFIDENCE_THRESHOLD`
-- `CHUNK_SIZE`
-- `CHUNK_OVERLAP`
-- `RETRIEVAL_RESULT_COUNT`
-- `RETRIEVAL_MODE`
-- `LOCAL_EMBEDDING_MODEL`
-- `EXTERNAL_LLM_EXTRACTION_ENABLED`
-- `PROCESSING_PIPELINE_VERSION`
-- `PARSER_CONFIG_VERSION`
+- `ANALYSIS_PIPELINE_VERSION`
+- `ANALYSIS_CONFIGURATION_VERSION`
+- `SCORECARD_VERSION`
+- `VALUATION_CONFIGURATION_VERSION`
+- `REPORT_TEMPLATE_VERSION`
+- `MIN_EVIDENCE_COVERAGE`
+- `BUY_SCORE_THRESHOLD`
+- `HOLD_SCORE_THRESHOLD`
+- `SELL_SCORE_THRESHOLD`
+- `MAX_UNRESOLVED_CONFLICTS`
+- `MIN_BUY_UPSIDE`
+- `MAX_SELL_DOWNSIDE`
+- `EXTERNAL_NARRATIVE_MODEL_ENABLED`
+- `NARRATIVE_MODEL_NAME`
 
-Default operation is deterministic, keyword-only, local, and works without an API key.
+Default operation is deterministic, local, and works without an API key.
 
 ## Setup On Windows PowerShell
 
@@ -212,4 +228,4 @@ Or from any current directory:
 
 ## Known Limitations
 
-Phase 5 is evidence infrastructure, not investment judgment. OCR depends on locally installed OCR tooling. PDF table extraction is cautious and does not perform financial calculations. Retrieval is keyword-only by default. No external model, embedding, web, or market-data call is used by the Phase 5 pipeline.
+Phase 6 is a research-draft workflow for professional review. It does not independently execute investment decisions or trades. Narrative drafting remains deterministic by default; external model narrative mode is disabled unless explicitly configured. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations depend on the quality and structure of Phase 5 evidence extraction.

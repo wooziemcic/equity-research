@@ -70,6 +70,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _ensure_phase4_package_columns(connection)
         _create_phase4_tables(connection)
         _create_phase5_tables(connection)
+        _create_phase6_tables(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -610,6 +611,202 @@ def _create_phase5_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_citation_verifications_evidence ON citation_verifications (evidence_id)",
         "CREATE INDEX IF NOT EXISTS idx_duplicate_groups_run ON content_duplicate_groups (processing_run_id)",
         "CREATE INDEX IF NOT EXISTS idx_claim_conflicts_run ON claim_conflicts (processing_run_id)",
+    ):
+        connection.execute(sql)
+
+
+def _create_phase6_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            analysis_run_id TEXT NOT NULL UNIQUE,
+            package_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            analysis_configuration_version TEXT NOT NULL,
+            scorecard_version TEXT NOT NULL,
+            valuation_configuration_version TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            status TEXT NOT NULL,
+            preliminary_recommendation TEXT,
+            analyst_adjusted_recommendation TEXT,
+            pm_approved_recommendation TEXT,
+            confidence TEXT,
+            evidence_coverage REAL,
+            package_coverage REAL,
+            research_cutoff TEXT,
+            reference_price REAL,
+            reference_price_currency TEXT,
+            reference_price_date TEXT,
+            reference_price_evidence_id TEXT,
+            time_horizon TEXT,
+            analyst_notes TEXT,
+            pm_notes TEXT,
+            error_message TEXT,
+            FOREIGN KEY (version_id) REFERENCES package_versions(version_id),
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_metrics (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            metric_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            metric_code TEXT NOT NULL,
+            display_name TEXT NOT NULL,
+            value REAL,
+            unit TEXT,
+            currency TEXT,
+            period TEXT,
+            scenario TEXT,
+            calculation_method TEXT NOT NULL,
+            formula_description TEXT NOT NULL,
+            source_evidence_ids_json TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            warning TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_scorecard_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            item_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            pillar_code TEXT NOT NULL,
+            pillar_name TEXT NOT NULL,
+            score REAL NOT NULL,
+            weight REAL NOT NULL,
+            weighted_score REAL NOT NULL,
+            evidence_quality TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL,
+            rationale TEXT NOT NULL,
+            analyst_override_score REAL,
+            analyst_override_rationale TEXT,
+            effective_score REAL NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_scenarios (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            scenario_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            scenario_name TEXT NOT NULL,
+            scenario_assumptions_json TEXT NOT NULL,
+            revenue_assumption TEXT,
+            margin_assumption TEXT,
+            earnings_assumption TEXT,
+            multiple_assumption TEXT,
+            implied_value REAL,
+            reference_price REAL,
+            upside_downside REAL,
+            probability REAL,
+            evidence_ids_json TEXT NOT NULL,
+            analyst_overrides_json TEXT,
+            warnings_json TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS analysis_thesis_items (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            thesis_item_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            item_type TEXT NOT NULL,
+            claim TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL,
+            citation_status TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            analyst_status TEXT NOT NULL,
+            source_type TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_decisions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            decision_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            preliminary_rating TEXT NOT NULL,
+            effective_rating TEXT NOT NULL,
+            recommendation_rationale TEXT NOT NULL,
+            why_not_buy TEXT NOT NULL,
+            why_not_hold TEXT NOT NULL,
+            why_not_sell TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            evidence_coverage REAL NOT NULL,
+            abstention_reason TEXT,
+            generated_at TEXT NOT NULL,
+            analyst_decision TEXT,
+            analyst_identity TEXT,
+            analyst_decision_at TEXT,
+            pm_decision TEXT,
+            pm_identity TEXT,
+            pm_decision_at TEXT,
+            pm_note TEXT,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS generated_reports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            report_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            report_version INTEGER NOT NULL,
+            report_kind TEXT NOT NULL,
+            report_status TEXT NOT NULL,
+            recommendation TEXT,
+            confidence TEXT,
+            docx_path TEXT,
+            docx_sha256 TEXT,
+            pdf_path TEXT,
+            pdf_sha256 TEXT,
+            template_version TEXT NOT NULL,
+            citation_audit_status TEXT NOT NULL,
+            warnings_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id),
+            UNIQUE (analysis_run_id, report_version)
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_analysis_runs_version ON analysis_runs (version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_runs_processing ON analysis_runs (processing_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_runs_status ON analysis_runs (status)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_metrics_run ON analysis_metrics (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_scorecard_run ON analysis_scorecard_items (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_scenarios_run ON analysis_scenarios (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_analysis_thesis_run ON analysis_thesis_items (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_decisions_run ON recommendation_decisions (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_generated_reports_run ON generated_reports (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_generated_reports_version ON generated_reports (version_id)",
     ):
         connection.execute(sql)
 
@@ -2333,4 +2530,317 @@ def phase5_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str
         "completed_processing_runs": int(completed["count"]),
         "evidence_records": int(evidence["count"]),
         "claim_conflicts": int(conflicts["count"]),
+    }
+
+
+def create_analysis_run(
+    run: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    _insert_record("analysis_runs", run, db_path=db_path)
+    return get_analysis_run(run["analysis_run_id"], db_path=db_path) or run
+
+
+def get_analysis_run(
+    analysis_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM analysis_runs WHERE analysis_run_id = ?",
+            (analysis_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_analysis_run(
+    analysis_run_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "updated_at",
+        "status",
+        "preliminary_recommendation",
+        "analyst_adjusted_recommendation",
+        "pm_approved_recommendation",
+        "confidence",
+        "evidence_coverage",
+        "package_coverage",
+        "reference_price",
+        "reference_price_currency",
+        "reference_price_date",
+        "reference_price_evidence_id",
+        "time_horizon",
+        "analyst_notes",
+        "pm_notes",
+        "error_message",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_analysis_run(analysis_run_id, db_path=db_path)
+    selected.setdefault("updated_at", utc_now_iso())
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"UPDATE analysis_runs SET {sql} WHERE analysis_run_id = ?",
+            (*selected.values(), analysis_run_id),
+        )
+    return get_analysis_run(analysis_run_id, db_path=db_path)
+
+
+def list_analysis_runs(
+    version_id: str | None = None,
+    *,
+    processing_run_id: str | None = None,
+    package_id: str | None = None,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM analysis_runs"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if version_id:
+        clauses.append("version_id = ?")
+        params.append(version_id)
+    if processing_run_id:
+        clauses.append("processing_run_id = ?")
+        params.append(processing_run_id)
+    if package_id:
+        clauses.append("package_id = ?")
+        params.append(package_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_analysis_metric(metric: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("analysis_metrics", metric, db_path=db_path)
+
+
+def list_analysis_metrics(analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM analysis_metrics WHERE analysis_run_id = ? ORDER BY metric_code, period, scenario",
+            (analysis_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_scorecard_item(item: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("analysis_scorecard_items", item, db_path=db_path)
+
+
+def list_scorecard_items(analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM analysis_scorecard_items WHERE analysis_run_id = ? ORDER BY pillar_code",
+            (analysis_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_scorecard_item(
+    item_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {"analyst_override_score", "analyst_override_rationale", "effective_score", "weighted_score", "updated_at"}
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return None
+    selected.setdefault("updated_at", utc_now_iso())
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(f"UPDATE analysis_scorecard_items SET {sql} WHERE item_id = ?", (*selected.values(), item_id))
+        row = connection.execute("SELECT * FROM analysis_scorecard_items WHERE item_id = ?", (item_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def create_analysis_scenario(scenario: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("analysis_scenarios", scenario, db_path=db_path)
+
+
+def list_analysis_scenarios(analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM analysis_scenarios WHERE analysis_run_id = ? ORDER BY scenario_name",
+            (analysis_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_analysis_scenario(
+    scenario_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "scenario_assumptions_json",
+        "revenue_assumption",
+        "margin_assumption",
+        "earnings_assumption",
+        "multiple_assumption",
+        "implied_value",
+        "reference_price",
+        "upside_downside",
+        "probability",
+        "analyst_overrides_json",
+        "warnings_json",
+        "updated_at",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return None
+    selected.setdefault("updated_at", utc_now_iso())
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(f"UPDATE analysis_scenarios SET {sql} WHERE scenario_id = ?", (*selected.values(), scenario_id))
+        row = connection.execute("SELECT * FROM analysis_scenarios WHERE scenario_id = ?", (scenario_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def create_thesis_item(item: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("analysis_thesis_items", item, db_path=db_path)
+
+
+def list_thesis_items(analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM analysis_thesis_items WHERE analysis_run_id = ? ORDER BY item_type, thesis_item_id",
+            (analysis_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_recommendation_decision(decision: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    _insert_record("recommendation_decisions", decision, db_path=db_path)
+    return get_recommendation_decision(decision["analysis_run_id"], db_path=db_path) or decision
+
+
+def get_recommendation_decision(
+    analysis_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM recommendation_decisions WHERE analysis_run_id = ? ORDER BY generated_at DESC LIMIT 1",
+            (analysis_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_recommendation_decision(
+    analysis_run_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "effective_rating",
+        "analyst_decision",
+        "analyst_identity",
+        "analyst_decision_at",
+        "pm_decision",
+        "pm_identity",
+        "pm_decision_at",
+        "pm_note",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_recommendation_decision(analysis_run_id, db_path=db_path)
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"""
+            UPDATE recommendation_decisions
+            SET {sql}
+            WHERE id = (
+                SELECT id FROM recommendation_decisions
+                WHERE analysis_run_id = ?
+                ORDER BY generated_at DESC LIMIT 1
+            )
+            """,
+            (*selected.values(), analysis_run_id),
+        )
+    return get_recommendation_decision(analysis_run_id, db_path=db_path)
+
+
+def next_report_version(analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> int:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(report_version), 0) + 1 AS next_version FROM generated_reports WHERE analysis_run_id = ?",
+            (analysis_run_id,),
+        ).fetchone()
+    return int(row["next_version"])
+
+
+def create_generated_report(report: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("generated_reports", report, db_path=db_path)
+
+
+def list_generated_reports(
+    analysis_run_id: str | None = None,
+    *,
+    version_id: str | None = None,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM generated_reports"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if analysis_run_id:
+        clauses.append("analysis_run_id = ?")
+        params.append(analysis_run_id)
+    if version_id:
+        clauses.append("version_id = ?")
+        params.append(version_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC, report_version DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def phase6_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str, int]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        runs = connection.execute("SELECT COUNT(*) AS count FROM analysis_runs").fetchone()
+        approved = connection.execute("SELECT COUNT(*) AS count FROM analysis_runs WHERE status = 'PM_APPROVED'").fetchone()
+        reports = connection.execute("SELECT COUNT(*) AS count FROM generated_reports").fetchone()
+        finals = connection.execute("SELECT COUNT(*) AS count FROM generated_reports WHERE report_status = 'FINAL'").fetchone()
+    return {
+        "analysis_runs": int(runs["count"]),
+        "pm_approved_runs": int(approved["count"]),
+        "investment_reports": int(reports["count"]),
+        "final_reports": int(finals["count"]),
     }

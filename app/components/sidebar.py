@@ -105,4 +105,4 @@ def render_sidebar() -> None:
         else:
             st.info("No active package selected. Start with Company Setup to create one.")
 
-        st.caption("Phase 5 processes locked corpora for evidence only. Recommendations and final reports remain future phases.")
+        st.caption("Phase 6 adds evidence-grounded recommendations, analyst review, PM approval, and reports. No trades are executed.")

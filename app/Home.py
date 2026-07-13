@@ -94,9 +94,13 @@ def _render_roadmap() -> None:
                 <strong>Phase 5</strong>
                 <span>Closed-corpus document processing, retrieval, evidence extraction, citations, duplicates, and conflicts.</span>
             </div>
+            <div class="roadmap-item roadmap-ready">
+                <strong>Phase 6</strong>
+                <span>Deterministic investment analysis, scorecards, recommendations, analyst review, PM approval, and reports.</span>
+            </div>
             <div class="roadmap-item">
                 <strong>Future Phases</strong>
-                <span>Investment recommendations, PM approval, and final reports.</span>
+                <span>Authentication, deployment, monitoring, and integrations. Trading remains out of scope.</span>
             </div>
         </div>
         """,
@@ -125,6 +129,7 @@ def main() -> None:
         phase3_metrics = database.phase3_dashboard_metrics()
         phase4_metrics = database.phase4_dashboard_metrics()
         phase5_metrics = database.phase5_dashboard_metrics()
+        phase6_metrics = database.phase6_dashboard_metrics()
     except DatabaseError:
         logger.exception("Unable to initialize dashboard metrics")
         st.error("The database could not be initialized. Check file permissions and try again.")
@@ -133,6 +138,7 @@ def main() -> None:
         phase3_metrics = {"licensed_documents": 0, "packages_needing_review": 0, "missing_core_items": 0}
         phase4_metrics = {"built_versions": 0, "locked_versions": 0, "packages_ready_to_build": 0, "integrity_failures": 0}
         phase5_metrics = {"processing_runs": 0, "completed_processing_runs": 0, "evidence_records": 0, "claim_conflicts": 0}
+        phase6_metrics = {"analysis_runs": 0, "pm_approved_runs": 0, "investment_reports": 0, "final_reports": 0}
 
     metric_columns = st.columns(4)
     with metric_columns[0]:
@@ -191,6 +197,15 @@ def main() -> None:
         render_metric_card("Evidence Records", phase5_metrics["evidence_records"], "Cited extracted facts")
     with evidence_columns[3]:
         render_metric_card("Claim Conflicts", phase5_metrics["claim_conflicts"], "Detected evidence disagreements")
+    analysis_columns = st.columns(4)
+    with analysis_columns[0]:
+        render_metric_card("Analysis Runs", phase6_metrics["analysis_runs"], "Recommendation analysis drafts")
+    with analysis_columns[1]:
+        render_metric_card("PM Approved", phase6_metrics["pm_approved_runs"], "Approved recommendations")
+    with analysis_columns[2]:
+        render_metric_card("Investment Reports", phase6_metrics["investment_reports"], "DOCX/PDF outputs")
+    with analysis_columns[3]:
+        render_metric_card("Final Reports", phase6_metrics["final_reports"], "PM-approved final reports")
 
     st.divider()
     _render_recent_packages()

@@ -14,9 +14,13 @@ from app import config
 from app.components.cards import render_empty_state
 from app.components.layout import bootstrap_page
 from app.components.sidebar import render_sidebar
+from app.services.analysis.scenario_analysis import set_scenario_probabilities
+from app.services.analysis_pipeline import create_analysis_run, validate_analysis_eligibility
 from app.services.evidence_service import create_analyst_evidence_from_chunk, verify_evidence_record
 from app.services.evidence_taxonomy import evidence_type_options
 from app.services.processing_pipeline import run_processing_pipeline, validate_processing_eligibility
+from app.services.recommendation_engine import complete_analyst_review, override_scorecard_item, pm_decision
+from app.services.reporting.investment_report import generate_investment_report
 from app.services.retrieval_service import search_chunks
 from app.utils import database
 
@@ -472,12 +476,296 @@ def _rows_to_xlsx(rows: list[dict[str, Any]]) -> bytes:
     return output.getvalue()
 
 
+def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str, Any] | None:
+    st.subheader("Analysis Run")
+    eligibility = validate_analysis_eligibility(version["version_id"], run["processing_run_id"], record_event=False)
+    if eligibility.errors:
+        st.error("Analysis blocked")
+        for error in eligibility.errors:
+            st.write(f"- {error}")
+    if eligibility.warnings:
+        st.warning("Analysis warnings")
+        for warning in eligibility.warnings:
+            st.write(f"- {warning}")
+    if eligibility.limitations:
+        st.info("Evidence limitations")
+        for limitation in eligibility.limitations:
+            st.write(f"- {limitation}")
+    cols = st.columns([1, 1, 1])
+    cols[0].metric("Analysis Pipeline", config.ANALYSIS_PIPELINE_VERSION)
+    cols[1].metric("Scorecard", config.SCORECARD_VERSION)
+    cols[2].metric("Valuation Config", config.VALUATION_CONFIGURATION_VERSION)
+    if st.button("Create Analysis Run", type="primary", disabled=bool(eligibility.errors)):
+        try:
+            created = create_analysis_run(version["version_id"], run["processing_run_id"])
+            st.success(f"Analysis run {created['analysis_run_id']} created: {created.get('preliminary_recommendation')}")
+            st.rerun()
+        except Exception as exc:
+            logger.exception("Analysis failed")
+            st.error(f"Analysis failed: {exc}")
+    runs = database.list_analysis_runs(version["version_id"], processing_run_id=run["processing_run_id"])
+    if not runs:
+        st.info("No analysis runs for this processing run.")
+        return None
+    st.dataframe(
+        [
+            {
+                "Analysis Run": item["analysis_run_id"],
+                "Status": item["status"],
+                "Preliminary": item.get("preliminary_recommendation") or "",
+                "Analyst": item.get("analyst_adjusted_recommendation") or "",
+                "PM": item.get("pm_approved_recommendation") or "",
+                "Confidence": item.get("confidence") or "",
+                "Evidence Coverage": item.get("evidence_coverage"),
+                "Reference Price": item.get("reference_price"),
+                "Updated": item.get("updated_at"),
+            }
+            for item in runs
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    labels = {item["analysis_run_id"]: item for item in runs}
+    selected = st.selectbox("Selected analysis run", options=list(labels.keys()))
+    return labels[selected]
+
+
+def _analysis_metrics_tab(analysis_run: dict[str, Any]) -> None:
+    metrics = database.list_analysis_metrics(analysis_run["analysis_run_id"])
+    if not metrics:
+        st.info("No calculated metrics for this analysis run.")
+        return
+    st.dataframe(
+        [
+            {
+                "Metric": metric["display_name"],
+                "Value": metric.get("value"),
+                "Unit": metric.get("unit") or metric.get("currency") or "",
+                "Period": metric.get("period") or "",
+                "Method": metric["calculation_method"],
+                "Formula": metric["formula_description"],
+                "Evidence IDs": metric["source_evidence_ids_json"],
+                "Confidence": metric["confidence"],
+                "Warning": metric.get("warning") or "",
+            }
+            for metric in metrics
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def _scorecard_tab(analysis_run: dict[str, Any]) -> None:
+    items = database.list_scorecard_items(analysis_run["analysis_run_id"])
+    if not items:
+        st.info("No scorecard rows for this analysis run.")
+        return
+    st.dataframe(
+        [
+            {
+                "Pillar": item["pillar_name"],
+                "Score": item["score"],
+                "Weight": item["weight"],
+                "Weighted": item["weighted_score"],
+                "Evidence Quality": item["evidence_quality"],
+                "Effective": item["effective_score"],
+                "Override": item.get("analyst_override_score"),
+                "Rationale": item["rationale"],
+            }
+            for item in items
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    labels = {f"{item['pillar_name']} - {item['item_id']}": item for item in items}
+    selected = labels[st.selectbox("Override scorecard item", options=list(labels.keys()))]
+    score = st.number_input("Override score", min_value=0.0, max_value=10.0, value=float(selected.get("effective_score") or 0), step=0.25)
+    rationale = st.text_area("Override rationale", key="score_override_rationale")
+    if st.button("Apply Score Override"):
+        try:
+            override_scorecard_item(selected["item_id"], override_score=score, rationale=rationale)
+            st.success("Score override recorded.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _scenarios_tab(analysis_run: dict[str, Any]) -> None:
+    scenarios = database.list_analysis_scenarios(analysis_run["analysis_run_id"])
+    if not scenarios:
+        st.info("No scenarios for this analysis run.")
+        return
+    st.dataframe(
+        [
+            {
+                "Scenario": scenario["scenario_name"],
+                "Implied Value": scenario.get("implied_value"),
+                "Reference Price": scenario.get("reference_price"),
+                "Upside/Downside": scenario.get("upside_downside"),
+                "Probability": scenario.get("probability"),
+                "Evidence IDs": scenario["evidence_ids_json"],
+                "Warnings": scenario.get("warnings_json") or "[]",
+            }
+            for scenario in scenarios
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+    st.write("Scenario probabilities")
+    bear = st.number_input("Bear probability", min_value=0.0, max_value=1.0, value=float(next((s.get("probability") for s in scenarios if s["scenario_name"] == "Bear" and s.get("probability") is not None), 0.0)), step=0.05)
+    base = st.number_input("Base probability", min_value=0.0, max_value=1.0, value=float(next((s.get("probability") for s in scenarios if s["scenario_name"] == "Base" and s.get("probability") is not None), 0.0)), step=0.05)
+    bull = st.number_input("Bull probability", min_value=0.0, max_value=1.0, value=float(next((s.get("probability") for s in scenarios if s["scenario_name"] == "Bull" and s.get("probability") is not None), 0.0)), step=0.05)
+    rationale = st.text_area("Probability rationale")
+    if st.button("Save Probabilities"):
+        try:
+            set_scenario_probabilities(analysis_run["analysis_run_id"], {"Bear": bear, "Base": base, "Bull": bull}, rationale=rationale)
+            st.success("Scenario probabilities saved.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _thesis_tab(analysis_run: dict[str, Any]) -> None:
+    items = database.list_thesis_items(analysis_run["analysis_run_id"])
+    if not items:
+        st.info("No thesis items for this analysis run.")
+        return
+    st.dataframe(
+        [
+            {
+                "Type": item["item_type"],
+                "Claim": item["claim"],
+                "Evidence IDs": item["evidence_ids_json"],
+                "Citation Status": item["citation_status"],
+                "Confidence": item["confidence"],
+                "Analyst Status": item["analyst_status"],
+            }
+            for item in items
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
+
+
+def _recommendation_tab(analysis_run: dict[str, Any]) -> None:
+    decision = database.get_recommendation_decision(analysis_run["analysis_run_id"])
+    if not decision:
+        st.info("No recommendation decision for this analysis run.")
+        return
+    cols = st.columns(5)
+    cols[0].metric("Preliminary", decision["preliminary_rating"])
+    cols[1].metric("Effective", decision["effective_rating"])
+    cols[2].metric("Confidence", decision["confidence"])
+    cols[3].metric("Evidence Coverage", f"{float(decision['evidence_coverage']):.0%}")
+    cols[4].metric("Status", analysis_run["status"])
+    st.write(decision["recommendation_rationale"])
+    st.write({"Why not Buy": decision["why_not_buy"], "Why not Hold": decision["why_not_hold"], "Why not Sell": decision["why_not_sell"]})
+
+
+def _analyst_review_tab(analysis_run: dict[str, Any]) -> None:
+    decision = database.get_recommendation_decision(analysis_run["analysis_run_id"])
+    if not decision:
+        st.info("Create an analysis run before analyst review.")
+        return
+    choice = st.selectbox(
+        "Analyst recommendation",
+        options=[
+            decision["effective_rating"],
+            config.RECOMMENDATION_BUY,
+            config.RECOMMENDATION_HOLD,
+            config.RECOMMENDATION_SELL,
+            config.RECOMMENDATION_INSUFFICIENT_EVIDENCE,
+            config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED,
+        ],
+    )
+    note = st.text_area("Analyst review note", value=analysis_run.get("analyst_notes") or "")
+    if st.button("Mark Ready For PM Review"):
+        try:
+            complete_analyst_review(analysis_run["analysis_run_id"], decision=choice, note=note)
+            st.success("Analyst review completed.")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+
+
+def _pm_approval_tab(analysis_run: dict[str, Any]) -> None:
+    st.write(
+        "PM approval is separate from package locking and does not execute trades."
+    )
+    note = st.text_area("PM note", value=analysis_run.get("pm_notes") or "")
+    cols = st.columns(3)
+    for label, action in (("Approve", "APPROVE"), ("Reject", "REJECT"), ("Return For Revision", "RETURN_FOR_REVISION")):
+        if cols[["Approve", "Reject", "Return For Revision"].index(label)].button(label):
+            try:
+                pm_decision(analysis_run["analysis_run_id"], action=action, note=note)
+                st.success(f"PM action recorded: {action}.")
+                st.rerun()
+            except Exception as exc:
+                st.error(str(exc))
+
+
+def _analysis_reports_tab(analysis_run: dict[str, Any]) -> None:
+    st.write("Reports")
+    col1, col2 = st.columns(2)
+    if col1.button("Generate Draft DOCX/PDF"):
+        try:
+            report = generate_investment_report(analysis_run["analysis_run_id"], final=False)
+            st.success(f"Draft report generated: V{report['report_version']:03d}")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    if col2.button("Generate Final DOCX/PDF"):
+        try:
+            report = generate_investment_report(analysis_run["analysis_run_id"], final=True)
+            st.success(f"Final report generated: V{report['report_version']:03d}")
+            st.rerun()
+        except Exception as exc:
+            st.error(str(exc))
+    reports = database.list_generated_reports(analysis_run["analysis_run_id"])
+    if reports:
+        st.dataframe(
+            [
+                {
+                    "Version": report["report_version"],
+                    "Status": report["report_status"],
+                    "Recommendation": report.get("recommendation") or "",
+                    "Confidence": report.get("confidence") or "",
+                    "Citation Audit": report["citation_audit_status"],
+                    "DOCX Hash": (report.get("docx_sha256") or "")[:12],
+                    "PDF Hash": (report.get("pdf_sha256") or "")[:12],
+                    "Created": report["created_at"],
+                }
+                for report in reports
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
+        for report in reports:
+            cols = st.columns(2)
+            if report.get("docx_path") and Path(report["docx_path"]).exists():
+                with Path(report["docx_path"]).open("rb") as handle:
+                    cols[0].download_button(
+                        f"DOCX V{report['report_version']:03d}",
+                        data=handle.read(),
+                        file_name=Path(report["docx_path"]).name,
+                        mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                    )
+            if report.get("pdf_path") and Path(report["pdf_path"]).exists():
+                with Path(report["pdf_path"]).open("rb") as handle:
+                    cols[1].download_button(
+                        f"PDF V{report['report_version']:03d}",
+                        data=handle.read(),
+                        file_name=Path(report["pdf_path"]).name,
+                        mime="application/pdf",
+                    )
+
+
 def main() -> None:
     bootstrap_page("Investment Analysis")
     render_sidebar()
-    st.markdown('<div class="eyebrow">Phase 5</div>', unsafe_allow_html=True)
-    st.title("Evidence & Document Intelligence")
-    st.caption("Closed-corpus processing of locked package versions. Investment recommendations begin in Phase 6.")
+    st.markdown('<div class="eyebrow">Phase 6</div>', unsafe_allow_html=True)
+    st.title("Investment Analysis")
+    st.caption("Closed-corpus evidence, deterministic analysis, analyst review, PM approval, and versioned reports. No trades are executed.")
     package = _load_or_select_package()
     if not package:
         return
@@ -489,18 +777,54 @@ def main() -> None:
     if not run:
         return
     _summary(run)
-    tab_docs, tab_evidence, tab_conflicts, tab_duplicates, tab_exports = st.tabs(
-        ["Document Explorer", "Evidence Ledger", "Conflicts", "Duplicate Lineage", "Export"]
+    st.divider()
+    analysis_run = _analysis_controls(version, run)
+    tabs = st.tabs(
+        [
+            "Evidence",
+            "Financial Metrics",
+            "Scorecard",
+            "Scenarios",
+            "Bull / Bear",
+            "Recommendation",
+            "Analyst Review",
+            "PM Approval",
+            "Reports",
+            "Export",
+        ]
     )
-    with tab_docs:
-        _document_explorer(version, run)
-    with tab_evidence:
-        _evidence_ledger(version, run)
-    with tab_conflicts:
-        _conflicts(run)
-    with tab_duplicates:
-        _duplicates(run)
-    with tab_exports:
+    with tabs[0]:
+        evidence_tabs = st.tabs(["Document Explorer", "Evidence Ledger", "Conflicts", "Duplicate Lineage"])
+        with evidence_tabs[0]:
+            _document_explorer(version, run)
+        with evidence_tabs[1]:
+            _evidence_ledger(version, run)
+        with evidence_tabs[2]:
+            _conflicts(run)
+        with evidence_tabs[3]:
+            _duplicates(run)
+    if not analysis_run:
+        for tab in tabs[1:9]:
+            with tab:
+                st.info("Create an analysis run to use this section.")
+    else:
+        with tabs[1]:
+            _analysis_metrics_tab(analysis_run)
+        with tabs[2]:
+            _scorecard_tab(analysis_run)
+        with tabs[3]:
+            _scenarios_tab(analysis_run)
+        with tabs[4]:
+            _thesis_tab(analysis_run)
+        with tabs[5]:
+            _recommendation_tab(analysis_run)
+        with tabs[6]:
+            _analyst_review_tab(analysis_run)
+        with tabs[7]:
+            _pm_approval_tab(analysis_run)
+        with tabs[8]:
+            _analysis_reports_tab(analysis_run)
+    with tabs[9]:
         _exports(run)
 
 
