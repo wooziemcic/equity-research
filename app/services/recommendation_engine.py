@@ -57,10 +57,10 @@ def package_coverage(version: dict[str, Any]) -> float:
         return 0.0
     if not snapshot:
         return 0.0
-    material = [item for item in snapshot if item.get("requirement_level") in {"required", "recommended"}]
+    material = [item for item in snapshot if str(item.get("requirement_level") or "").strip().lower() in {"required", "recommended"}]
     if not material:
         return 0.0
-    available = [item for item in material if item.get("effective_status") in {"AVAILABLE", "NOT_APPLICABLE"}]
+    available = [item for item in material if str(item.get("effective_status") or "").strip().upper() in {"AVAILABLE", "NOT_APPLICABLE"}]
     return len(available) / len(material)
 
 
@@ -216,9 +216,33 @@ def generate_thesis_items(
     analysis_run_id: str,
     *,
     evidence: list[dict[str, Any]],
+    ai_review: Any | None = None,
     db_path: str | None = None,
 ) -> list[dict[str, Any]]:
     db_target = db_path or config.DATABASE_PATH
+    if config.OPENAI_REQUIRED and ai_review is None:
+        raise ValueError("OpenAI is required for thesis drafting.")
+    if ai_review is not None:
+        created: list[dict[str, Any]] = []
+        for model_item in ai_review.thesis_items:
+            records = [record for record in evidence if record["evidence_id"] in model_item.evidence_ids]
+            citation_status = config.VERIFICATION_SUPPORTS if records else config.VERIFICATION_AMBIGUOUS
+            item = {
+                "thesis_item_id": _thesis_id(),
+                "analysis_run_id": analysis_run_id,
+                "item_type": model_item.item_type,
+                "claim": model_item.claim if not model_item.abstain else "Unsupported claim was removed; the model abstained.",
+                "evidence_ids_json": json.dumps(model_item.evidence_ids, sort_keys=True),
+                "citation_status": citation_status,
+                "confidence": model_item.confidence if records else config.CONFIDENCE_INSUFFICIENT,
+                "analyst_status": config.ANALYST_STATUS_UNREVIEWED,
+                "source_type": "OPENAI_LOCKED_CORPUS" if records else None,
+                "created_at": database.utc_now_iso(),
+                "updated_at": database.utc_now_iso(),
+            }
+            database.create_thesis_item(item, db_path=db_target)
+            created.append(item)
+        return created
     created: list[dict[str, Any]] = []
     definitions = [
         ("BULL_THESIS", {"REPORTED_GROWTH", "REPORTED_REVENUE", "CATALYST", "PRICE_TARGET"}),
@@ -263,9 +287,12 @@ def generate_recommendation(
     metrics: list[dict[str, Any]],
     scorecard_items: list[dict[str, Any]],
     conflicts: list[dict[str, Any]],
+    narrative: dict[str, Any] | None = None,
     db_path: str | None = None,
 ) -> dict[str, Any]:
     db_target = db_path or config.DATABASE_PATH
+    if config.OPENAI_REQUIRED and narrative is None:
+        raise ValueError("OpenAI is required for recommendation narrative generation.")
     coverage = evidence_coverage(evidence)
     score = effective_score(scorecard_items)
     reference_prices = [metric for metric in metrics if metric.get("metric_code") == "REFERENCE_PRICE" and metric.get("value") is not None]
@@ -274,11 +301,15 @@ def generate_recommendation(
     target_price = float(price_targets[-1]["value"]) if price_targets else None
     upside = ((target_price - reference_price) / reference_price) if target_price is not None and reference_price else None
     unsupported = [item for item in evidence if item.get("verification_status") in {config.VERIFICATION_DOES_NOT_SUPPORT, config.VERIFICATION_SOURCE_MISSING, config.VERIFICATION_HASH_MISMATCH}]
+    usable = usable_evidence(evidence)
     confidence = recommendation_confidence(coverage=coverage, conflicts=conflicts, evidence=evidence, reference_price=reference_price)
     abstention_reason = None
     if unsupported:
         rating = config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED
         abstention_reason = "Unsupported or missing citations require analyst review."
+    elif not usable:
+        rating = config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+        abstention_reason = "No verified package-supported evidence is available for deterministic recommendation."
     elif coverage < config.MIN_EVIDENCE_COVERAGE:
         rating = config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED
         abstention_reason = "Evidence coverage is below the configured minimum."
@@ -300,19 +331,22 @@ def generate_recommendation(
     else:
         rating = config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
         abstention_reason = "Score and valuation evidence are not strong enough for Buy/Hold/Sell."
-    rationale = _rationale(rating, score, coverage, upside, abstention_reason)
+    narrative = narrative or {}
+    rationale = str(narrative.get("rationale") or _rationale(rating, score, coverage, upside, abstention_reason))
+    if narrative.get("conflict_explanations"):
+        rationale = f"{rationale} Conflict explanation: {narrative['conflict_explanations']}"
     decision = {
         "decision_id": _decision_id(),
         "analysis_run_id": analysis_run_id,
         "preliminary_rating": rating,
         "effective_rating": rating,
         "recommendation_rationale": rationale,
-        "why_not_buy": _why_not(config.RECOMMENDATION_BUY, rating, score, coverage, upside),
-        "why_not_hold": _why_not(config.RECOMMENDATION_HOLD, rating, score, coverage, upside),
-        "why_not_sell": _why_not(config.RECOMMENDATION_SELL, rating, score, coverage, upside),
+        "why_not_buy": str(narrative.get("why_not_buy") or _why_not(config.RECOMMENDATION_BUY, rating, score, coverage, upside)),
+        "why_not_hold": str(narrative.get("why_not_hold") or _why_not(config.RECOMMENDATION_HOLD, rating, score, coverage, upside)),
+        "why_not_sell": str(narrative.get("why_not_sell") or _why_not(config.RECOMMENDATION_SELL, rating, score, coverage, upside)),
         "confidence": confidence,
         "evidence_coverage": coverage,
-        "abstention_reason": abstention_reason,
+        "abstention_reason": narrative.get("abstention_reason") or abstention_reason,
         "generated_at": database.utc_now_iso(),
         "analyst_decision": None,
         "analyst_identity": None,

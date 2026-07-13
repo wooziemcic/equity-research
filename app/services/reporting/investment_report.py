@@ -73,6 +73,8 @@ def generate_investment_report(
     run = database.get_analysis_run(analysis_run_id, db_path=db_path)
     if not run:
         raise ValueError("Analysis run does not exist.")
+    if config.OPENAI_REQUIRED and run.get("ai_review_status") != config.AI_REVIEW_STATUS_COMPLETED:
+        raise ValueError("OpenAI analysis is required before report narrative generation.")
     if final and run.get("status") != config.ANALYSIS_STATUS_PM_APPROVED:
         raise ValueError("Final report generation requires PM approval.")
     decision = database.get_recommendation_decision(analysis_run_id, db_path=db_path)
@@ -91,6 +93,11 @@ def generate_investment_report(
                 db_path=db_path,
             )
         raise ValueError("Final report citation audit failed.")
+    existing_reports = database.list_generated_reports(analysis_run_id, db_path=db_path)
+    desired_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
+    for existing in existing_reports:
+        if existing.get("report_status") == desired_status:
+            return existing
     report_version = database.next_report_version(analysis_run_id, db_path=db_path)
     report_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
     root = _report_root(run["version_id"], analysis_run_id)

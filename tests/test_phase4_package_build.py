@@ -153,7 +153,8 @@ def test_stale_and_needs_review_require_acknowledgement(temp_db: Path) -> None:
 def test_build_version_structure_manifest_inventory_zip_and_lock(temp_db: Path) -> None:
     package = prepared_package(temp_db)
     version = build_package_version(package, notes="first build", db_path=temp_db)
-    assert version["version_id"].endswith("V001")
+    assert version["version_id"].startswith("PV-")
+    assert version["display_version"].endswith("V001")
     assert version["status"] == config.VERSION_STATUS_BUILT
     root = Path(version["manifest_path"]).parents[1]
     assert (root / "00_Package_Manifest" / "package_manifest.json").exists()
@@ -185,8 +186,9 @@ def test_second_version_and_zip_not_overwritten(temp_db: Path) -> None:
     package = prepared_package(temp_db)
     first = build_package_version(package, db_path=temp_db)
     second = build_package_version(package, db_path=temp_db)
-    assert first["version_id"].endswith("V001")
-    assert second["version_id"].endswith("V002")
+    assert first["display_version"].endswith("V001")
+    assert second["display_version"].endswith("V002")
+    assert first["version_id"] != second["version_id"]
     assert first["zip_path"] != second["zip_path"]
     assert Path(first["zip_path"]).exists()
     assert Path(second["zip_path"]).exists()

@@ -21,6 +21,7 @@ from app.services.collectors.sec_collector import (
     preview_filings,
 )
 from app.services.company_resolver import resolve_package_company
+from app.services.document_download_service import DocumentDownloadError, create_public_documents_zip, get_document_download
 from app.services.taxonomy import category_options
 from app.services.upload_service import (
     UploadCandidate,
@@ -186,7 +187,7 @@ def _sec_collection(package: dict) -> None:
     if st.button("Download Selected SEC Filings", disabled=not selected):
         summary = download_selected_filings(package, [labels[label] for label in selected])
         st.success(
-            f"SEC run complete: {summary['downloaded']} downloaded, {summary['skipped']} skipped/duplicate, {summary['failed']} failed."
+            f"SEC run complete: {summary['downloaded_now']} downloaded now, {summary['already_collected']} already collected, {summary['duplicate']} duplicate, {summary['failed']} failed, {summary['not_found']} not found."
         )
         _refresh_active_package(package["package_id"])
 
@@ -243,7 +244,7 @@ def _ir_collection(package: dict) -> None:
     if st.button("Download Selected IR Documents", disabled=not selections):
         summary = download_selected_ir_documents(package, selections)
         st.success(
-            f"IR run complete: {summary['downloaded']} downloaded, {summary['skipped']} skipped/duplicate, {summary['failed']} failed."
+            f"IR run complete: {summary['downloaded_now']} downloaded now, {summary['already_collected']} already collected, {summary['duplicate']} duplicate, {summary['failed']} failed, {summary['not_found']} not found."
         )
         _refresh_active_package(package["package_id"])
 
@@ -357,6 +358,26 @@ def _collected_documents(package: dict) -> None:
             "Preview SEC filings or discover investor-relations PDFs to begin collection.",
         )
         return
+    public_documents = [
+        doc for doc in documents
+        if int(doc.get("is_public") or 0) and doc.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED
+    ]
+    if public_documents and st.button("Download All Collected Public Files", use_container_width=True):
+        try:
+            content, filename, included, missing = create_public_documents_zip(package["package_id"])
+            st.download_button(
+                "Download Public Files ZIP",
+                data=content,
+                file_name=filename,
+                mime="application/zip",
+                use_container_width=True,
+            )
+            if missing:
+                st.warning(f"The ZIP omitted {missing} file(s) that are no longer present in managed storage.")
+            st.caption(f"Prepared {included} public file(s) from this package.")
+        except Exception as exc:
+            logger.exception("Public document ZIP failed")
+            st.error(f"Public files could not be prepared: {exc}")
     source_filter = st.multiselect(
         "Source filter",
         sorted({doc["source_name"] for doc in documents if doc.get("source_name")}),
@@ -395,6 +416,32 @@ def _collected_documents(package: dict) -> None:
         hide_index=True,
         use_container_width=True,
     )
+    for document in filtered:
+        if document.get("collection_status") != config.DOCUMENT_STATUS_DOWNLOADED:
+            continue
+        label = document.get("title") or document.get("local_filename") or document["document_id"]
+        with st.expander(f"View / Preview: {label}", expanded=False):
+            try:
+                download = get_document_download(package["package_id"], document["document_id"])
+                st.download_button(
+                    "Download",
+                    data=download.content,
+                    file_name=download.filename,
+                    mime=download.mime_type,
+                    key=f"download_collected_{document['document_id']}",
+                    use_container_width=True,
+                )
+                if download.source_url:
+                    st.link_button("Open Original Source", download.source_url, use_container_width=True)
+                if download.mime_type == "text/html":
+                    st.caption("Safe source preview")
+                    st.code(download.content[:12000].decode("utf-8", errors="replace"), language="html")
+                elif download.mime_type == "application/pdf":
+                    st.caption("PDF document. Use Download to open the original PDF file.")
+                else:
+                    st.caption(f"{download.filename} ({download.mime_type})")
+            except DocumentDownloadError as exc:
+                st.error(str(exc))
 
 
 def _collection_history(package: dict) -> None:
@@ -411,8 +458,10 @@ def _collection_history(package: dict) -> None:
                 "Completed": run.get("completed_at") or "",
                 "Status": run["status"],
                 "Discovered": run["documents_discovered"],
-                "Downloaded": run["documents_downloaded"],
-                "Skipped": run["documents_skipped"],
+                "Downloaded now": run["documents_downloaded"],
+                "Already collected": run.get("documents_already_collected", 0),
+                "Duplicate": run.get("documents_duplicated", 0),
+                "Not found": run.get("documents_not_found", 0),
                 "Failed": run["documents_failed"],
             }
             for run in runs

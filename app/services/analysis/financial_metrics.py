@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 import secrets
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation, ROUND_HALF_UP
@@ -27,17 +28,82 @@ class MetricResult:
     warning: str | None = None
 
 
+NULL_VALUE_STRINGS = {"", "null", "none", "n/a", "na", "--", "-"}
+METRIC_NAME_ALIASES = {
+    "reported_revenue": "revenue",
+    "revenue": "revenue",
+    "revenues": "revenue",
+    "sales": "revenue",
+    "net_sales": "revenue",
+    "reported_growth": "growth",
+    "growth": "growth",
+    "reported_margin": "margin",
+    "margin": "margin",
+    "reported_eps": "eps",
+    "eps": "eps",
+    "earnings_per_share": "eps",
+    "reported_cash_flow": "cash_flow",
+    "cash_flow": "cash_flow",
+    "free_cash_flow": "cash_flow",
+    "fcf": "cash_flow",
+    "reported_debt": "debt",
+    "debt": "debt",
+    "gross_debt": "debt",
+    "total_debt": "debt",
+    "reported_liquidity": "liquidity",
+    "liquidity": "liquidity",
+    "cash": "liquidity",
+    "cash_and_cash_equivalents": "liquidity",
+    "ebitda": "ebitda",
+    "adjusted_ebitda": "adjusted_ebitda",
+    "adj_ebitda": "adjusted_ebitda",
+    "price_target": "price_target",
+    "target_price": "price_target",
+    "reference_price": "reference_price",
+    "share_price": "share_price",
+    "stock_price": "stock_price",
+    "valuation_multiple": "valuation_multiple",
+    "multiple": "valuation_multiple",
+}
+EVIDENCE_TYPE_METRIC_ALIASES = {
+    "REPORTED_REVENUE": "revenue",
+    "REPORTED_GROWTH": "growth",
+    "REPORTED_MARGIN": "margin",
+    "REPORTED_EPS": "eps",
+    "REPORTED_CASH_FLOW": "cash_flow",
+    "REPORTED_DEBT": "debt",
+    "REPORTED_LIQUIDITY": "liquidity",
+    "PRICE_TARGET": "price_target",
+    "VALUATION_MULTIPLE": "valuation_multiple",
+}
+
+
 def _metric_id() -> str:
     return f"MET-{secrets.token_hex(8).upper()}"
 
 
 def decimal_or_none(value: Any) -> Decimal | None:
-    if value is None or value == "":
+    if value is None:
+        return None
+    if isinstance(value, Decimal):
+        return value
+    if isinstance(value, int | float):
+        return Decimal(str(value))
+    text = str(value).strip()
+    if text.lower() in NULL_VALUE_STRINGS:
+        return None
+    negative = text.startswith("(") and text.endswith(")")
+    text = text.strip("()").strip()
+    text = text.replace("$", "").replace(",", "").replace("%", "")
+    text = re.sub(r"(?i)\b(usd|eur|gbp|cad|aud|dollars?)\b", "", text)
+    match = re.search(r"[-+]?\d+(?:\.\d+)?", text)
+    if not match:
         return None
     try:
-        return Decimal(str(value).replace(",", ""))
+        parsed = Decimal(match.group(0))
     except (InvalidOperation, ValueError):
         return None
+    return -abs(parsed) if negative else parsed
 
 
 def quantize(value: Decimal | None, places: str = "0.01") -> Decimal | None:
@@ -47,22 +113,35 @@ def quantize(value: Decimal | None, places: str = "0.01") -> Decimal | None:
 
 
 def scale_multiplier(unit: str | None) -> Decimal:
-    normalized = (unit or "").lower()
-    if normalized in {"billion", "bn", "b"}:
+    normalized = (unit or "").strip().lower()
+    if normalized in {"billion", "billions", "bn", "b"}:
         return Decimal("1000000000")
-    if normalized in {"million", "mm", "m"}:
+    if normalized in {"million", "millions", "mm", "m"}:
         return Decimal("1000000")
-    if normalized in {"thousand", "k"}:
+    if normalized in {"thousand", "thousands", "k"}:
         return Decimal("1000")
     return Decimal("1")
+
+
+def _unit_from_value_text(value: Any) -> str | None:
+    text = str(value or "").lower()
+    if "%" in text or "percent" in text:
+        return "%"
+    if re.search(r"\b(billion|billions|bn)\b", text):
+        return "billion"
+    if re.search(r"\b(million|millions|mm)\b", text):
+        return "million"
+    if re.search(r"\b(thousand|thousands)\b", text):
+        return "thousand"
+    return None
 
 
 def normalized_value(evidence: dict[str, Any]) -> Decimal | None:
     value = decimal_or_none(evidence.get("value"))
     if value is None:
         return None
-    unit = evidence.get("unit")
-    if unit == "%":
+    unit = evidence.get("unit") or _unit_from_value_text(evidence.get("value"))
+    if str(unit or "").strip().lower() in {"%", "percent"}:
         return value / Decimal("100")
     return value * scale_multiplier(unit)
 
@@ -90,23 +169,81 @@ def usable_evidence(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     ]
 
 
+def _normalize_metric_token(value: Any) -> str:
+    normalized = re.sub(r"[^a-z0-9]+", "_", str(value or "").strip().lower()).strip("_")
+    return METRIC_NAME_ALIASES.get(normalized, normalized)
+
+
+def _record_metric_key(record: dict[str, Any]) -> str:
+    metric = _normalize_metric_token(record.get("metric_name"))
+    if metric and metric != "numeric_fact":
+        return metric
+    evidence_type = str(record.get("evidence_type") or "").strip().upper()
+    return EVIDENCE_TYPE_METRIC_ALIASES.get(evidence_type, metric)
+
+
 def _first_by_metric(records: list[dict[str, Any]], metric_names: set[str], period: str | None = None) -> dict[str, Any] | None:
+    normalized_names = {_normalize_metric_token(name) for name in metric_names}
     candidates = [
         record
         for record in records
-        if (record.get("metric_name") or "").lower() in metric_names
-        and record.get("value") is not None
+        if _record_metric_key(record) in normalized_names
+        and normalized_value(record) is not None
         and (period is None or (record.get("period") or "") == period)
     ]
     return candidates[0] if candidates else None
 
 
 def _records_by_metric(records: list[dict[str, Any]], metric_names: set[str]) -> list[dict[str, Any]]:
+    normalized_names = {_normalize_metric_token(name) for name in metric_names}
     return [
         record
         for record in records
-        if (record.get("metric_name") or "").lower() in metric_names and record.get("value") is not None
+        if _record_metric_key(record) in normalized_names and normalized_value(record) is not None
     ]
+
+
+def metric_input_summary(records: list[dict[str, Any]]) -> dict[str, int]:
+    summary: dict[str, int] = {}
+    for record in records:
+        key = _record_metric_key(record)
+        if not key:
+            continue
+        suffix = "_numeric" if normalized_value(record) is not None else "_non_numeric"
+        summary[f"{key}{suffix}"] = summary.get(f"{key}{suffix}", 0) + 1
+    return dict(sorted(summary.items()))
+
+
+def diagnose_metric_skips(records: list[dict[str, Any]], metrics: list[dict[str, Any]] | None = None) -> list[dict[str, str]]:
+    calculated = {
+        metric.get("metric_code")
+        for metric in metrics or []
+        if metric.get("metric_code") and metric.get("value") is not None
+    }
+    skipped: list[dict[str, str]] = []
+
+    def add(metric_code: str, reason: str) -> None:
+        if metric_code not in calculated:
+            skipped.append({"metric_code": metric_code, "reason": reason})
+
+    revenue_records = _records_by_metric(records, {"revenue"})
+    if not revenue_records:
+        add("REVENUE", "No usable numeric revenue evidence was discovered.")
+    if len({record.get("period") for record in revenue_records if record.get("period")}) < 2:
+        add("REVENUE_GROWTH_CALCULATED", "Fewer than two revenue periods with usable numeric values were discovered.")
+    if not _records_by_metric(records, {"reference_price", "share_price", "stock_price"}):
+        add("REFERENCE_PRICE", "No package-contained numeric reference price evidence was discovered.")
+    if not _records_by_metric(records, {"price_target"}):
+        add("PRICE_TARGET", "No package-contained numeric price target evidence was discovered.")
+
+    periods = sorted({record.get("period") for record in records if record.get("period")})
+    if not any(_first_by_metric(records, {"revenue"}, period) and _first_by_metric(records, {"cash_flow"}, period) for period in periods):
+        add("FCF_CONVERSION", "No same-period revenue and cash-flow evidence pair was discovered.")
+    if not any(_first_by_metric(records, {"debt"}, period) and _first_by_metric(records, {"liquidity"}, period) for period in periods):
+        add("NET_DEBT", "No same-period debt and cash/liquidity evidence pair was discovered.")
+    if not any(_first_by_metric(records, {"debt"}, period) and _first_by_metric(records, {"ebitda", "adjusted_ebitda"}, period) for period in periods):
+        add("DEBT_TO_EBITDA", "No same-period debt and EBITDA evidence pair was discovered.")
+    return skipped
 
 
 def calculate_revenue_growth(current: dict[str, Any], prior: dict[str, Any]) -> MetricResult:

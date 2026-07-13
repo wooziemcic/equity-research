@@ -10,3 +10,6 @@ data/packages/
 data/reports/
 data/cache/
 *.db-journal
+
+.env
+.streamlit/secrets.toml

@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import hashlib
 import logging
+import secrets
 import sqlite3
+import uuid
 from contextlib import contextmanager
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any, Iterator
+from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
 from app.config import DATABASE_PATH, ensure_directories
 
@@ -26,11 +30,14 @@ def get_connection(db_path: Path | str = DATABASE_PATH) -> Iterator[sqlite3.Conn
     """Open a SQLite connection with row dictionaries enabled."""
     path = Path(db_path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    connection = sqlite3.connect(path)
+    connection = sqlite3.connect(path, timeout=30)
     connection.row_factory = sqlite3.Row
     try:
         yield connection
         connection.commit()
+    except sqlite3.IntegrityError:
+        connection.rollback()
+        raise
     except sqlite3.Error as exc:
         connection.rollback()
         logger.exception("SQLite operation failed")
@@ -65,12 +72,15 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         connection.execute("CREATE INDEX IF NOT EXISTS idx_packages_status ON packages (status)")
         _ensure_package_columns(connection)
         _create_phase2_tables(connection)
+        _ensure_collection_run_columns(connection)
         _ensure_document_columns(connection)
         _create_phase3_tables(connection)
         _ensure_phase4_package_columns(connection)
         _create_phase4_tables(connection)
+        _ensure_phase4_version_columns(connection)
         _create_phase5_tables(connection)
         _create_phase6_tables(connection)
+        _create_phase7_tables(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -111,6 +121,7 @@ def _create_phase2_tables(connection: sqlite3.Connection) -> None:
             source_name TEXT NOT NULL,
             source_url TEXT NOT NULL,
             source_domain TEXT,
+            source_identity_key TEXT,
             accession_number TEXT,
             form_type TEXT,
             publication_date TEXT,
@@ -143,6 +154,9 @@ def _create_phase2_tables(connection: sqlite3.Connection) -> None:
             documents_discovered INTEGER NOT NULL DEFAULT 0,
             documents_downloaded INTEGER NOT NULL DEFAULT 0,
             documents_skipped INTEGER NOT NULL DEFAULT 0,
+            documents_already_collected INTEGER NOT NULL DEFAULT 0,
+            documents_duplicated INTEGER NOT NULL DEFAULT 0,
+            documents_not_found INTEGER NOT NULL DEFAULT 0,
             documents_failed INTEGER NOT NULL DEFAULT 0,
             error_summary TEXT,
             FOREIGN KEY (package_id) REFERENCES packages(package_id)
@@ -184,12 +198,30 @@ def _ensure_document_columns(connection: sqlite3.Connection) -> None:
         "authorization_confirmed": "INTEGER NOT NULL DEFAULT 0",
         "upload_status": "TEXT",
         "archive_origin_document_id": "TEXT",
+        "source_identity_key": "TEXT",
         "deleted_at": "TEXT",
         "deleted_by": "TEXT",
     }
     for column, definition in additions.items():
         if column not in columns:
             connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_documents_source_identity ON documents (source_identity_key)")
+    connection.execute(
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_documents_package_source_identity_current
+        ON documents(package_id, source_identity_key)
+        WHERE source_identity_key IS NOT NULL
+          AND collection_status IN ('DISCOVERED', 'DOWNLOADED')
+        """
+    )
+
+
+def _ensure_collection_run_columns(connection: sqlite3.Connection) -> None:
+    """Add distinct collection result counters without rewriting history."""
+    columns = _table_columns(connection, "collection_runs")
+    for column in ("documents_already_collected", "documents_duplicated", "documents_not_found"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE collection_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
 
 
 def _create_phase3_tables(connection: sqlite3.Connection) -> None:
@@ -298,6 +330,7 @@ def _create_phase4_tables(connection: sqlite3.Connection) -> None:
         CREATE TABLE IF NOT EXISTS package_versions (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             version_id TEXT NOT NULL UNIQUE,
+            display_version TEXT NOT NULL,
             parent_package_id TEXT NOT NULL,
             version_number INTEGER NOT NULL,
             previous_version_id TEXT,
@@ -371,11 +404,33 @@ def _create_phase4_tables(connection: sqlite3.Connection) -> None:
     for sql in (
         "CREATE INDEX IF NOT EXISTS idx_package_versions_parent ON package_versions (parent_package_id)",
         "CREATE INDEX IF NOT EXISTS idx_package_versions_status ON package_versions (status)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_package_versions_parent_number ON package_versions (parent_package_id, version_number)",
         "CREATE INDEX IF NOT EXISTS idx_package_version_documents_version ON package_version_documents (version_id)",
         "CREATE INDEX IF NOT EXISTS idx_package_version_events_version ON package_version_events (version_id)",
         "CREATE INDEX IF NOT EXISTS idx_package_version_events_parent ON package_version_events (parent_package_id)",
     ):
         connection.execute(sql)
+
+
+def _ensure_phase4_version_columns(connection: sqlite3.Connection) -> None:
+    """Add the human-readable version label while preserving existing rows."""
+    columns = _table_columns(connection, "package_versions")
+    if "display_version" not in columns:
+        connection.execute("ALTER TABLE package_versions ADD COLUMN display_version TEXT")
+    rows = connection.execute(
+        "SELECT version_id, ticker, research_cutoff_date, version_number FROM package_versions WHERE display_version IS NULL OR display_version = ''"
+    ).fetchall()
+    for row in rows:
+        ticker = "".join(character if character.isalnum() else "-" for character in str(row["ticker"] or "").upper()).strip("-") or "PACKAGE"
+        cutoff = str(row["research_cutoff_date"] or "").replace("-", "")
+        display_version = f"{ticker}-{cutoff}-V{int(row['version_number']):03d}"
+        connection.execute(
+            "UPDATE package_versions SET display_version = ? WHERE version_id = ?",
+            (display_version, row["version_id"]),
+        )
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_package_versions_parent_number ON package_versions (parent_package_id, version_number)"
+    )
 
 
 def _create_phase5_tables(connection: sqlite3.Connection) -> None:
@@ -646,11 +701,17 @@ def _create_phase6_tables(connection: sqlite3.Connection) -> None:
             analyst_notes TEXT,
             pm_notes TEXT,
             error_message TEXT,
+            ai_review_status TEXT,
+            ai_model TEXT,
             FOREIGN KEY (version_id) REFERENCES package_versions(version_id),
             FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
         )
         """
     )
+    columns = _table_columns(connection, "analysis_runs")
+    for column in ("ai_review_status", "ai_model"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} TEXT")
     connection.execute(
         """
         CREATE TABLE IF NOT EXISTS analysis_metrics (
@@ -807,6 +868,67 @@ def _create_phase6_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_recommendation_decisions_run ON recommendation_decisions (analysis_run_id)",
         "CREATE INDEX IF NOT EXISTS idx_generated_reports_run ON generated_reports (analysis_run_id)",
         "CREATE INDEX IF NOT EXISTS idx_generated_reports_version ON generated_reports (version_id)",
+    ):
+        connection.execute(sql)
+
+
+def _create_phase7_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS research_workflow_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            workflow_run_id TEXT NOT NULL UNIQUE,
+            package_id TEXT NOT NULL,
+            ticker TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_step TEXT NOT NULL,
+            idempotency_key TEXT UNIQUE,
+            version_id TEXT,
+            processing_run_id TEXT,
+            analysis_run_id TEXT,
+            report_id TEXT,
+            stage_statuses_json TEXT,
+            warnings_json TEXT,
+            errors_json TEXT,
+            error_message TEXT,
+            created_by TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            FOREIGN KEY (package_id) REFERENCES packages(package_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS combined_exports (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            export_id TEXT NOT NULL UNIQUE,
+            analysis_run_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            report_id TEXT,
+            export_version INTEGER NOT NULL,
+            zip_path TEXT NOT NULL,
+            zip_sha256 TEXT NOT NULL,
+            file_count INTEGER NOT NULL DEFAULT 0,
+            total_size_bytes INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            metadata_json TEXT,
+            warnings_json TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE (analysis_run_id, export_version),
+            FOREIGN KEY (analysis_run_id) REFERENCES analysis_runs(analysis_run_id)
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_research_workflows_package ON research_workflow_runs (package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_research_workflows_status ON research_workflow_runs (status)",
+        "CREATE INDEX IF NOT EXISTS idx_research_workflows_analysis ON research_workflow_runs (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_combined_exports_analysis ON combined_exports (analysis_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_combined_exports_version ON combined_exports (version_id)",
     ):
         connection.execute(sql)
 
@@ -1007,6 +1129,27 @@ def update_package_collection_state(
     return get_package_by_package_id(package_id, db_path=db_path)
 
 
+def update_package_research_settings(
+    package_id: str,
+    *,
+    filing_history_years: int,
+    research_cutoff_date: str,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    """Update editable research settings on the working package."""
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            """
+            UPDATE packages
+            SET filing_history_years = ?, research_cutoff_date = ?, updated_at = ?
+            WHERE package_id = ?
+            """,
+            (filing_history_years, research_cutoff_date, utc_now_iso(), package_id),
+        )
+    return get_package_by_package_id(package_id, db_path=db_path)
+
+
 def create_collection_run(
     *,
     run_id: str,
@@ -1036,6 +1179,9 @@ def update_collection_run(
     documents_discovered: int = 0,
     documents_downloaded: int = 0,
     documents_skipped: int = 0,
+    documents_already_collected: int = 0,
+    documents_duplicated: int = 0,
+    documents_not_found: int = 0,
     documents_failed: int = 0,
     error_summary: str | None = None,
     completed: bool = True,
@@ -1049,7 +1195,8 @@ def update_collection_run(
             """
             UPDATE collection_runs
             SET completed_at = ?, status = ?, documents_discovered = ?,
-                documents_downloaded = ?, documents_skipped = ?, documents_failed = ?,
+                documents_downloaded = ?, documents_skipped = ?, documents_already_collected = ?,
+                documents_duplicated = ?, documents_not_found = ?, documents_failed = ?,
                 error_summary = ?
             WHERE run_id = ?
             """,
@@ -1059,6 +1206,9 @@ def update_collection_run(
                 documents_discovered,
                 documents_downloaded,
                 documents_skipped,
+                documents_already_collected,
+                documents_duplicated,
+                documents_not_found,
                 documents_failed,
                 error_summary,
                 run_id,
@@ -1098,12 +1248,214 @@ def list_recent_collection_runs(
     return [dict(row) for row in rows]
 
 
+def generate_document_id(prefix: str = "DOC") -> str:
+    """Return a globally unique document row identifier."""
+    return f"{prefix}-{secrets.token_hex(12).upper()}"
+
+
+def normalize_source_url(source_url: str | None) -> str:
+    """Normalize source URLs for package-scoped duplicate detection."""
+    if not source_url:
+        return ""
+    parsed = urlparse(str(source_url).strip())
+    if not parsed.scheme:
+        return str(source_url).strip().lower()
+    scheme = parsed.scheme.lower()
+    netloc = parsed.netloc.lower()
+    path = quote(unquote(parsed.path or ""), safe="/:@")
+    query_pairs = sorted(parse_qsl(parsed.query, keep_blank_values=True))
+    query = urlencode(query_pairs, doseq=True)
+    return urlunparse((scheme, netloc, path, "", query, ""))
+
+
+def source_identity_key(document: dict[str, Any]) -> str | None:
+    """Return a stable package-scoped source identity key separate from document_id."""
+    existing = str(document.get("source_identity_key") or "").strip()
+    if existing:
+        return existing.lower()
+    source_url = normalize_source_url(document.get("source_url"))
+    accession = str(document.get("accession_number") or "").strip()
+    collection_method = str(document.get("collection_method") or "").upper()
+    source_name = str(document.get("source_name") or "").upper()
+    sha256_hash = str(document.get("sha256_hash") or "").strip().lower()
+
+    if accession:
+        parsed = urlparse(source_url)
+        parts = [part for part in parsed.path.split("/") if part]
+        cik = ""
+        primary_document = Path(parsed.path).name
+        if "data" in parts:
+            data_index = parts.index("data")
+            if data_index + 1 < len(parts):
+                cik = parts[data_index + 1]
+        cik_or_ticker = cik or str(document.get("ticker") or "").lower()
+        return f"sec:{cik_or_ticker}:{accession.lower()}:{primary_document.lower()}"
+    if collection_method == "LICENSED_UPLOAD" or source_url.startswith("local-upload://"):
+        return f"upload:{sha256_hash}" if sha256_hash else None
+    if collection_method == "INVESTOR_RELATIONS" or source_name == "INVESTOR RELATIONS":
+        return f"ir:{source_url}" if source_url else None
+    if source_url:
+        suffix = f":{sha256_hash}" if sha256_hash else ""
+        return f"public:{source_url}{suffix}"
+    if sha256_hash:
+        return f"upload:{sha256_hash}"
+    return None
+
+
+def _legacy_or_missing_document_id(document_id: str | None) -> bool:
+    if not document_id:
+        return True
+    return document_id.startswith(("DOC-SEC-", "DOC-IR-", "DOC-UPLOAD-"))
+
+
+def _row_for_document_identity(connection: sqlite3.Connection, prepared: dict[str, Any]) -> sqlite3.Row | None:
+    package_id = prepared.get("package_id")
+    accession = prepared.get("accession_number")
+    source_url = prepared.get("source_url")
+    sha256_hash = prepared.get("sha256_hash")
+    identity = prepared.get("source_identity_key")
+    checks: list[tuple[str, tuple[Any, ...]]] = []
+    if accession:
+        checks.append(
+            (
+                """
+                SELECT * FROM documents
+                WHERE package_id = ? AND accession_number = ?
+                  AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+                ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+                LIMIT 1
+                """,
+                (package_id, accession),
+            )
+        )
+    if source_url:
+        checks.append(
+            (
+                """
+                SELECT * FROM documents
+                WHERE package_id = ? AND source_url = ?
+                  AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+                ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+                LIMIT 1
+                """,
+                (package_id, source_url),
+            )
+        )
+    if sha256_hash:
+        checks.append(
+            (
+                """
+                SELECT * FROM documents
+                WHERE package_id = ? AND sha256_hash = ?
+                  AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+                ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+                LIMIT 1
+                """,
+                (package_id, sha256_hash),
+            )
+        )
+    if identity:
+        checks.append(
+            (
+                """
+                SELECT * FROM documents
+                WHERE package_id = ? AND source_identity_key = ?
+                  AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+                ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+                LIMIT 1
+                """,
+                (package_id, identity),
+            )
+        )
+    for sql, params in checks:
+        row = connection.execute(sql, params).fetchone()
+        if row:
+            return row
+    return None
+
+
+def _document_id_exists(connection: sqlite3.Connection, document_id: str, package_id: str) -> bool:
+    row = connection.execute(
+        "SELECT package_id FROM documents WHERE document_id = ?",
+        (document_id,),
+    ).fetchone()
+    return bool(row and row["package_id"] != package_id)
+
+
+def _update_existing_document_from_insert(
+    connection: sqlite3.Connection,
+    existing: sqlite3.Row,
+    prepared: dict[str, Any],
+) -> None:
+    existing_dict = dict(existing)
+    incoming_status = prepared.get("collection_status")
+    existing_status = existing_dict.get("collection_status")
+    repair_existing = incoming_status == "DOWNLOADED" and existing_status in {"FAILED", "DUPLICATE", "SKIPPED", "DISCOVERED"}
+    safe_fields = (
+        "category",
+        "document_type",
+        "title",
+        "source_name",
+        "source_url",
+        "source_domain",
+        "source_identity_key",
+        "accession_number",
+        "form_type",
+        "publication_date",
+        "report_period",
+        "local_filename",
+        "local_path",
+        "mime_type",
+        "file_size_bytes",
+        "sha256_hash",
+        "collection_method",
+        "is_public",
+        "original_filename",
+        "stored_filename",
+        "file_extension",
+        "detected_file_type",
+        "source_type",
+        "source_institution",
+        "suggested_category_code",
+        "suggested_category",
+        "suggested_confidence",
+        "final_category_code",
+        "classification_method",
+        "classification_rules_matched",
+        "document_title",
+        "document_date",
+        "upload_method",
+        "uploaded_by",
+        "analyst_notes",
+        "authorization_confirmed",
+        "upload_status",
+        "archive_origin_document_id",
+    )
+    updates: dict[str, Any] = {}
+    for field in safe_fields:
+        incoming = prepared.get(field)
+        if incoming is None or incoming == "":
+            continue
+        if repair_existing or existing_dict.get(field) in {None, ""}:
+            updates[field] = incoming
+    if repair_existing:
+        updates["collection_status"] = "DOWNLOADED"
+        updates["error_message"] = None
+    if updates:
+        updates["updated_at"] = utc_now_iso()
+        sql = ", ".join(f"{key} = ?" for key in updates)
+        connection.execute(
+            f"UPDATE documents SET {sql} WHERE document_id = ?",
+            (*updates.values(), existing["document_id"]),
+        )
+
+
 def create_document_record(
     document: dict[str, Any],
     *,
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
-    """Insert and return a document record."""
+    """Insert or reuse a package-scoped document record idempotently."""
     initialize_database(db_path)
     now = utc_now_iso()
     fields = (
@@ -1116,6 +1468,7 @@ def create_document_record(
         "source_name",
         "source_url",
         "source_domain",
+        "source_identity_key",
         "accession_number",
         "form_type",
         "publication_date",
@@ -1153,6 +1506,9 @@ def create_document_record(
         "updated_at",
     )
     prepared = dict(document)
+    prepared["source_identity_key"] = source_identity_key(prepared)
+    if _legacy_or_missing_document_id(prepared.get("document_id")):
+        prepared["document_id"] = generate_document_id()
     prepared.setdefault("is_public", True)
     prepared["is_public"] = int(bool(prepared["is_public"]))
     prepared.setdefault("authorization_confirmed", False)
@@ -1160,26 +1516,62 @@ def create_document_record(
     prepared["created_at"] = now
     prepared["updated_at"] = now
     with get_connection(db_path) as connection:
-        connection.execute(
-            """
-            INSERT INTO documents (
-                document_id, package_id, ticker, category, document_type, title,
-                source_name, source_url, source_domain, accession_number, form_type,
-                publication_date, report_period, local_filename, local_path,
-                mime_type, file_size_bytes, sha256_hash, collection_method,
-                collection_status, is_public, error_message, original_filename,
-                stored_filename, file_extension, detected_file_type, source_type,
-                source_institution, suggested_category_code, suggested_category,
-                suggested_confidence, final_category_code, classification_method,
-                classification_rules_matched, document_title, document_date,
-                upload_method, uploaded_by, analyst_notes, authorization_confirmed,
-                upload_status, archive_origin_document_id, created_at, updated_at
+        existing = _row_for_document_identity(connection, prepared)
+        if existing:
+            _update_existing_document_from_insert(connection, existing, prepared)
+            row = connection.execute("SELECT * FROM documents WHERE document_id = ?", (existing["document_id"],)).fetchone()
+            return dict(row) if row else dict(existing)
+        while _document_id_exists(connection, prepared["document_id"], prepared["package_id"]):
+            prepared["document_id"] = generate_document_id()
+        try:
+            connection.execute(
+                """
+                INSERT INTO documents (
+                    document_id, package_id, ticker, category, document_type, title,
+                    source_name, source_url, source_domain, source_identity_key,
+                    accession_number, form_type, publication_date, report_period,
+                    local_filename, local_path, mime_type, file_size_bytes,
+                    sha256_hash, collection_method, collection_status, is_public,
+                    error_message, original_filename, stored_filename, file_extension,
+                    detected_file_type, source_type, source_institution,
+                    suggested_category_code, suggested_category, suggested_confidence,
+                    final_category_code, classification_method,
+                    classification_rules_matched, document_title, document_date,
+                    upload_method, uploaded_by, analyst_notes, authorization_confirmed,
+                    upload_status, archive_origin_document_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(prepared.get(field) for field in fields),
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            tuple(prepared.get(field) for field in fields),
-        )
-    return get_document_by_document_id(document["document_id"], db_path=db_path) or {}
+        except sqlite3.IntegrityError:
+            winner = _row_for_document_identity(connection, prepared)
+            if winner:
+                _update_existing_document_from_insert(connection, winner, prepared)
+                row = connection.execute("SELECT * FROM documents WHERE document_id = ?", (winner["document_id"],)).fetchone()
+                return dict(row) if row else dict(winner)
+            prepared["document_id"] = generate_document_id()
+            connection.execute(
+                """
+                INSERT INTO documents (
+                    document_id, package_id, ticker, category, document_type, title,
+                    source_name, source_url, source_domain, source_identity_key,
+                    accession_number, form_type, publication_date, report_period,
+                    local_filename, local_path, mime_type, file_size_bytes,
+                    sha256_hash, collection_method, collection_status, is_public,
+                    error_message, original_filename, stored_filename, file_extension,
+                    detected_file_type, source_type, source_institution,
+                    suggested_category_code, suggested_category, suggested_confidence,
+                    final_category_code, classification_method,
+                    classification_rules_matched, document_title, document_date,
+                    upload_method, uploaded_by, analyst_notes, authorization_confirmed,
+                    upload_status, archive_origin_document_id, created_at, updated_at
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                tuple(prepared.get(field) for field in fields),
+            )
+    return get_document_by_document_id(prepared["document_id"], db_path=db_path) or {}
 
 
 def get_document_by_document_id(
@@ -1216,6 +1608,56 @@ def update_document_status(
     return get_document_by_document_id(document_id, db_path=db_path)
 
 
+def mark_failed_documents_superseded(
+    package_id: str,
+    *,
+    accession_number: str | None = None,
+    source_url: str | None = None,
+    sha256_hash: str | None = None,
+    source_identity_key_value: str | None = None,
+    winning_document_id: str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    """Mark recoverable failed document attempts as superseded for current counts."""
+    clauses = ["package_id = ?", "collection_status = 'FAILED'"]
+    clause_params: list[Any] = [package_id]
+    identity = source_identity_key_value
+    if not identity:
+        identity = source_identity_key({"source_url": source_url, "sha256_hash": sha256_hash, "accession_number": accession_number})
+    match_clauses: list[str] = []
+    match_params: list[Any] = []
+    if accession_number:
+        match_clauses.append("accession_number = ?")
+        match_params.append(accession_number)
+    if source_url:
+        match_clauses.append("source_url = ?")
+        match_params.append(source_url)
+    if sha256_hash:
+        match_clauses.append("sha256_hash = ?")
+        match_params.append(sha256_hash)
+    if identity:
+        match_clauses.append("source_identity_key = ?")
+        match_params.append(identity)
+    if not match_clauses:
+        return 0
+    if winning_document_id:
+        clauses.append("document_id != ?")
+        clause_params.append(winning_document_id)
+    sql = f"""
+        UPDATE documents
+        SET collection_status = 'SUPERSEDED',
+            error_message = COALESCE(error_message, 'Superseded by repaired document record.'),
+            updated_at = ?
+        WHERE {' AND '.join(clauses)}
+          AND ({' OR '.join(match_clauses)})
+    """
+    ordered_params = [utc_now_iso(), *clause_params, *match_params]
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        cursor = connection.execute(sql, tuple(ordered_params))
+        return int(cursor.rowcount or 0)
+
+
 def list_documents_by_package(
     package_id: str,
     *,
@@ -1250,25 +1692,107 @@ def list_documents_by_category(
     return [dict(row) for row in rows]
 
 
+def get_document_by_accession(
+    package_id: str,
+    accession_number: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    if not accession_number:
+        return None
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM documents
+            WHERE package_id = ? AND accession_number = ?
+              AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+            ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+            LIMIT 1
+            """,
+            (package_id, accession_number),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def get_document_by_url(
+    package_id: str,
+    source_url: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    if not source_url:
+        return None
+    identity = source_identity_key({"package_id": package_id, "source_url": source_url, "collection_method": "PUBLIC"})
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM documents
+            WHERE package_id = ?
+              AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+              AND (source_url = ? OR source_identity_key = ?)
+            ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+            LIMIT 1
+            """,
+            (package_id, source_url, identity),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def get_document_by_hash(
+    package_id: str,
+    sha256_hash: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    if not sha256_hash:
+        return None
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM documents
+            WHERE package_id = ? AND sha256_hash = ?
+              AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+            ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+            LIMIT 1
+            """,
+            (package_id, sha256_hash),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def get_document_by_source_identity(
+    package_id: str,
+    identity: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    if not identity:
+        return None
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM documents
+            WHERE package_id = ? AND source_identity_key = ?
+              AND collection_status NOT IN ('DELETED', 'SUPERSEDED', 'RESOLVED')
+            ORDER BY CASE collection_status WHEN 'DOWNLOADED' THEN 0 WHEN 'DISCOVERED' THEN 1 ELSE 2 END, updated_at DESC
+            LIMIT 1
+            """,
+            (package_id, identity),
+        ).fetchone()
+    return row_to_dict(row)
+
+
 def document_exists_by_accession(
     package_id: str,
     accession_number: str,
     *,
     db_path: Path | str = DATABASE_PATH,
 ) -> bool:
-    if not accession_number:
-        return False
-    initialize_database(db_path)
-    with get_connection(db_path) as connection:
-        row = connection.execute(
-            """
-            SELECT 1 FROM documents
-            WHERE package_id = ? AND accession_number = ?
-            LIMIT 1
-            """,
-            (package_id, accession_number),
-        ).fetchone()
-    return row is not None
+    return get_document_by_accession(package_id, accession_number, db_path=db_path) is not None
 
 
 def document_exists_by_url(
@@ -1277,13 +1801,7 @@ def document_exists_by_url(
     *,
     db_path: Path | str = DATABASE_PATH,
 ) -> bool:
-    initialize_database(db_path)
-    with get_connection(db_path) as connection:
-        row = connection.execute(
-            "SELECT 1 FROM documents WHERE package_id = ? AND source_url = ? LIMIT 1",
-            (package_id, source_url),
-        ).fetchone()
-    return row is not None
+    return get_document_by_url(package_id, source_url, db_path=db_path) is not None
 
 
 def document_exists_by_hash(
@@ -1292,17 +1810,7 @@ def document_exists_by_hash(
     *,
     db_path: Path | str = DATABASE_PATH,
 ) -> bool:
-    initialize_database(db_path)
-    with get_connection(db_path) as connection:
-        row = connection.execute(
-            """
-            SELECT 1 FROM documents
-            WHERE package_id = ? AND sha256_hash = ?
-            LIMIT 1
-            """,
-            (package_id, sha256_hash),
-        ).fetchone()
-    return row is not None
+    return get_document_by_hash(package_id, sha256_hash, db_path=db_path) is not None
 
 
 def count_documents_by_status_and_category(
@@ -1522,6 +2030,11 @@ def upsert_checklist_item(
 ) -> dict[str, Any]:
     initialize_database(db_path)
     now = utc_now_iso()
+    normalized = dict(item)
+    normalized["requirement_level"] = str(item.get("requirement_level") or "").strip().lower()
+    for key in ("automatic_status", "analyst_override_status", "effective_status"):
+        if normalized.get(key):
+            normalized[key] = str(normalized[key]).strip().upper()
     with get_connection(db_path) as connection:
         connection.execute(
             """
@@ -1545,24 +2058,24 @@ def upsert_checklist_item(
                 updated_at = excluded.updated_at
             """,
             (
-                item["checklist_item_id"],
-                item["package_id"],
-                item["category_code"],
-                item["display_name"],
-                item["requirement_level"],
-                item["checklist_group"],
-                item.get("applicability", "APPLICABLE"),
-                item["automatic_status"],
-                item.get("analyst_override_status"),
-                item["effective_status"],
-                item.get("analyst_note"),
-                item.get("matched_document_count", 0),
-                item.get("latest_document_date"),
+                normalized["checklist_item_id"],
+                normalized["package_id"],
+                normalized["category_code"],
+                normalized["display_name"],
+                normalized["requirement_level"],
+                normalized["checklist_group"],
+                normalized.get("applicability", "APPLICABLE"),
+                normalized["automatic_status"],
+                normalized.get("analyst_override_status"),
+                normalized["effective_status"],
+                normalized.get("analyst_note"),
+                normalized.get("matched_document_count", 0),
+                normalized.get("latest_document_date"),
                 now,
                 now,
             ),
         )
-    return get_checklist_item(item["package_id"], item["checklist_item_id"], db_path=db_path) or {}
+    return get_checklist_item(normalized["package_id"], normalized["checklist_item_id"], db_path=db_path) or {}
 
 
 def get_checklist_item(
@@ -1608,8 +2121,9 @@ def set_checklist_override(
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any] | None:
     initialize_database(db_path)
+    normalized_override = str(override_status).strip().upper() if override_status else None
     with get_connection(db_path) as connection:
-        if override_status:
+        if normalized_override:
             connection.execute(
                 """
                 UPDATE package_checklist_items
@@ -1617,7 +2131,7 @@ def set_checklist_override(
                     analyst_note = ?, updated_at = ?
                 WHERE package_id = ? AND checklist_item_id = ?
                 """,
-                (override_status, override_status, note, utc_now_iso(), package_id, checklist_item_id),
+                (normalized_override, normalized_override, note, utc_now_iso(), package_id, checklist_item_id),
             )
         else:
             connection.execute(
@@ -1725,14 +2239,15 @@ def phase3_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str
             """
             SELECT COUNT(DISTINCT package_id) AS count
             FROM package_checklist_items
-            WHERE effective_status IN ('MISSING', 'NEEDS_REVIEW', 'STALE')
+            WHERE UPPER(effective_status) IN ('MISSING', 'NEEDS_REVIEW', 'STALE')
             """
         ).fetchone()
         missing_core = connection.execute(
             """
             SELECT COUNT(*) AS count
             FROM package_checklist_items
-            WHERE requirement_level = 'required' AND effective_status = 'MISSING'
+            WHERE LOWER(requirement_level) = 'required'
+              AND UPPER(effective_status) IN ('MISSING', 'NEEDS_REVIEW', 'STALE')
             """
         ).fetchone()
     return {
@@ -1827,6 +2342,76 @@ def next_package_version_number(
     return int(row["next_version"])
 
 
+def format_display_version(ticker: str, research_cutoff_date: str, version_number: int) -> str:
+    """Format the package-scoped human-readable version label."""
+    clean_ticker = "".join(character if character.isalnum() else "-" for character in str(ticker).upper()).strip("-") or "PACKAGE"
+    cutoff = str(research_cutoff_date).replace("-", "")
+    return f"{clean_ticker}-{cutoff}-V{int(version_number):03d}"
+
+
+def allocate_package_version(
+    version: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+    max_attempts: int = 8,
+) -> dict[str, Any]:
+    """Allocate and insert a package version number atomically."""
+    initialize_database(db_path)
+    for _ in range(max_attempts):
+        try:
+            with get_connection(db_path) as connection:
+                connection.execute("BEGIN IMMEDIATE")
+                latest = connection.execute(
+                    "SELECT version_number, version_id FROM package_versions WHERE parent_package_id = ? ORDER BY version_number DESC LIMIT 1",
+                    (version["parent_package_id"],),
+                ).fetchone()
+                version_number = int(latest["version_number"] if latest else 0) + 1
+                record = {
+                    **version,
+                    "version_id": f"PV-{uuid.uuid4().hex.upper()}",
+                    "display_version": format_display_version(version["ticker"], version["research_cutoff_date"], version_number),
+                    "version_number": version_number,
+                    "previous_version_id": latest["version_id"] if latest else None,
+                    "created_at": version.get("created_at", utc_now_iso()),
+                }
+                connection.execute(
+                    """
+                    INSERT INTO package_versions (
+                        version_id, display_version, parent_package_id, version_number, previous_version_id,
+                        ticker, company_name, security_type, research_cutoff_date, status,
+                        document_count, public_document_count, licensed_document_count, total_size_bytes,
+                        checklist_snapshot_json, created_by, created_at, notes, error_message
+                    )
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        record["version_id"],
+                        record["display_version"],
+                        record["parent_package_id"],
+                        record["version_number"],
+                        record.get("previous_version_id"),
+                        record["ticker"],
+                        record.get("company_name"),
+                        record["security_type"],
+                        record["research_cutoff_date"],
+                        record["status"],
+                        record.get("document_count", 0),
+                        record.get("public_document_count", 0),
+                        record.get("licensed_document_count", 0),
+                        record.get("total_size_bytes", 0),
+                        record.get("checklist_snapshot_json"),
+                        record.get("created_by", "analyst"),
+                        record["created_at"],
+                        record.get("notes"),
+                        record.get("error_message"),
+                    ),
+                )
+            return get_package_version(record["version_id"], db_path=db_path) or record
+        except sqlite3.IntegrityError:
+            continue
+    raise DatabaseError("Could not allocate a unique package version.")
+
+
 def latest_package_version(
     package_id: str,
     *,
@@ -1853,20 +2438,25 @@ def create_package_version(
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
     initialize_database(db_path)
+    version_id = version.get("version_id") or f"PV-{uuid.uuid4().hex.upper()}"
+    display_version = version.get("display_version") or format_display_version(
+        version["ticker"], version["research_cutoff_date"], int(version["version_number"])
+    )
     with get_connection(db_path) as connection:
         connection.execute(
             """
             INSERT INTO package_versions (
-                version_id, parent_package_id, version_number, previous_version_id,
+                version_id, display_version, parent_package_id, version_number, previous_version_id,
                 ticker, company_name, security_type, research_cutoff_date, status,
                 document_count, public_document_count, licensed_document_count,
                 total_size_bytes, checklist_snapshot_json, created_by, created_at,
                 notes, error_message
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
-                version["version_id"],
+                version_id,
+                display_version,
                 version["parent_package_id"],
                 version["version_number"],
                 version.get("previous_version_id"),
@@ -1886,7 +2476,7 @@ def create_package_version(
                 version.get("error_message"),
             ),
         )
-    return get_package_version(version["version_id"], db_path=db_path) or {}
+    return get_package_version(version_id, db_path=db_path) or {}
 
 
 def get_package_version(
@@ -2394,6 +2984,7 @@ def update_evidence_record(
         "scenario",
         "direction",
         "updated_at",
+        "extraction_method",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2579,6 +3170,8 @@ def update_analysis_run(
         "analyst_notes",
         "pm_notes",
         "error_message",
+        "ai_review_status",
+        "ai_model",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2823,6 +3416,189 @@ def list_generated_reports(
     if clauses:
         sql += " WHERE " + " AND ".join(clauses)
     sql += " ORDER BY created_at DESC, report_version DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_research_workflow_run(
+    workflow: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    try:
+        _insert_record("research_workflow_runs", workflow, db_path=db_path)
+    except sqlite3.IntegrityError:
+        existing = get_research_workflow_by_key(workflow.get("idempotency_key") or "", db_path=db_path)
+        if existing:
+            return existing
+        raise
+    return get_research_workflow_run(workflow["workflow_run_id"], db_path=db_path) or workflow
+
+
+def get_research_workflow_run(
+    workflow_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM research_workflow_runs WHERE workflow_run_id = ?",
+            (workflow_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def get_research_workflow_by_key(
+    idempotency_key: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM research_workflow_runs WHERE idempotency_key = ?",
+            (idempotency_key,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def latest_research_workflow_run(
+    package_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM research_workflow_runs
+            WHERE package_id = ?
+            ORDER BY started_at DESC, id DESC
+            LIMIT 1
+            """,
+            (package_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def list_research_workflow_runs(
+    package_id: str | None = None,
+    *,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM research_workflow_runs"
+    params: list[Any] = []
+    if package_id:
+        sql += " WHERE package_id = ?"
+        params.append(package_id)
+    sql += " ORDER BY started_at DESC, id DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_research_workflow_run(
+    workflow_run_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "status",
+        "current_step",
+        "version_id",
+        "processing_run_id",
+        "analysis_run_id",
+        "report_id",
+        "stage_statuses_json",
+        "warnings_json",
+        "errors_json",
+        "error_message",
+        "updated_at",
+        "completed_at",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_research_workflow_run(workflow_run_id, db_path=db_path)
+    selected.setdefault("updated_at", utc_now_iso())
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"UPDATE research_workflow_runs SET {sql} WHERE workflow_run_id = ?",
+            (*selected.values(), workflow_run_id),
+        )
+    return get_research_workflow_run(workflow_run_id, db_path=db_path)
+
+
+def next_combined_export_version(
+    analysis_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> int:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT COALESCE(MAX(export_version), 0) + 1 AS next_version FROM combined_exports WHERE analysis_run_id = ?",
+            (analysis_run_id,),
+        ).fetchone()
+    return int(row["next_version"])
+
+
+def create_combined_export(
+    export: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    _insert_record("combined_exports", export, db_path=db_path)
+    return get_combined_export(export["export_id"], db_path=db_path) or export
+
+
+def get_combined_export(
+    export_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM combined_exports WHERE export_id = ?",
+            (export_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def list_combined_exports(
+    analysis_run_id: str | None = None,
+    *,
+    version_id: str | None = None,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM combined_exports"
+    clauses: list[str] = []
+    params: list[Any] = []
+    if analysis_run_id:
+        clauses.append("analysis_run_id = ?")
+        params.append(analysis_run_id)
+    if version_id:
+        clauses.append("version_id = ?")
+        params.append(version_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at DESC, export_version DESC"
     if limit is not None:
         sql += " LIMIT ?"
         params.append(limit)

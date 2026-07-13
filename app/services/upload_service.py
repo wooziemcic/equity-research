@@ -251,7 +251,7 @@ def store_uploaded_files(
     summary = {"uploaded": 0, "duplicated": 0, "skipped": 0, "failed": 0, "bytes": 0}
     for result, candidate in zip(validations, candidates, strict=False):
         details = metadata_by_name.get(result.original_filename, {})
-        document_id = f"DOC-UPLOAD-{secrets.token_hex(8).upper()}"
+        document_id = database.generate_document_id("DOC-UPLOAD")
         if not result.is_valid:
             database.create_document_record(
                 _document_record(package, result, document_id, source_type, config.DOCUMENT_STATUS_FAILED, details=details, error=result.error),
@@ -260,12 +260,15 @@ def store_uploaded_files(
             _audit(package["package_id"], "UPLOAD_FAILED", {"filename": result.original_filename, "error": result.error}, document_id, db_path=db_path)
             summary["failed"] += 1
             continue
-        if database.document_exists_by_hash(package["package_id"], result.sha256_hash, db_path=db_path):
-            database.create_document_record(
-                _document_record(package, result, document_id, source_type, config.DOCUMENT_STATUS_DUPLICATE, details=details, content=None, error="Duplicate file hash in this package."),
+        existing_hash = database.get_document_by_hash(package["package_id"], result.sha256_hash, db_path=db_path)
+        if existing_hash and existing_hash.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED:
+            _audit(
+                package["package_id"],
+                "DUPLICATE_DETECTED",
+                {"filename": result.original_filename, "sha256": result.sha256_hash, "existing_document_id": existing_hash["document_id"]},
+                existing_hash["document_id"],
                 db_path=db_path,
             )
-            _audit(package["package_id"], "DUPLICATE_DETECTED", {"filename": result.original_filename, "sha256": result.sha256_hash}, document_id, db_path=db_path)
             summary["duplicated"] += 1
             continue
         path = _unique_path(package["package_id"], source_type, result.sanitized_filename)

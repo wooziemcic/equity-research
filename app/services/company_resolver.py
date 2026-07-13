@@ -68,6 +68,7 @@ def load_ticker_mapping(
     rows = payload.get("data", [])
     fields = payload.get("fields", [])
     mapping = [dict(zip(fields, row, strict=False)) for row in rows]
+    path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(mapping), encoding="utf-8")
     return mapping
 
@@ -89,16 +90,15 @@ def _submissions_metadata(cik: str, *, session: requests.Session | None = None) 
     return response.json()
 
 
-def resolve_package_company(
-    package: dict[str, Any],
+def resolve_ticker_metadata(
+    raw_ticker: str,
     *,
     refresh: bool = False,
     selected_cik: str | None = None,
     session: requests.Session | None = None,
-    db_path: Path | str = config.DATABASE_PATH,
 ) -> ResolutionResult:
-    """Resolve a package ticker to an SEC company identity."""
-    ticker_result = validate_ticker(package.get("ticker"))
+    """Resolve a ticker to SEC company metadata without mutating a package."""
+    ticker_result = validate_ticker(raw_ticker)
     if not ticker_result.is_valid:
         return ResolutionResult("UNRESOLVED", error=ticker_result.error)
     try:
@@ -128,7 +128,6 @@ def resolve_package_company(
     row = matches[0]
     cik = normalize_cik(row.get("cik", row.get("cik_str", "")))
     submissions = _submissions_metadata(cik, session=session)
-    now = database.utc_now_iso()
     metadata = {
         "ticker": ticker_result.value,
         "company_name": submissions.get("name") or row.get("name") or row.get("title"),
@@ -140,8 +139,29 @@ def resolve_package_company(
         "sec_company_url": config.SEC_COMPANY_PAGE_TEMPLATE.format(cik=cik),
         "resolution_status": "RESOLVED",
         "resolution_source": config.SEC_TICKER_MAPPING_URL,
-        "resolution_timestamp": now,
+        "resolution_timestamp": database.utc_now_iso(),
     }
+    return ResolutionResult("RESOLVED", metadata=metadata)
+
+
+def resolve_package_company(
+    package: dict[str, Any],
+    *,
+    refresh: bool = False,
+    selected_cik: str | None = None,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> ResolutionResult:
+    """Resolve a package ticker to an SEC company identity."""
+    result = resolve_ticker_metadata(
+        str(package.get("ticker") or ""),
+        refresh=refresh,
+        selected_cik=selected_cik,
+        session=session,
+    )
+    if result.status != "RESOLVED" or not result.metadata:
+        return result
+    metadata = result.metadata
     updated = database.update_package_company_metadata(
         package["package_id"],
         metadata,

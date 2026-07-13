@@ -65,8 +65,17 @@ def test_existing_phase1_database_upgrades_successfully(tmp_path: Path) -> None:
         columns = {
             row[1] for row in connection.execute("PRAGMA table_info(packages)")
         }
+        document_columns = {
+            row[1] for row in connection.execute("PRAGMA table_info(documents)")
+        }
+        indexes = {
+            row[1]
+            for row in connection.execute("PRAGMA index_list(documents)")
+        }
     assert {"packages", "documents", "collection_runs"} <= tables
     assert {"cik", "resolution_status", "last_collection_at"} <= columns
+    assert "source_identity_key" in document_columns
+    assert "idx_documents_package_source_identity_current" in indexes
 
 
 def test_document_insertion_duplicate_checks_and_status_updates(temp_db: Path, package: dict) -> None:

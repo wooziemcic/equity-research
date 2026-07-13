@@ -35,6 +35,13 @@ def initialize_session_state() -> None:
     st.session_state.setdefault(config.SESSION_ACTIVE_PACKAGE_ID, None)
     st.session_state.setdefault(config.SESSION_ACTIVE_TICKER, None)
     st.session_state.setdefault(config.SESSION_CURRENT_WORKFLOW_STEP, "Company Setup")
+    st.session_state.setdefault(config.SESSION_ACTIVE_VERSION_ID, None)
+    st.session_state.setdefault(config.SESSION_ACTIVE_PROCESSING_RUN_ID, None)
+    st.session_state.setdefault(config.SESSION_ACTIVE_ANALYSIS_RUN_ID, None)
+    st.session_state.setdefault(config.SESSION_ACTIVE_REPORT_ID, None)
+    st.session_state.setdefault(config.SESSION_PRIMARY_SCREEN, "Search")
+    st.session_state.setdefault(config.SESSION_COLLECTION_STATE, {})
+    st.session_state.setdefault(config.SESSION_WORKFLOW_STATE, {})
 
 
 def bootstrap_page(current_step: str = "Company Setup") -> None:

@@ -1,7 +1,14 @@
 from __future__ import annotations
 
 import os
+import re
 from pathlib import Path
+
+from dotenv import load_dotenv
+
+
+PROJECT_ROOT = Path(__file__).resolve().parents[1]
+load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
 APP_NAME = "Cutler Research AI"
@@ -9,7 +16,6 @@ APP_SUBTITLE = "Equity Research Workbench"
 PAGE_TITLE = APP_NAME
 PAGE_ICON = "📊"
 
-PROJECT_ROOT = Path(__file__).resolve().parents[1]
 DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_DIR = DATA_DIR / "database"
 DATABASE_PATH = DATABASE_DIR / "cutler_research.db"
@@ -48,6 +54,13 @@ RETRIEVAL_RESULT_COUNT = int(os.getenv("RETRIEVAL_RESULT_COUNT", "20"))
 RETRIEVAL_MODE = os.getenv("RETRIEVAL_MODE", "keyword").strip().lower()
 LOCAL_EMBEDDING_MODEL = os.getenv("LOCAL_EMBEDDING_MODEL", "keyword-only")
 EXTERNAL_LLM_EXTRACTION_ENABLED = os.getenv("EXTERNAL_LLM_EXTRACTION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_REQUIRED = os.getenv("OPENAI_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-5.6-terra")
+OPENAI_REASONING_EFFORT = os.getenv("OPENAI_REASONING_EFFORT", "low")
+OPENAI_PREFLIGHT_CACHE_SECONDS = int(os.getenv("OPENAI_PREFLIGHT_CACHE_SECONDS", "60"))
+AI_REVIEW_STATUS_NOT_REQUIRED = "NOT_REQUIRED"
+AI_REVIEW_STATUS_RUNNING = "RUNNING"
+AI_REVIEW_STATUS_COMPLETED = "COMPLETED"
 PROCESSING_PIPELINE_VERSION = os.getenv("PROCESSING_PIPELINE_VERSION", "5.0")
 PARSER_CONFIG_VERSION = os.getenv("PARSER_CONFIG_VERSION", "5.0")
 ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "6.0")
@@ -62,8 +75,8 @@ SELL_SCORE_THRESHOLD = float(os.getenv("SELL_SCORE_THRESHOLD", "3.50"))
 MAX_UNRESOLVED_CONFLICTS = int(os.getenv("MAX_UNRESOLVED_CONFLICTS", "3"))
 MIN_BUY_UPSIDE = float(os.getenv("MIN_BUY_UPSIDE", "0.10"))
 MAX_SELL_DOWNSIDE = float(os.getenv("MAX_SELL_DOWNSIDE", "-0.10"))
-EXTERNAL_NARRATIVE_MODEL_ENABLED = os.getenv("EXTERNAL_NARRATIVE_MODEL_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
-NARRATIVE_MODEL_NAME = os.getenv("NARRATIVE_MODEL_NAME", "deterministic-local")
+EXTERNAL_NARRATIVE_MODEL_ENABLED = os.getenv("EXTERNAL_NARRATIVE_MODEL_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
+NARRATIVE_MODEL_NAME = os.getenv("NARRATIVE_MODEL_NAME", OPENAI_MODEL)
 
 SUPPORTED_SECURITY_TYPES = (
     "Common Equity",
@@ -117,6 +130,14 @@ DOCUMENT_STATUS_DOWNLOADED = "DOWNLOADED"
 DOCUMENT_STATUS_DUPLICATE = "DUPLICATE"
 DOCUMENT_STATUS_FAILED = "FAILED"
 DOCUMENT_STATUS_SKIPPED = "SKIPPED"
+DOCUMENT_STATUS_RESOLVED = "RESOLVED"
+DOCUMENT_STATUS_SUPERSEDED = "SUPERSEDED"
+
+COLLECTION_ITEM_DOWNLOADED_NOW = "DOWNLOADED_NOW"
+COLLECTION_ITEM_ALREADY_COLLECTED = "ALREADY_COLLECTED"
+COLLECTION_ITEM_DUPLICATE = "DUPLICATE"
+COLLECTION_ITEM_FAILED = "FAILED"
+COLLECTION_ITEM_NOT_FOUND = "NOT_FOUND"
 
 COLLECTION_STATUS_RUNNING = "RUNNING"
 COLLECTION_STATUS_COMPLETE = "COMPLETE"
@@ -185,6 +206,7 @@ ANALYSIS_STATUS_NEEDS_PM_APPROVAL = "NEEDS_PM_APPROVAL"
 ANALYSIS_STATUS_PM_APPROVED = "PM_APPROVED"
 ANALYSIS_STATUS_PM_REJECTED = "PM_REJECTED"
 ANALYSIS_STATUS_SUPERSEDED = "SUPERSEDED"
+ANALYSIS_STATUS_COMPLETED_WITH_WARNINGS = "COMPLETED_WITH_WARNINGS"
 ANALYSIS_STATUS_FAILED = "FAILED"
 
 RECOMMENDATION_BUY = "BUY"
@@ -279,6 +301,25 @@ SEC_COMPANY_PAGE_TEMPLATE = "https://www.sec.gov/edgar/browse/?CIK={cik}"
 SESSION_ACTIVE_PACKAGE_ID = "active_package_id"
 SESSION_ACTIVE_TICKER = "active_ticker"
 SESSION_CURRENT_WORKFLOW_STEP = "current_workflow_step"
+SESSION_ACTIVE_VERSION_ID = "active_version_id"
+SESSION_ACTIVE_PROCESSING_RUN_ID = "active_processing_run_id"
+SESSION_ACTIVE_ANALYSIS_RUN_ID = "active_analysis_run_id"
+SESSION_ACTIVE_REPORT_ID = "active_report_id"
+SESSION_PRIMARY_SCREEN = "primary_screen"
+SESSION_COLLECTION_STATE = "collection_state"
+SESSION_WORKFLOW_STATE = "workflow_state"
+
+WORKFLOW_STATUS_RUNNING = "RUNNING"
+WORKFLOW_STATUS_COMPLETED = "COMPLETED"
+WORKFLOW_STATUS_COMPLETED_WITH_WARNINGS = "COMPLETED_WITH_WARNINGS"
+WORKFLOW_STATUS_FAILED = "FAILED"
+WORKFLOW_STATUS_BLOCKED = "BLOCKED"
+
+COMBINED_EXPORT_STATUS_CREATED = "CREATED"
+COMBINED_EXPORT_STATUS_FAILED = "FAILED"
+
+EMAIL_PATTERN = re.compile(r"\b[A-Z0-9._%+-]+@[A-Z0-9.-]+\.[A-Z]{2,}\b", re.IGNORECASE)
+SEC_USER_AGENT_PLACEHOLDERS = ("example.com", "your-domain", "placeholder")
 
 REQUIRED_DIRECTORIES = (
     DATA_DIR,
@@ -300,7 +341,13 @@ def ensure_directories() -> None:
 
 def sec_user_agent_is_configured() -> bool:
     """Return whether SEC requests have a usable user-agent value."""
-    value = SEC_USER_AGENT.strip().lower()
+    raw_value = SEC_USER_AGENT.strip()
+    value = raw_value.lower()
     if not value:
         return False
-    return "example.com" not in value and "research@example.com" not in value
+    if any(placeholder in value for placeholder in SEC_USER_AGENT_PLACEHOLDERS):
+        return False
+    if not EMAIL_PATTERN.search(raw_value):
+        return False
+    application_name = EMAIL_PATTERN.sub("", raw_value).strip(" \t\r\n()[]{}<>;:-_,")
+    return bool(application_name)

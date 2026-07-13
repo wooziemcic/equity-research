@@ -1,19 +1,69 @@
 # Cutler Equity Research Workbench
 
-Cutler Research AI is an internal Streamlit workbench for building locked research packages, processing those packages into cited evidence, and turning verified evidence into auditable investment-analysis drafts for analyst and portfolio-manager review.
+Cutler Research AI is an internal Streamlit research product for searching a ticker, building a locked document-grounded research package, processing that package into cited evidence, and turning verified evidence into auditable investment-analysis drafts for analyst and portfolio-manager review.
 
 ## Current Status
 
-Implemented through Phase 6:
+Implemented through Phase 7:
 
 - Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
 - Phase 3: licensed-file uploads, classification suggestions, analyst category correction, upload history, audit events, ZIP inspection, document inventory editing, controlled deletion, and checklist review.
 - Phase 4: readiness validation, manifest generation, inventory exports, checklist snapshots, integrity reports, immutable package snapshots, ZIP generation, explicit locking, and version comparison.
 - Phase 5: closed-corpus document processing, native extraction, optional local OCR, spreadsheet-safe parsing, citation-preserving chunks, keyword retrieval, deterministic evidence extraction, citation verification, duplicate grouping, conflict detection, analyst evidence review, and exports.
-- Phase 6: deterministic financial metrics, evidence-backed scorecards, bull/base/bear scenarios, Buy/Hold/Sell/Insufficient Evidence/Analyst Review Required recommendations, analyst review, PM approval, DOCX/PDF reports, citation audits, report versioning, and report hashes.
+- Phase 6: deterministic financial metrics, evidence-backed scorecards, bull/base/bear scenarios, OpenAI-validated evidence interpretation and narrative generation, Buy/Hold/Sell/Insufficient Evidence/Analyst Review Required recommendations, analyst review, PM approval, DOCX/PDF reports, citation audits, report versioning, and report hashes.
+- Phase 7: polished three-screen workflow, SEC-backed ticker search, consolidated Research Workspace, simplified Investment Result page, resumable workflow orchestration, recent research history, Advanced Workbench navigation, and a combined research-package plus AI-report ZIP export.
 
-Not implemented: authentication, cloud deployment, continuous monitoring, trading integration, or external narrative-model workflows. The system does not execute trades.
+Not implemented: authentication, cloud deployment, continuous monitoring, or trading integration. The system does not execute trades.
+
+## Phase 7 Primary Workflow
+
+The default application experience is now:
+
+1. `Search` - `app/Home.py` is a minimal ticker-search landing page. It strips spaces, uppercases the ticker, validates symbol format, and verifies an exact match through the supported SEC company database. It does not use general web search or unsupported lookup services. After the analyst confirms the SEC company record, the app reuses the newest editable package for that ticker or creates a new Common Equity package.
+2. `Research` - `app/pages/0_Research_Workspace.py` consolidates package settings, automated public collection, optional licensed uploads, package coverage, checklist acknowledgement, and the primary `Build Package and Generate Analysis` action. Filing-year selection now lives in the Automated Research card and updates the working package's `filing_history_years`.
+3. `Result` - `app/pages/6_Investment_Result.py` shows the preliminary, analyst-reviewed, or PM-approved signal; separates recommendation confidence, evidence coverage, and package coverage; renders report sections with citations; and exposes governance details through an Advanced Review drawer.
+
+Secondary navigation includes `Dashboard / History` for previous packages and `Advanced Workbench` for the detailed Phase 1-6 pages: package setup, public collection, licensed uploads, package review, evidence exploration, analyst review, PM approval, generated reports, and audit history.
+
+## Research Workspace Details
+
+Automated Research supports:
+
+- Filing history options: 1, 2, 3, and 5 years.
+- Research cutoff date, blocked from future dates by default.
+- SEC form selection: 10-K, 10-Q, 8-K, DEF 14A, 20-F, and 6-K.
+- Public company material preferences and an optional investor-relations URL.
+- A planned collection preview and a real collection timeline derived from collection runs, upload runs, documents, checklist rows, and readiness validation.
+
+Additional Research supports the existing secure upload workflow for authorized Bloomberg, Morningstar, FactSet, sell-side, credit, transcript, model, activist, industry, company-material, and internal files. Existing file validation, signature checks, ZIP inspection, duplicate detection, classification suggestions, category correction, authorization acknowledgement, and audit recording remain in force.
+
+The primary proceed action calls the existing services in sequence:
+
+1. Validate package readiness.
+2. Build a package version, manifest, inventory, checklist snapshot, integrity report, and Phase 4 package ZIP.
+3. Lock the verified package version.
+4. Run document processing and evidence extraction.
+5. Verify citations through the existing evidence pipeline.
+6. Run deterministic investment analysis.
+7. Generate a draft DOCX/PDF investment report.
+
+Workflow state is persisted in `research_workflow_runs`, including version ID, processing run ID, analysis run ID, report ID, stage statuses, warnings, errors, and an idempotency key so Streamlit reruns do not duplicate backend runs.
+
+## Final Combined ZIP
+
+The Result page can generate `Download Research Package + AI Report`, a new versioned combined export recorded in `combined_exports`. It does not alter the immutable Phase 4 package snapshot or overwrite the Phase 4 ZIP.
+
+The combined export includes only:
+
+- Files from the selected locked package version.
+- Package manifest, document inventory, checklist snapshot, and integrity report.
+- Included public documents and licensed uploads.
+- The selected analysis run's DOCX/PDF report.
+- `12_Final_Analysis/evidence_ledger.xlsx`.
+- `12_Final_Analysis/conflicts.csv`.
+
+The export verifies locked package file hashes and report hashes where available, uses relative archive paths only, excludes databases, `.env`, logs, secrets, temporary files, and unrelated package files, writes atomically, hashes the final ZIP, and versions each export.
 
 ## Closed-Corpus Analysis Rule
 
@@ -174,7 +224,7 @@ Before report generation, Phase 6 checks material thesis items for supported or 
 
 ## Configuration
 
-Key Phase 6 settings:
+Key Phase 6 and Phase 7 settings:
 
 - `ANALYSIS_PIPELINE_VERSION`
 - `ANALYSIS_CONFIGURATION_VERSION`
@@ -188,10 +238,21 @@ Key Phase 6 settings:
 - `MAX_UNRESOLVED_CONFLICTS`
 - `MIN_BUY_UPSIDE`
 - `MAX_SELL_DOWNSIDE`
+- `OPENAI_REQUIRED`
+- `OPENAI_MODEL`
+- `OPENAI_REASONING_EFFORT`
+- `EXTERNAL_LLM_EXTRACTION_ENABLED`
 - `EXTERNAL_NARRATIVE_MODEL_ENABLED`
 - `NARRATIVE_MODEL_NAME`
+- `SESSION_ACTIVE_PACKAGE_ID`
+- `SESSION_ACTIVE_VERSION_ID`
+- `SESSION_ACTIVE_PROCESSING_RUN_ID`
+- `SESSION_ACTIVE_ANALYSIS_RUN_ID`
+- `SESSION_ACTIVE_REPORT_ID`
 
-Default operation is deterministic, local, and works without an API key.
+Arithmetic, ratios, formulas, hashes, database writes, package integrity, citation checks, and score thresholds remain deterministic. With `OPENAI_REQUIRED=true`, analysis and narrative generation stop safely until the configured model passes an explicit OpenAI preflight check. OpenAI requests use the Responses API at `/v1/responses`, with no web or external tools, and only selected locked-package evidence.
+
+Package versions use a globally unique internal `version_id` such as `PV-...` and a package-scoped human-readable `display_version` such as `QXO-20260713-V001`.
 
 ## Setup On Windows PowerShell
 
@@ -226,6 +287,8 @@ Or from any current directory:
 & "C:\path\to\cutler-equity-research-blueprint\scripts\run_app.ps1"
 ```
 
+Direct page navigation is supported for the primary workflow and the Advanced Workbench pages. If you open the Research or Result page directly without an active package, the app offers a persisted package or analysis selection instead of crashing.
+
 ## Known Limitations
 
-Phase 6 is a research-draft workflow for professional review. It does not independently execute investment decisions or trades. Narrative drafting remains deterministic by default; external model narrative mode is disabled unless explicitly configured. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations depend on the quality and structure of Phase 5 evidence extraction.
+Phase 7 is a UX and workflow consolidation over the Phase 1-6 backend. It does not add Bloomberg, FactSet, Morningstar, browser automation, live market data, portfolio allocation, trade execution, or a new frontend framework. SEC public collection still requires a configured SEC user agent. Investor-relations discovery remains conservative and requires an analyst-supplied public IR URL. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations and recommendation rules depend on the quality and structure of Phase 5 evidence extraction.

@@ -20,6 +20,22 @@ PUBLIC_FORM_CATEGORY_MAP = {
     "DEF 14A": "proxy_statement",
 }
 
+MISSING_COVERAGE_STATUSES = {
+    config.CHECKLIST_STATUS_MISSING,
+    config.CHECKLIST_STATUS_STALE,
+    config.CHECKLIST_STATUS_NEEDS_REVIEW,
+}
+
+
+def normalize_requirement_level(value: Any) -> str:
+    """Normalize checklist requirement levels for storage and comparison."""
+    return str(value or "").strip().lower()
+
+
+def normalize_checklist_status(value: Any) -> str:
+    """Normalize checklist status values for storage and comparison."""
+    return str(value or "").strip().upper()
+
 
 def _document_category_code(document: dict[str, Any]) -> str:
     if document.get("final_category_code"):
@@ -75,20 +91,21 @@ def ensure_package_checklist(
             item["id"],
             db_path=db_path,
         )
-        override = existing.get("analyst_override_status") if existing else None
+        override = normalize_checklist_status(existing.get("analyst_override_status")) if existing and existing.get("analyst_override_status") else None
         note = existing.get("analyst_note") if existing else None
+        effective = override or automatic
         database.upsert_checklist_item(
             {
                 "checklist_item_id": item["id"],
                 "package_id": package["package_id"],
                 "category_code": item["category_code"],
                 "display_name": item["display_name"],
-                "requirement_level": item["requirement_level"],
+                "requirement_level": normalize_requirement_level(item["requirement_level"]),
                 "checklist_group": item["group"],
                 "applicability": "APPLICABLE",
-                "automatic_status": automatic,
+                "automatic_status": normalize_checklist_status(automatic),
                 "analyst_override_status": override,
-                "effective_status": override or automatic,
+                "effective_status": normalize_checklist_status(effective),
                 "analyst_note": note,
                 "matched_document_count": len(matches),
                 "latest_document_date": latest,
@@ -116,10 +133,11 @@ def set_override(
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any] | None:
     """Apply or clear an analyst checklist override."""
+    normalized_override = normalize_checklist_status(override_status) if override_status else None
     item = database.set_checklist_override(
         package_id,
         checklist_item_id,
-        override_status,
+        normalized_override,
         note,
         db_path=db_path,
     )
@@ -130,7 +148,7 @@ def set_override(
         event_details_json=json.dumps(
             {
                 "checklist_item_id": checklist_item_id,
-                "override_status": override_status,
+                "override_status": normalized_override,
                 "note": note,
             },
             sort_keys=True,
@@ -148,22 +166,40 @@ def coverage_summary(items: list[dict[str, Any]]) -> dict[str, int]:
         "optional_available": 0,
         "missing": 0,
         "needs_review": 0,
+        "stale": 0,
+        "not_available": 0,
         "not_applicable": 0,
+        "available_required": 0,
+        "missing_required": 0,
+        "missing_recommended": 0,
     }
     for item in items:
-        level = item["requirement_level"]
-        status = item["effective_status"]
+        level = normalize_requirement_level(item.get("requirement_level"))
+        status = normalize_checklist_status(
+            item.get("effective_status")
+            or item.get("analyst_override_status")
+            or item.get("automatic_status")
+        )
         if status == config.CHECKLIST_STATUS_AVAILABLE:
             if level == "required":
                 summary["required_available"] += 1
+                summary["available_required"] += 1
             elif level == "recommended":
                 summary["recommended_available"] += 1
             else:
                 summary["optional_available"] += 1
+        if level == "required" and status in MISSING_COVERAGE_STATUSES:
+            summary["missing_required"] += 1
+        if level == "recommended" and status in MISSING_COVERAGE_STATUSES:
+            summary["missing_recommended"] += 1
         if status == config.CHECKLIST_STATUS_MISSING:
             summary["missing"] += 1
         if status == config.CHECKLIST_STATUS_NEEDS_REVIEW:
             summary["needs_review"] += 1
+        if status == config.CHECKLIST_STATUS_STALE:
+            summary["stale"] += 1
+        if status == config.CHECKLIST_STATUS_NOT_AVAILABLE:
+            summary["not_available"] += 1
         if status == config.CHECKLIST_STATUS_NOT_APPLICABLE:
             summary["not_applicable"] += 1
     return summary

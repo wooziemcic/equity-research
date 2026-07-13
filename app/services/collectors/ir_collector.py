@@ -236,20 +236,20 @@ def download_selected_ir_documents(
         status=config.COLLECTION_STATUS_RUNNING,
         db_path=db_path,
     )
-    summary = {"discovered": len(selections), "downloaded": 0, "skipped": 0, "failed": 0}
+    summary = {
+        "discovered": len(selections),
+        "downloaded": 0,
+        "downloaded_now": 0,
+        "already_collected": 0,
+        "duplicate": 0,
+        "skipped": 0,
+        "failed": 0,
+        "not_found": 0,
+    }
     for candidate, category in selections:
-        document_id = f"DOC-IR-{hashlib.sha1(candidate.url.encode('utf-8')).hexdigest()[:16].upper()}"
-        if database.document_exists_by_url(package["package_id"], candidate.url, db_path=db_path):
-            database.create_document_record(
-                _document_record(
-                    package,
-                    candidate,
-                    status=config.DOCUMENT_STATUS_DUPLICATE,
-                    category=category,
-                    document_id=f"{document_id}-DUP-{secrets.token_hex(3).upper()}",
-                ),
-                db_path=db_path,
-            )
+        existing = database.get_document_by_url(package["package_id"], candidate.url, db_path=db_path)
+        if existing and existing.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED:
+            summary["already_collected"] += 1
             summary["skipped"] += 1
             continue
         try:
@@ -263,18 +263,9 @@ def download_selected_ir_documents(
             if not content.startswith(b"%PDF"):
                 raise HttpClientError("Downloaded file did not contain a valid PDF signature.")
             sha = hashlib.sha256(content).hexdigest()
-            if database.document_exists_by_hash(package["package_id"], sha, db_path=db_path):
-                database.create_document_record(
-                    _document_record(
-                        package,
-                        candidate,
-                        status=config.DOCUMENT_STATUS_DUPLICATE,
-                        category=category,
-                        document_id=f"{document_id}-HASH-{secrets.token_hex(3).upper()}",
-                        content=content,
-                    ),
-                    db_path=db_path,
-                )
+            existing_hash = database.get_document_by_hash(package["package_id"], sha, db_path=db_path)
+            if existing_hash and existing_hash.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED:
+                summary["duplicate"] += 1
                 summary["skipped"] += 1
                 continue
             path = safe_document_path(package["package_id"], "investor_relations", candidate.filename)
@@ -285,13 +276,14 @@ def download_selected_ir_documents(
                     candidate,
                     status=config.DOCUMENT_STATUS_DOWNLOADED,
                     category=category,
-                    document_id=document_id,
+                    document_id=database.generate_document_id("DOC-IR"),
                     local_path=path,
                     content=content,
                 ),
                 db_path=db_path,
             )
             summary["downloaded"] += 1
+            summary["downloaded_now"] += 1
         except Exception as exc:
             database.create_document_record(
                 _document_record(
@@ -299,15 +291,18 @@ def download_selected_ir_documents(
                     candidate,
                     status=config.DOCUMENT_STATUS_FAILED,
                     category=category,
-                    document_id=f"{document_id}-FAIL-{secrets.token_hex(3).upper()}",
+                    document_id=database.generate_document_id("DOC-IR"),
                     error_message=str(exc),
                 ),
                 db_path=db_path,
             )
-            summary["failed"] += 1
+            if "HTTP 404" in str(exc):
+                summary["not_found"] += 1
+            else:
+                summary["failed"] += 1
     run_status = (
         config.COLLECTION_STATUS_COMPLETE
-        if summary["failed"] == 0
+        if summary["failed"] == 0 and summary["not_found"] == 0
         else config.COLLECTION_STATUS_PARTIAL
         if summary["downloaded"] or summary["skipped"]
         else config.COLLECTION_STATUS_FAILED
@@ -319,6 +314,9 @@ def download_selected_ir_documents(
         documents_downloaded=summary["downloaded"],
         documents_skipped=summary["skipped"],
         documents_failed=summary["failed"],
+        documents_already_collected=summary["already_collected"],
+        documents_duplicated=summary["duplicate"],
+        documents_not_found=summary["not_found"],
         db_path=db_path,
     )
     database.update_package_collection_state(

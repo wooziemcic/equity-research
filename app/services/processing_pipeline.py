@@ -149,6 +149,10 @@ def run_processing_pipeline(
     if not eligibility.is_eligible or not eligibility.version or not eligibility.root:
         raise ValueError("Processing blocked: " + "; ".join(eligibility.errors))
     version = eligibility.version
+    existing_runs = database.list_processing_runs(version_id, db_path=db_path)
+    for existing in existing_runs:
+        if existing.get("status") in {config.PROCESSING_STATUS_RUNNING, config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}:
+            return existing
     run_id = _run_id()
     ocr_config = {
         "enabled": config.OCR_ENABLED if ocr_enabled is None else bool(ocr_enabled),

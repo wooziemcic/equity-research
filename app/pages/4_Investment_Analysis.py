@@ -19,6 +19,7 @@ from app.services.analysis_pipeline import create_analysis_run, validate_analysi
 from app.services.evidence_service import create_analyst_evidence_from_chunk, verify_evidence_record
 from app.services.evidence_taxonomy import evidence_type_options
 from app.services.processing_pipeline import run_processing_pipeline, validate_processing_eligibility
+from app.services.openai_service import preflight_openai
 from app.services.recommendation_engine import complete_analyst_review, override_scorecard_item, pm_decision
 from app.services.reporting.investment_report import generate_investment_report
 from app.services.retrieval_service import search_chunks
@@ -64,12 +65,12 @@ def _select_locked_version(package: dict[str, Any]) -> dict[str, Any] | None:
     if not versions:
         render_empty_state("No locked verified version.", "Build and lock a package version in Package Review.")
         return None
-    labels = {f"{version['version_id']} ({version.get('integrity_status')})": version for version in versions}
+    labels = {f"{version.get('display_version') or version['version_id']} [{version['version_id']}] ({version.get('integrity_status')})": version for version in versions}
     selected = st.selectbox("Version", options=list(labels.keys()))
     version = labels[selected]
     docs = database.list_package_version_documents(version["version_id"])
     cols = st.columns(5)
-    cols[0].metric("Version ID", version["version_id"])
+    cols[0].metric("Display Version", version.get("display_version") or version["version_id"])
     cols[1].metric("Cutoff", version["research_cutoff_date"])
     cols[2].metric("Documents", len(docs))
     cols[3].metric("Integrity", version.get("integrity_status") or "")
@@ -495,6 +496,13 @@ def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str
     cols[0].metric("Analysis Pipeline", config.ANALYSIS_PIPELINE_VERSION)
     cols[1].metric("Scorecard", config.SCORECARD_VERSION)
     cols[2].metric("Valuation Config", config.VALUATION_CONFIGURATION_VERSION)
+    if config.OPENAI_REQUIRED:
+        if st.button("Test OpenAI Connectivity"):
+            result = preflight_openai(force=True)
+            if result.connected:
+                st.success(f"OpenAI connected. Model: {result.model}. AI extraction: enabled. AI narrative: enabled.")
+            else:
+                st.error(result.message or "OpenAI connectivity failed.")
     if st.button("Create Analysis Run", type="primary", disabled=bool(eligibility.errors)):
         try:
             created = create_analysis_run(version["version_id"], run["processing_run_id"])
@@ -518,6 +526,7 @@ def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str
                 "Confidence": item.get("confidence") or "",
                 "Evidence Coverage": item.get("evidence_coverage"),
                 "Reference Price": item.get("reference_price"),
+                "AI Review": item.get("ai_review_status") or "",
                 "Updated": item.get("updated_at"),
             }
             for item in runs
@@ -527,7 +536,17 @@ def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str
     )
     labels = {item["analysis_run_id"]: item for item in runs}
     selected = st.selectbox("Selected analysis run", options=list(labels.keys()))
-    return labels[selected]
+    selected_run = labels[selected]
+    if config.OPENAI_REQUIRED and selected_run.get("status") == config.ANALYSIS_STATUS_FAILED:
+        if st.button("Retry OpenAI Analysis"):
+            try:
+                retried = create_analysis_run(version["version_id"], run["processing_run_id"])
+                st.success(f"OpenAI analysis retry created {retried['analysis_run_id']}.")
+                st.rerun()
+            except Exception as exc:
+                logger.exception("OpenAI analysis retry failed")
+                st.error(f"OpenAI analysis retry failed: {exc}")
+    return selected_run
 
 
 def _analysis_metrics_tab(analysis_run: dict[str, Any]) -> None:

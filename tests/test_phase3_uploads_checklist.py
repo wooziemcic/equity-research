@@ -102,7 +102,9 @@ def test_upload_batch_limit_and_duplicate_hash(package: dict, temp_db: Path) -> 
     assert first["uploaded"] == 1
     assert second["duplicated"] == 1
     docs = database.list_documents_by_package(package["package_id"], db_path=temp_db)
+    assert len(docs) == 1
     assert any(not int(doc["is_public"]) for doc in docs)
+    assert docs[0]["source_identity_key"] == f"upload:{docs[0]['sha256_hash']}"
 
 
 @pytest.mark.parametrize(

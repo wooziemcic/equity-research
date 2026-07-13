@@ -177,7 +177,7 @@ def validate_package_readiness(
     return ReadinessResult(status, errors, warnings, notices)
 
 
-def _version_id(package: dict[str, Any], version_number: int) -> str:
+def _display_version(package: dict[str, Any], version_number: int) -> str:
     cutoff = str(package["research_cutoff_date"]).replace("-", "")
     return f"{sanitize_filename(package['ticker'])}-{cutoff}-V{version_number:03d}"
 
@@ -273,15 +273,9 @@ def build_package_version(
             db_path=db_path,
         )
         raise ValueError("Package is not ready to build.")
-    version_number = database.next_package_version_number(package["package_id"], db_path=db_path)
-    previous = database.latest_package_version(package["package_id"], db_path=db_path)
-    version_id = _version_id(package, version_number)
-    version = database.create_package_version(
+    version = database.allocate_package_version(
         {
-            "version_id": version_id,
             "parent_package_id": package["package_id"],
-            "version_number": version_number,
-            "previous_version_id": previous.get("version_id") if previous else None,
             "ticker": package["ticker"],
             "company_name": package.get("company_name"),
             "security_type": package["security_type"],
@@ -293,6 +287,8 @@ def build_package_version(
         },
         db_path=db_path,
     )
+    version_id = version["version_id"]
+    version_number = int(version["version_number"])
     database.create_package_version_event(
         event_id=f"PVE-{secrets.token_hex(8).upper()}",
         parent_package_id=package["package_id"],
@@ -512,6 +508,7 @@ def _manifest(package: dict[str, Any], version: dict[str, Any], docs: list[dict[
         "schema_version": "4.0",
         "package_id": package["package_id"],
         "version_id": version["version_id"],
+        "display_version": version.get("display_version"),
         "version_number": version["version_number"],
         "ticker": package["ticker"],
         "company_name": package.get("company_name"),

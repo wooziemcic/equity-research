@@ -1,6 +1,7 @@
 streamlit>=1.36
 pytest>=8.0
 requests>=2.32
+python-dotenv>=1.0
 openpyxl>=3.1
 PyMuPDF>=1.24
 pypdf>=4.0
@@ -8,3 +9,5 @@ python-docx>=1.1
 Pillow>=10.0
 pytesseract>=0.3.10
 reportlab>=4.0
+openai>=2.45.0
+pydantic>=2.10

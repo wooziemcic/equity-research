@@ -3,15 +3,16 @@ from __future__ import annotations
 import json
 from datetime import date
 from pathlib import Path
+from typing import Any
 
 import pytest
 from docx import Document
 from streamlit.testing.v1 import AppTest
 
 from app import config
-from app.services.analysis.financial_metrics import calculate_revenue_growth
+from app.services.analysis.financial_metrics import calculate_metrics, calculate_revenue_growth
 from app.services.analysis.scenario_analysis import set_scenario_probabilities
-from app.services.analysis_pipeline import create_analysis_run, validate_analysis_eligibility
+from app.services.analysis_pipeline import AnalysisPipelineError, create_analysis_run, load_analysis_diagnostics, validate_analysis_eligibility
 from app.services.checklist_service import ensure_package_checklist
 from app.services.package_builder import build_package_version, lock_version
 from app.services.package_service import PackageInput, create_package
@@ -102,13 +103,14 @@ def _add_evidence(
     evidence_id: str,
     evidence_type: str,
     metric_name: str,
-    value: float | None,
+    value: Any,
     unit: str | None = None,
     currency: str | None = "USD",
     period: str | None = "FY2026",
     claim: str | None = None,
     confidence: str = "High",
     verification_status: str = config.VERIFICATION_SUPPORTS,
+    analyst_status: str = config.ANALYST_STATUS_ACCEPTED,
 ) -> dict:
     chunk = database.list_document_chunks(run["processing_run_id"], version_id=run["version_id"], db_path=temp_db)[0]
     locator = json.loads(chunk["source_locator_json"])
@@ -136,7 +138,7 @@ def _add_evidence(
         "extraction_method": "TEST_EVIDENCE",
         "confidence": confidence,
         "verification_status": verification_status,
-        "analyst_status": config.ANALYST_STATUS_ACCEPTED,
+        "analyst_status": analyst_status,
         "analyst_note": "",
         "source_locator_json": json.dumps(locator, sort_keys=True),
         "source_text_hash": None,
@@ -187,7 +189,9 @@ def test_phase6_schema_and_eligibility_blocks_bad_inputs(temp_db: Path) -> None:
     locked = lock_version(built["version_id"], db_path=temp_db)
     assert not validate_analysis_eligibility(locked["version_id"], db_path=temp_db).is_eligible
     no_evidence_run = run_processing_pipeline(locked["version_id"], db_path=temp_db)
-    assert not validate_analysis_eligibility(locked["version_id"], no_evidence_run["processing_run_id"], db_path=temp_db).is_eligible
+    no_evidence = validate_analysis_eligibility(locked["version_id"], no_evidence_run["processing_run_id"], db_path=temp_db)
+    assert no_evidence.is_eligible
+    assert any("no evidence records" in limitation.lower() for limitation in no_evidence.limitations)
     _, other_version, other_run = _locked_processed_version(temp_db, "Revenue was $1 million.", ticker="ABC")
     wrong = validate_analysis_eligibility(locked["version_id"], other_run["processing_run_id"], db_path=temp_db)
     assert not wrong.is_eligible
@@ -227,6 +231,163 @@ def test_analysis_run_calculations_scorecard_recommendation_and_scenarios(temp_d
     assert round(sum(item["probability"] for item in updated), 6) == 1
     with pytest.raises(ValueError):
         set_scenario_probabilities(analysis["analysis_run_id"], {"Bear": 0.2, "Base": 0.5, "Bull": 0.2}, rationale="Bad total.", db_path=temp_db)
+
+
+def test_analysis_gracefully_abstains_without_evidence_and_generates_report(temp_db: Path) -> None:
+    _, version, run = _locked_processed_version(temp_db, "Plain source document without metric content.")
+    eligibility = validate_analysis_eligibility(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    assert eligibility.is_eligible
+    assert any("no evidence records" in limitation.lower() for limitation in eligibility.limitations)
+
+    analysis = create_analysis_run(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    assert analysis["status"] != config.ANALYSIS_STATUS_FAILED
+    assert analysis["preliminary_recommendation"] == config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+    decision = database.get_recommendation_decision(analysis["analysis_run_id"], db_path=temp_db)
+    assert decision["preliminary_rating"] == config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+    assert "No verified package-supported evidence" in decision["abstention_reason"]
+    diagnostics = load_analysis_diagnostics(analysis)
+    assert diagnostics["metric_diagnostics"]["evidence_records"] == 0
+    draft = generate_investment_report(analysis["analysis_run_id"], final=False, db_path=temp_db)
+    assert draft["report_status"] == config.REPORT_STATUS_DRAFT
+
+
+def test_analysis_warns_when_verified_evidence_is_unaccepted(temp_db: Path) -> None:
+    _, version, run = _locked_processed_version(temp_db)
+    _add_evidence(
+        temp_db,
+        run,
+        evidence_id="EVD-UNREVIEWED-REV",
+        evidence_type="REPORTED_REVENUE",
+        metric_name="revenue",
+        value=100.0,
+        unit="million",
+        analyst_status=config.ANALYST_STATUS_UNREVIEWED,
+    )
+    eligibility = validate_analysis_eligibility(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    assert eligibility.is_eligible
+    assert any("no records have been accepted" in warning for warning in eligibility.warnings)
+    analysis = create_analysis_run(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    diagnostics = load_analysis_diagnostics(analysis)
+    assert diagnostics["metric_diagnostics"]["verified_records"] == 1
+    assert diagnostics["metric_diagnostics"]["accepted_records"] == 0
+    assert any("preliminary draft analysis" in warning for warning in diagnostics["warnings"])
+
+
+def test_no_verified_evidence_abstains_without_failing_analysis(temp_db: Path) -> None:
+    _, version, run = _locked_processed_version(temp_db)
+    _add_evidence(
+        temp_db,
+        run,
+        evidence_id="EVD-PENDING-REV",
+        evidence_type="REPORTED_REVENUE",
+        metric_name="revenue",
+        value=100.0,
+        unit="million",
+        verification_status=config.VERIFICATION_PENDING,
+    )
+    analysis = create_analysis_run(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    diagnostics = load_analysis_diagnostics(analysis)
+    assert analysis["status"] != config.ANALYSIS_STATUS_FAILED
+    assert diagnostics["metric_diagnostics"]["evidence_records"] == 1
+    assert diagnostics["metric_diagnostics"]["verified_records"] == 0
+    assert diagnostics["metric_diagnostics"]["usable_evidence_records"] == 0
+    decision = database.get_recommendation_decision(analysis["analysis_run_id"], db_path=temp_db)
+    assert decision["preliminary_rating"] == config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+
+
+def test_missing_reference_price_and_partial_financial_evidence_are_limitations(temp_db: Path) -> None:
+    _, version, run = _locked_processed_version(temp_db)
+    _add_evidence(temp_db, run, evidence_id="EVD-REV-A", evidence_type="REPORTED_REVENUE", metric_name="revenue", value=100.0, unit="million", period="FY2025")
+    _add_evidence(temp_db, run, evidence_id="EVD-REV-B", evidence_type="REPORTED_REVENUE", metric_name="revenue", value=110.0, unit="million", period="FY2026")
+    _add_evidence(temp_db, run, evidence_id="EVD-FCF-MISMATCH", evidence_type="REPORTED_CASH_FLOW", metric_name="cash_flow", value=20.0, unit="million", period="FY2024")
+
+    analysis = create_analysis_run(version["version_id"], run["processing_run_id"], db_path=temp_db)
+    assert analysis["status"] != config.ANALYSIS_STATUS_FAILED
+    diagnostics = load_analysis_diagnostics(analysis)
+    limitations = " ".join(diagnostics["limitations"]).lower()
+    assert "reference price" in limitations
+    assert "same-period revenue and cash-flow" in limitations
+    decision = database.get_recommendation_decision(analysis["analysis_run_id"], db_path=temp_db)
+    assert decision["preliminary_rating"] in {config.RECOMMENDATION_INSUFFICIENT_EVIDENCE, config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED}
+
+
+def test_metric_extraction_normalizes_sec_style_values(temp_db: Path) -> None:
+    records = [
+        {
+            "evidence_id": "EVD-SEC-REV-25",
+            "evidence_type": "REPORTED_REVENUE",
+            "metric_name": None,
+            "value": "$1,000",
+            "unit": "million",
+            "currency": "USD",
+            "period": "FY2025",
+            "verification_status": config.VERIFICATION_SUPPORTS,
+            "analyst_status": config.ANALYST_STATUS_ACCEPTED,
+            "confidence": "High",
+        },
+        {
+            "evidence_id": "EVD-SEC-REV-26",
+            "evidence_type": "REPORTED_REVENUE",
+            "metric_name": "Reported Revenue",
+            "value": "$1.2 billion",
+            "unit": None,
+            "currency": "USD",
+            "period": "FY2026",
+            "verification_status": config.VERIFICATION_SUPPORTS,
+            "analyst_status": config.ANALYST_STATUS_ACCEPTED,
+            "confidence": "High",
+        },
+        {
+            "evidence_id": "EVD-SEC-MARGIN",
+            "evidence_type": "REPORTED_MARGIN",
+            "metric_name": "reported margin",
+            "value": "12%",
+            "unit": None,
+            "currency": None,
+            "period": "FY2026",
+            "verification_status": config.VERIFICATION_SUPPORTS,
+            "analyst_status": config.ANALYST_STATUS_ACCEPTED,
+            "confidence": "High",
+        },
+        {
+            "evidence_id": "EVD-SEC-EBITDA",
+            "evidence_type": "OTHER_FACT",
+            "metric_name": "Adjusted EBITDA",
+            "value": "(25)",
+            "unit": "million",
+            "currency": "USD",
+            "period": "FY2026",
+            "verification_status": config.VERIFICATION_SUPPORTS,
+            "analyst_status": config.ANALYST_STATUS_ACCEPTED,
+            "confidence": "High",
+        },
+    ]
+    metrics = calculate_metrics(records, analysis_run_id="RUN-NORMALIZE", db_path=temp_db)
+    by_code = {metric.metric_code: metric for metric in metrics}
+    assert by_code["REVENUE"].value == 1_200_000_000
+    assert float(by_code["REPORTED_MARGIN"].value) == pytest.approx(0.12)
+    assert by_code["EBITDA"].value == -25_000_000
+    assert float(by_code["REVENUE_GROWTH_CALCULATED"].value) == pytest.approx(0.2)
+
+
+def test_metric_calculation_exception_persists_safe_diagnostics(temp_db: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    _, version, run = _locked_processed_version(temp_db)
+    _add_evidence(temp_db, run, evidence_id="EVD-EXC-REV", evidence_type="REPORTED_REVENUE", metric_name="revenue", value=100.0)
+
+    def boom(*args, **kwargs) -> None:
+        raise RuntimeError("metric parser exploded token=secret")
+
+    monkeypatch.setattr("app.services.analysis_pipeline.calculate_metrics", boom)
+    with pytest.raises(AnalysisPipelineError) as raised:
+        create_analysis_run(version["version_id"], run["processing_run_id"], db_path=temp_db)
+
+    failed = database.list_analysis_runs(version["version_id"], processing_run_id=run["processing_run_id"], db_path=temp_db)[0]
+    assert failed["status"] == config.ANALYSIS_STATUS_FAILED
+    diagnostics = load_analysis_diagnostics(failed)
+    assert diagnostics["metric_diagnostics"]["exception_type"] == "RuntimeError"
+    assert diagnostics["metric_diagnostics"]["analysis_run_id"] == failed["analysis_run_id"]
+    assert diagnostics["metric_diagnostics"]["evidence_records"] >= 1
+    assert raised.value.analysis_run_id == failed["analysis_run_id"]
 
 
 def test_recommendation_rule_outcomes(temp_db: Path) -> None:

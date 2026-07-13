@@ -273,7 +273,7 @@ def _build_package_section(package: dict) -> None:
     if st.button("Build Package Version", type="primary", disabled=bool(readiness.errors)):
         try:
             version = build_package_version(package, notes=notes)
-            st.success(f"Built package version {version['version_id']}. Integrity: {version.get('integrity_status')}")
+            st.success(f"Built {version.get('display_version') or version['version_id']}. Integrity: {version.get('integrity_status')}")
             st.rerun()
         except Exception as exc:
             logger.exception("Package build failed")
@@ -292,6 +292,7 @@ def _version_history(package: dict) -> None:
         [
             {
                 "Version ID": version["version_id"],
+                "Display Version": version.get("display_version") or "",
                 "Status": version["status"],
                 "Created": version["created_at"],
                 "Locked": version.get("locked_at") or "",
