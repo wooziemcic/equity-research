@@ -1,0 +1,15 @@
+@'
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cutler-equity-research"
+version = "0.1.0"
+description = "Cutler Equity Research Workbench"
+requires-python = ">=3.11,<3.13"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["app*"]
+'@ | Set-Content pyproject.toml
