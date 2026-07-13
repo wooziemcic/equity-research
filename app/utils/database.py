@@ -69,6 +69,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase3_tables(connection)
         _ensure_phase4_package_columns(connection)
         _create_phase4_tables(connection)
+        _create_phase5_tables(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -372,6 +373,243 @@ def _create_phase4_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_package_version_documents_version ON package_version_documents (version_id)",
         "CREATE INDEX IF NOT EXISTS idx_package_version_events_version ON package_version_events (version_id)",
         "CREATE INDEX IF NOT EXISTS idx_package_version_events_parent ON package_version_events (parent_package_id)",
+    ):
+        connection.execute(sql)
+
+
+def _create_phase5_tables(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processing_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            processing_run_id TEXT NOT NULL UNIQUE,
+            version_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            pipeline_version TEXT NOT NULL,
+            parser_config_version TEXT NOT NULL,
+            embedding_config_json TEXT,
+            ocr_config_json TEXT,
+            retrieval_config_json TEXT,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            total_documents INTEGER NOT NULL DEFAULT 0,
+            successful_documents INTEGER NOT NULL DEFAULT 0,
+            partial_documents INTEGER NOT NULL DEFAULT 0,
+            failed_documents INTEGER NOT NULL DEFAULT 0,
+            pages_processed INTEGER NOT NULL DEFAULT 0,
+            tables_detected INTEGER NOT NULL DEFAULT 0,
+            sheets_processed INTEGER NOT NULL DEFAULT 0,
+            chunks_created INTEGER NOT NULL DEFAULT 0,
+            evidence_records_created INTEGER NOT NULL DEFAULT 0,
+            warnings_json TEXT,
+            errors_json TEXT,
+            created_by TEXT NOT NULL,
+            status TEXT NOT NULL,
+            FOREIGN KEY (version_id) REFERENCES package_versions(version_id),
+            FOREIGN KEY (package_id) REFERENCES packages(package_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_processing_results (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            result_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            original_document_id TEXT,
+            parser_used TEXT NOT NULL,
+            parser_version TEXT NOT NULL,
+            processing_status TEXT NOT NULL,
+            detected_language TEXT,
+            page_count INTEGER NOT NULL DEFAULT 0,
+            sheet_count INTEGER NOT NULL DEFAULT 0,
+            extracted_character_count INTEGER NOT NULL DEFAULT 0,
+            ocr_required INTEGER NOT NULL DEFAULT 0,
+            ocr_pages INTEGER NOT NULL DEFAULT 0,
+            table_count INTEGER NOT NULL DEFAULT 0,
+            warning_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            extracted_content_path TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_pages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            page_record_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            page_number INTEGER NOT NULL,
+            page_label TEXT,
+            extraction_method TEXT NOT NULL,
+            native_text_character_count INTEGER NOT NULL DEFAULT 0,
+            ocr_text_character_count INTEGER NOT NULL DEFAULT 0,
+            ocr_confidence REAL,
+            page_text_path TEXT,
+            normalized_text TEXT,
+            image_render_path TEXT,
+            processing_warnings_json TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_sheets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            sheet_record_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            sheet_name TEXT NOT NULL,
+            sheet_index INTEGER NOT NULL,
+            hidden_state TEXT,
+            used_range TEXT,
+            formula_cell_count INTEGER NOT NULL DEFAULT 0,
+            cached_value_cell_count INTEGER NOT NULL DEFAULT 0,
+            external_link_count INTEGER NOT NULL DEFAULT 0,
+            warning_flags TEXT,
+            extracted_representation_path TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS document_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chunk_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            page_number INTEGER,
+            sheet_name TEXT,
+            row_range TEXT,
+            section_heading TEXT,
+            chunk_index INTEGER NOT NULL,
+            chunk_text TEXT NOT NULL,
+            character_count INTEGER NOT NULL,
+            token_estimate INTEGER NOT NULL,
+            extraction_method TEXT NOT NULL,
+            source_locator_json TEXT NOT NULL,
+            chunk_hash TEXT NOT NULL,
+            duplicate_group_id TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS evidence_records (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            evidence_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            evidence_type TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            normalized_subject TEXT,
+            metric_name TEXT,
+            value REAL,
+            unit TEXT,
+            currency TEXT,
+            period TEXT,
+            scenario TEXT,
+            direction TEXT,
+            source_text TEXT NOT NULL,
+            page_number INTEGER,
+            sheet_name TEXT,
+            cell_or_row_range TEXT,
+            section_heading TEXT,
+            extraction_method TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            verification_status TEXT NOT NULL,
+            analyst_status TEXT NOT NULL,
+            analyst_note TEXT,
+            source_locator_json TEXT,
+            source_text_hash TEXT,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS citation_verifications (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            verification_id TEXT NOT NULL UNIQUE,
+            evidence_id TEXT NOT NULL,
+            citation_locator_json TEXT NOT NULL,
+            verification_method TEXT NOT NULL,
+            support_status TEXT NOT NULL,
+            support_score REAL NOT NULL,
+            verifier_note TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (evidence_id) REFERENCES evidence_records(evidence_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS content_duplicate_groups (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            duplicate_group_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            duplicate_type TEXT NOT NULL,
+            canonical_chunk_hash TEXT NOT NULL,
+            member_count INTEGER NOT NULL,
+            member_chunk_ids_json TEXT NOT NULL,
+            explanation TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS claim_conflicts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conflict_id TEXT NOT NULL UNIQUE,
+            processing_run_id TEXT NOT NULL,
+            subject TEXT,
+            metric TEXT,
+            period TEXT,
+            evidence_id_a TEXT NOT NULL,
+            evidence_id_b TEXT NOT NULL,
+            conflict_type TEXT NOT NULL,
+            severity TEXT NOT NULL,
+            explanation TEXT NOT NULL,
+            analyst_status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_processing_runs_version ON processing_runs (version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_processing_runs_package ON processing_runs (package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_processing_results_run ON document_processing_results (processing_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_pages_run_doc ON document_pages (processing_run_id, version_document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_sheets_run_doc ON document_sheets (processing_run_id, version_document_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_run ON document_chunks (processing_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_version ON document_chunks (version_id)",
+        "CREATE INDEX IF NOT EXISTS idx_document_chunks_hash ON document_chunks (chunk_hash)",
+        "CREATE INDEX IF NOT EXISTS idx_evidence_records_run ON evidence_records (processing_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_evidence_records_type ON evidence_records (evidence_type)",
+        "CREATE INDEX IF NOT EXISTS idx_citation_verifications_evidence ON citation_verifications (evidence_id)",
+        "CREATE INDEX IF NOT EXISTS idx_duplicate_groups_run ON content_duplicate_groups (processing_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_claim_conflicts_run ON claim_conflicts (processing_run_id)",
     ):
         connection.execute(sql)
 
@@ -1668,4 +1906,431 @@ def phase4_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str
         "locked_versions": int(locked["count"]),
         "integrity_failures": int(failures["count"]),
         "packages_ready_to_build": int(ready["count"]),
+    }
+
+
+def _insert_record(
+    table: str,
+    record: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    initialize_database(db_path)
+    clean_record = {key: value for key, value in record.items() if key != "id"}
+    keys = list(clean_record.keys())
+    placeholders = ", ".join("?" for _ in keys)
+    columns = ", ".join(keys)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+            tuple(clean_record[key] for key in keys),
+        )
+    return clean_record
+
+
+def create_processing_run(
+    run: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    _insert_record("processing_runs", run, db_path=db_path)
+    return get_processing_run(run["processing_run_id"], db_path=db_path) or run
+
+
+def get_processing_run(
+    processing_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM processing_runs WHERE processing_run_id = ?",
+            (processing_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_processing_run(
+    processing_run_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "completed_at",
+        "total_documents",
+        "successful_documents",
+        "partial_documents",
+        "failed_documents",
+        "pages_processed",
+        "tables_detected",
+        "sheets_processed",
+        "chunks_created",
+        "evidence_records_created",
+        "warnings_json",
+        "errors_json",
+        "status",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_processing_run(processing_run_id, db_path=db_path)
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"UPDATE processing_runs SET {sql} WHERE processing_run_id = ?",
+            (*selected.values(), processing_run_id),
+        )
+    return get_processing_run(processing_run_id, db_path=db_path)
+
+
+def list_processing_runs(
+    version_id: str | None = None,
+    *,
+    package_id: str | None = None,
+    limit: int | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM processing_runs"
+    params: list[Any] = []
+    clauses: list[str] = []
+    if version_id:
+        clauses.append("version_id = ?")
+        params.append(version_id)
+    if package_id:
+        clauses.append("package_id = ?")
+        params.append(package_id)
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY started_at DESC"
+    if limit is not None:
+        sql += " LIMIT ?"
+        params.append(limit)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_document_processing_result(
+    result: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("document_processing_results", result, db_path=db_path)
+
+
+def list_document_processing_results(
+    processing_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM document_processing_results
+            WHERE processing_run_id = ?
+            ORDER BY version_document_id
+            """,
+            (processing_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_document_page(
+    page: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("document_pages", page, db_path=db_path)
+
+
+def list_document_pages(
+    processing_run_id: str,
+    version_document_id: str | None = None,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM document_pages WHERE processing_run_id = ?"
+    params: list[Any] = [processing_run_id]
+    if version_document_id:
+        sql += " AND version_document_id = ?"
+        params.append(version_document_id)
+    sql += " ORDER BY version_document_id, page_number"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_document_sheet(
+    sheet: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("document_sheets", sheet, db_path=db_path)
+
+
+def list_document_sheets(
+    processing_run_id: str,
+    version_document_id: str | None = None,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM document_sheets WHERE processing_run_id = ?"
+    params: list[Any] = [processing_run_id]
+    if version_document_id:
+        sql += " AND version_document_id = ?"
+        params.append(version_document_id)
+    sql += " ORDER BY version_document_id, sheet_index"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_document_chunk(
+    chunk: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("document_chunks", chunk, db_path=db_path)
+
+
+def update_document_chunk_duplicate_group(
+    chunk_id: str,
+    duplicate_group_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            "UPDATE document_chunks SET duplicate_group_id = ? WHERE chunk_id = ?",
+            (duplicate_group_id, chunk_id),
+        )
+
+
+def list_document_chunks(
+    processing_run_id: str,
+    *,
+    version_id: str | None = None,
+    version_document_id: str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM document_chunks WHERE processing_run_id = ?"
+    params: list[Any] = [processing_run_id]
+    if version_id:
+        sql += " AND version_id = ?"
+        params.append(version_id)
+    if version_document_id:
+        sql += " AND version_document_id = ?"
+        params.append(version_document_id)
+    sql += " ORDER BY version_document_id, chunk_index"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_evidence_record(
+    evidence: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("evidence_records", evidence, db_path=db_path)
+
+
+def get_evidence_record(
+    evidence_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM evidence_records WHERE evidence_id = ?",
+            (evidence_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def list_evidence_records(
+    processing_run_id: str,
+    *,
+    version_id: str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    sql = "SELECT * FROM evidence_records WHERE processing_run_id = ?"
+    params: list[Any] = [processing_run_id]
+    if version_id:
+        sql += " AND version_id = ?"
+        params.append(version_id)
+    sql += " ORDER BY created_at, evidence_id"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_evidence_record(
+    evidence_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "verification_status",
+        "analyst_status",
+        "analyst_note",
+        "claim_text",
+        "evidence_type",
+        "normalized_subject",
+        "metric_name",
+        "value",
+        "unit",
+        "currency",
+        "period",
+        "scenario",
+        "direction",
+        "updated_at",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_evidence_record(evidence_id, db_path=db_path)
+    if "updated_at" not in selected:
+        selected["updated_at"] = utc_now_iso()
+    sql = ", ".join(f"{key} = ?" for key in selected)
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"UPDATE evidence_records SET {sql} WHERE evidence_id = ?",
+            (*selected.values(), evidence_id),
+        )
+    return get_evidence_record(evidence_id, db_path=db_path)
+
+
+def update_evidence_analyst_status(
+    evidence_id: str,
+    analyst_status: str,
+    analyst_note: str | None = None,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    return update_evidence_record(
+        evidence_id,
+        {"analyst_status": analyst_status, "analyst_note": analyst_note or ""},
+        db_path=db_path,
+    )
+
+
+def create_citation_verification(
+    verification: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("citation_verifications", verification, db_path=db_path)
+
+
+def list_citation_verifications(
+    evidence_id: str | None = None,
+    *,
+    processing_run_id: str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    if evidence_id:
+        with get_connection(db_path) as connection:
+            rows = connection.execute(
+                "SELECT * FROM citation_verifications WHERE evidence_id = ? ORDER BY created_at DESC",
+                (evidence_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    if processing_run_id:
+        with get_connection(db_path) as connection:
+            rows = connection.execute(
+                """
+                SELECT cv.*
+                FROM citation_verifications cv
+                JOIN evidence_records er ON er.evidence_id = cv.evidence_id
+                WHERE er.processing_run_id = ?
+                ORDER BY cv.created_at DESC
+                """,
+                (processing_run_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+    return []
+
+
+def create_duplicate_group(
+    duplicate_group: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("content_duplicate_groups", duplicate_group, db_path=db_path)
+
+
+def list_duplicate_groups(
+    processing_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM content_duplicate_groups
+            WHERE processing_run_id = ?
+            ORDER BY member_count DESC, duplicate_group_id
+            """,
+            (processing_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_claim_conflict(
+    conflict: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    return _insert_record("claim_conflicts", conflict, db_path=db_path)
+
+
+def list_claim_conflicts(
+    processing_run_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            """
+            SELECT *
+            FROM claim_conflicts
+            WHERE processing_run_id = ?
+            ORDER BY severity DESC, created_at DESC
+            """,
+            (processing_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def phase5_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str, int]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        runs = connection.execute("SELECT COUNT(*) AS count FROM processing_runs").fetchone()
+        completed = connection.execute(
+            "SELECT COUNT(*) AS count FROM processing_runs WHERE status IN ('COMPLETED', 'COMPLETED_WITH_WARNINGS')"
+        ).fetchone()
+        evidence = connection.execute("SELECT COUNT(*) AS count FROM evidence_records").fetchone()
+        conflicts = connection.execute("SELECT COUNT(*) AS count FROM claim_conflicts").fetchone()
+    return {
+        "processing_runs": int(runs["count"]),
+        "completed_processing_runs": int(completed["count"]),
+        "evidence_records": int(evidence["count"]),
+        "claim_conflicts": int(conflicts["count"]),
     }

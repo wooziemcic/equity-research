@@ -90,9 +90,13 @@ def _render_roadmap() -> None:
                 <strong>Phase 4</strong>
                 <span>Readiness validation, manifests, inventory files, immutable versions, locking, and ZIP exports.</span>
             </div>
+            <div class="roadmap-item roadmap-ready">
+                <strong>Phase 5</strong>
+                <span>Closed-corpus document processing, retrieval, evidence extraction, citations, duplicates, and conflicts.</span>
+            </div>
             <div class="roadmap-item">
                 <strong>Future Phases</strong>
-                <span>Document analysis, evidence extraction, investment recommendations, PM approval, and final reports.</span>
+                <span>Investment recommendations, PM approval, and final reports.</span>
             </div>
         </div>
         """,
@@ -120,6 +124,7 @@ def main() -> None:
         collection_metrics = database.dashboard_public_collection_metrics()
         phase3_metrics = database.phase3_dashboard_metrics()
         phase4_metrics = database.phase4_dashboard_metrics()
+        phase5_metrics = database.phase5_dashboard_metrics()
     except DatabaseError:
         logger.exception("Unable to initialize dashboard metrics")
         st.error("The database could not be initialized. Check file permissions and try again.")
@@ -127,6 +132,7 @@ def main() -> None:
         collection_metrics = {"public_documents": 0, "resolved_packages": 0, "failed_items": 0}
         phase3_metrics = {"licensed_documents": 0, "packages_needing_review": 0, "missing_core_items": 0}
         phase4_metrics = {"built_versions": 0, "locked_versions": 0, "packages_ready_to_build": 0, "integrity_failures": 0}
+        phase5_metrics = {"processing_runs": 0, "completed_processing_runs": 0, "evidence_records": 0, "claim_conflicts": 0}
 
     metric_columns = st.columns(4)
     with metric_columns[0]:
@@ -176,6 +182,15 @@ def main() -> None:
         render_metric_card("Ready To Build", phase4_metrics["packages_ready_to_build"], "Checklist reviewed packages")
     with export_columns[3]:
         render_metric_card("Integrity Failures", phase4_metrics["integrity_failures"], "Build or verification failures")
+    evidence_columns = st.columns(4)
+    with evidence_columns[0]:
+        render_metric_card("Processing Runs", phase5_metrics["processing_runs"], "Locked corpus processing")
+    with evidence_columns[1]:
+        render_metric_card("Completed Runs", phase5_metrics["completed_processing_runs"], "Finished evidence pipelines")
+    with evidence_columns[2]:
+        render_metric_card("Evidence Records", phase5_metrics["evidence_records"], "Cited extracted facts")
+    with evidence_columns[3]:
+        render_metric_card("Claim Conflicts", phase5_metrics["claim_conflicts"], "Detected evidence disagreements")
 
     st.divider()
     _render_recent_packages()

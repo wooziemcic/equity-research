@@ -67,7 +67,7 @@ def render_sidebar() -> None:
         _safe_page_link("pages/1_New_Research_Package.py", "New Research Package")
         _safe_page_link("pages/2_Document_Collection.py", "Document Collection")
         _safe_page_link("pages/3_Package_Review.py", "Package Review")
-        _safe_page_link("pages/4_Investment_Analysis.py", "Investment Analysis")
+        _safe_page_link("pages/4_Investment_Analysis.py", "Evidence Intelligence")
         _safe_page_link("pages/5_Generated_Reports.py", "Generated Reports")
 
         st.markdown('<div class="sidebar-section-title">Workflow</div>', unsafe_allow_html=True)
@@ -105,4 +105,4 @@ def render_sidebar() -> None:
         else:
             st.info("No active package selected. Start with Company Setup to create one.")
 
-        st.caption("Phase 3 enables public collection, licensed uploads, and checklist review. Analysis and reports remain future phases.")
+        st.caption("Phase 5 processes locked corpora for evidence only. Recommendations and final reports remain future phases.")

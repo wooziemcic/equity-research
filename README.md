@@ -1,148 +1,181 @@
 # Cutler Equity Research Workbench
 
-Cutler Research AI is an internal Streamlit workbench for creating research workspaces, collecting public documents, uploading authorized licensed materials, reviewing coverage, and building versioned research package exports.
+Cutler Research AI is an internal Streamlit workbench for creating research workspaces, collecting public documents, uploading authorized licensed materials, building locked research package versions, and processing those locked corpora into searchable cited evidence.
 
 ## Current Status
 
-Implemented through Phase 4:
+Implemented through Phase 5:
 
-- Phase 1: package setup, SQLite persistence, validation, dashboard, shared dark UI, and multi-page navigation.
+- Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and multi-page navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
-- Phase 3: licensed-file uploads, lightweight classification suggestions, analyst category correction, upload history, audit events, ZIP inspection, document inventory editing, controlled deletion, and security-type-aware checklist review.
-- Phase 4: readiness validation, package manifest generation, document inventory CSV/XLSX, checklist snapshots, integrity reports, versioned immutable package snapshots, ZIP generation, explicit locking, export downloads, and version comparison.
+- Phase 3: licensed-file uploads, classification suggestions, analyst category correction, upload history, audit events, ZIP inspection, document inventory editing, controlled deletion, and checklist review.
+- Phase 4: readiness validation, manifest generation, inventory exports, checklist snapshots, integrity reports, immutable package snapshots, ZIP generation, explicit locking, and version comparison.
+- Phase 5: closed-corpus document processing, native extraction, optional local OCR, spreadsheet-safe parsing, citation-preserving chunks, keyword retrieval, deterministic evidence extraction, citation verification, duplicate grouping, conflict detection, analyst review, and evidence/conflict exports.
 
 Not implemented:
 
-- Document parsing for analysis, OCR, embeddings, RAG, LLM calls, evidence extraction, citations, contradiction detection, financial calculations, Buy/Sell/Hold recommendations, investment report generation, PM investment approval, authentication, or cloud deployment.
-- Document analysis begins in Phase 5. Buy/Sell/Hold and final investment reports begin in Phase 6.
+- Buy/Sell/Hold or Insufficient Evidence recommendations, valuation conclusions, financial-model calculations, final investment memos, PM approval, trading integration, continuous monitoring, authentication, cloud deployment, RAG over open internet, or external LLM/API extraction.
+- Buy/Sell/Hold and final investment reports begin in Phase 6.
 
-## Working Package Versus Versioned Package
+## Closed-Corpus Guarantee
 
-The working package remains editable. Analysts can add documents, change licensed-file metadata, and update checklist overrides. A built package version is a snapshot copied into `data/packages/<package_id>/<version_id>/`. A locked version is immutable and becomes the future Phase 5 corpus.
+Phase 5 only processes documents included in a selected locked package version. It does not refresh SEC, investor-relations, market-data, Bloomberg, sell-side, web, or model-memory facts during processing or retrieval.
 
-Changing a working package after locking requires creating a new version. Locked versions are not edited in place.
+Every evidence record is tied to:
 
-## Readiness Validation
+- A locked package version document.
+- A source locator such as page, sheet, row, line, cell range, or section.
+- Supporting source text and source-text hash.
+- A deterministic citation-verification status.
 
-Before build, the app checks:
+Unsupported evidence is not marked verified.
 
-- Package and company setup exist.
-- At least one document is available.
-- Included files exist physically and stay inside managed data directories.
-- No failed or deleted document is included.
-- Documents have categories and SHA-256 hashes.
-- Checklist review acknowledgement is saved.
-- Missing core, stale, and needs-review items are acknowledged.
-- Duplicate records are warned about rather than silently included twice.
+## Locked Package Versions
 
-Readiness states are `NOT_READY`, `READY_WITH_WARNINGS`, and `READY`.
-
-## Checklist Acknowledgement
-
-Package Review includes this acknowledgement:
-
-```text
-I reviewed the package checklist and understand that missing, stale, unavailable, or not-applicable research may affect later analysis.
-```
-
-This does not imply investment approval.
-
-## Standard Package Structure
-
-Each version is built under:
+The working package remains editable. A built package version is a snapshot copied into:
 
 ```text
 data/packages/<package_id>/<version_id>/
-├── 00_Package_Manifest/
-│   ├── package_manifest.json
-│   ├── document_inventory.csv
-│   ├── document_inventory.xlsx
-│   ├── package_checklist.json
-│   ├── package_checklist.csv
-│   └── integrity_report.json
-├── 01_SEC_Filings/
-├── 02_Company_Materials/
-├── 03_Earnings_Transcripts/
-├── 04_Bloomberg/
-├── 05_Sell_Side_Research/
-├── 06_Credit_Research/
-├── 07_Industry_Research/
-├── 08_Activist_and_Bear_Research/
-├── 09_Financial_Models/
-├── 10_Internal_Analyst_Materials/
-└── 11_Other/
 ```
 
-Original working files are not moved or altered. Files are copied into the version snapshot and verified by SHA-256.
+Only versions with status `LOCKED` and integrity `VERIFIED` or `VERIFIED_WITH_WARNINGS` can be processed. Phase 5 verifies file existence, size, and SHA-256 before reading. If a locked file is missing or mutated, processing is blocked and an audit event is recorded. Create a new package version instead of modifying a locked version.
 
-## Manifest And Inventory
+## Processing Runs
 
-`package_manifest.json` includes package identity, version identity, company metadata, analyst review acknowledgement, document counts, category counts, checklist coverage, warnings, missing/stale/needs-review items, and all included document metadata.
+Each Phase 5 run is version-level and reproducible. A new configuration creates a new processing run rather than mutating old results.
 
-`document_inventory.csv` and `document_inventory.xlsx` include document IDs, categories, public/licensed status, source, dates, original/stored filenames, relative package paths, file size, SHA-256, and notes. The workbook is values-only, with a frozen header and filters.
+Processing runs store:
 
-`package_checklist.json` and `package_checklist.csv` snapshot the exact checklist state at build time. Locked snapshots are not recalculated when the working checklist later changes.
+- Pipeline and parser configuration versions.
+- OCR, retrieval, and local embedding configuration metadata.
+- Started/completed timestamps and status.
+- Document, page, sheet, table, chunk, evidence, warning, and error counts.
+- Created-by placeholder and audit events.
 
-## Integrity Verification And Locking
+Statuses include `PENDING`, `RUNNING`, `COMPLETED`, `COMPLETED_WITH_WARNINGS`, `FAILED`, `CANCELLED`, and `STALE`.
 
-`integrity_report.json` records files checked, passed, failed, missing files, hash mismatches, size mismatches, unexpected files, verification timestamp, and status. A package cannot be locked if integrity verification fails.
+## Processed Storage
 
-Builds create ZIP files such as:
+Generated extraction artifacts are separate from immutable package snapshots:
 
 ```text
-QXO_Equity_Research_Package_2026-07-13_V001.zip
+data/processed/<version_id>/<processing_run_id>/
+  documents/<version_document_id>/
+    document_metadata.json
+    full_text.txt
+    pages/
+    sheets/
+    tables/
+    warnings.json
+  chunks/
+  evidence/
+  indexes/
+  run_summary.json
 ```
 
-ZIPs are written outside their source directory, verified by reopening, and hashed with SHA-256. ZIPs do not include SQLite databases, `.env` files, temp files, absolute paths, or recursive ZIP inclusion.
+`data/processed/` is ignored by Git. Original locked files are not modified.
 
-## Versioning And Comparison
+## Supported Formats
 
-Version IDs look like:
+Phase 5 supports:
+
+- PDF: PyMuPDF native text first, pypdf fallback, page counts, page text, image-only classification, mixed-page warnings, and OCR-needed state.
+- DOCX: headings, paragraphs, tables, section order, and paragraph/table citations. Page numbers are not invented.
+- TXT: encoding fallback and line-range citations.
+- CSV: headers, row text, delimiter detection, row citations, and encoding capture.
+- XLSX/XLSM: sheet names, hidden state, used ranges, cell references, literal values, formula text, formula-without-cached-value warnings, cached-value warnings, external-link metadata, and macro-safe handling.
+- PNG/JPG/JPEG: metadata and optional local OCR.
+- ZIP: stored as archive-only. Contents are not processed automatically in Phase 5.
+
+## OCR Behavior
+
+OCR is disabled by default and used only as a fallback for image-only or nearly image-only content when enabled by configuration. OCR is local only, limited by `MAX_OCR_PAGES`, and records confidence when available. If OCR dependencies or the local OCR engine are unavailable, documents are marked as requiring OCR rather than sent to any external service.
+
+Low-confidence OCR-derived numeric evidence is left for analyst review.
+
+## Spreadsheet Safety
+
+Spreadsheets are read with `openpyxl`.
+
+The pipeline never:
+
+- Executes macros.
+- Refreshes formulas.
+- Uses Excel COM automation.
+- Calls Bloomberg, FactSet, Morningstar, or other add-ins.
+- Treats formula text as a calculated value.
+- Follows external links.
+
+Cell values are labeled as `LITERAL_VALUE`, `CACHED_FORMULA_VALUE`, `FORMULA_WITHOUT_CACHED_VALUE`, `EXTERNAL_LINK_VALUE`, or `UNKNOWN` where practical. Cached formula values are warned as potentially stale.
+
+## Chunking And Retrieval
+
+Chunks are deterministic and citation-preserving:
+
+- PDFs are chunked by page.
+- DOCX files keep headings and table context.
+- TXT/CSV files keep line and row locators.
+- Spreadsheets are chunked by sheet and row/cell range.
+
+Retrieval is keyword-only by default and restricted to one selected locked version and one selected processing run. It deduplicates exact repeated chunks and returns source locators with scores. Hybrid/vector metadata can be recorded, but no external embeddings are used by default.
+
+## Evidence And Citations
+
+The evidence ledger stores structured rows for company facts, revenue, growth, margin, EPS, cash flow, debt, liquidity, guidance, analyst estimates, analyst ratings, price targets, credit ratings, covenants, capital allocation, risks, legal/regulatory facts, valuation multiples, convertible terms, and other facts.
+
+Each evidence record includes claim text, evidence type, subject, metric, optional value/unit/currency/period, source text, citation locator JSON, extraction method, confidence, verification status, analyst status, and notes.
+
+Example citation forms:
 
 ```text
-QXO-20260713-V001
-QXO-20260713-V002
+[QXO Q1 2026 Earnings Release, p. 4]
+[QXO Bloomberg ANR, Estimates sheet, cells F24:F30]
+[QXO Earnings Transcript, lines 412-427]
+[QXO 2025 10-K, Item 7, p. 63]
 ```
 
-The app compares two versions and reports added documents, removed documents, same-hash renamed files, recategorized documents, hash changes, checklist status changes, research cutoff changes, public/licensed count changes, and total size changes.
+## Citation Verification
 
-## Storage Locations
+Every deterministic extracted evidence record is verified against its cited chunk. The verifier checks that the cited source exists, the stored source text hash still matches, the source text appears in the cited region, and numeric values/periods/metric terms are supported where possible.
 
-Working public/licensed files:
+Support statuses include:
 
-```text
-data/downloaded/<package_id>/
-```
+- `SUPPORTS`
+- `PARTIALLY_SUPPORTS`
+- `DOES_NOT_SUPPORT`
+- `SOURCE_MISSING`
+- `AMBIGUOUS`
+- `SOURCE_TEXT_HASH_MISMATCH`
 
-Built version snapshots and ZIPs:
+## Duplicates, Conflicts, And Review
 
-```text
-data/packages/<package_id>/
-```
+Phase 5 detects exact file duplicates, exact chunk duplicates, and near-identical text groups. Duplicate groups are shown without deleting source documents.
 
-SQLite metadata:
+Conflict detection surfaces value differences, unit mismatches, forecast disagreements, and GAAP/adjusted mismatches for matching subject/metric/period groupings. The app does not automatically choose a winner.
 
-```text
-data/database/cutler_research.db
-```
+Analysts can accept, reject, flag as needs review, annotate evidence, and add analyst-created evidence tied to an existing source chunk. Analyst-created evidence starts as pending verification.
 
-## Security Controls
+## Configuration
 
-- Path containment checks
-- Filename sanitization
-- Atomic writes where practical
-- Staging directories for builds
-- SHA-256 verification after copy
-- ZIP path safety and ZIP verification
-- No arbitrary file inclusion
-- No symlink following during copy
-- No macro execution
-- No spreadsheet formula refresh
-- No external model submission
-- No internet use during package build
-- Audit logging for build, manifest, inventory, checklist, integrity, ZIP, lock, and download events
+Key Phase 5 settings are centralized in `app/config.py` and shown in `.env.example`:
 
-No antivirus scanning is claimed.
+- `MAX_PDF_PAGES`
+- `MAX_SPREADSHEET_SHEETS`
+- `MAX_SPREADSHEET_CELLS`
+- `MAX_EXTRACTED_CHARACTERS`
+- `OCR_ENABLED`
+- `MAX_OCR_PAGES`
+- `OCR_CONFIDENCE_THRESHOLD`
+- `CHUNK_SIZE`
+- `CHUNK_OVERLAP`
+- `RETRIEVAL_RESULT_COUNT`
+- `RETRIEVAL_MODE`
+- `LOCAL_EMBEDDING_MODEL`
+- `EXTERNAL_LLM_EXTRACTION_ENABLED`
+- `PROCESSING_PIPELINE_VERSION`
+- `PARSER_CONFIG_VERSION`
+
+Default operation is deterministic, keyword-only, local, and works without an API key.
 
 ## Setup On Windows PowerShell
 
@@ -165,18 +198,18 @@ pytest
 python -m compileall app tests
 ```
 
-Launch the app:
+Launch the app from the repository root:
 
 ```powershell
 python -m streamlit run app\Home.py --server.port 8505
 ```
 
-Or use the launcher:
+Or from any current directory:
 
 ```powershell
-.\scripts\run_app.ps1
+& "C:\path\to\cutler-equity-research-blueprint\scripts\run_app.ps1"
 ```
 
 ## Known Limitations
 
-Phase 4 builds auditable document packages only. It does not parse, summarize, analyze, cite, score, or recommend investments from document contents.
+Phase 5 is evidence infrastructure, not investment judgment. OCR depends on locally installed OCR tooling. PDF table extraction is cautious and does not perform financial calculations. Retrieval is keyword-only by default. No external model, embedding, web, or market-data call is used by the Phase 5 pipeline.
