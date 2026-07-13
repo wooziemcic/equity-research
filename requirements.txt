@@ -1,4 +1,3 @@
--e .
 streamlit>=1.36
 pytest>=8.0
 requests>=2.32
