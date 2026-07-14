@@ -217,11 +217,37 @@ p, li, label {
     background: var(--cutler-red);
     border: 1px solid var(--cutler-red);
     border-radius: 0 8px 8px 0;
-    color: var(--text);
+    color: #ffffff !important;
     height: 58px !important;
     min-height: 58px !important;
     transition: background 140ms ease, border-color 140ms ease, box-shadow 140ms ease;
     width: 100%;
+}
+
+button[kind="primary"]:not(:disabled),
+div[data-testid="stButton"] button[data-testid="stBaseButton-primary"]:not(:disabled),
+div[data-testid="stFormSubmitButton"] button[data-testid="stBaseButton-primaryFormSubmit"]:not(:disabled),
+button[data-testid="stBaseButton-primary"]:not(:disabled),
+button[data-testid="stBaseButton-primaryFormSubmit"]:not(:disabled) {
+    color: #ffffff !important;
+}
+
+button[kind="primary"]:not(:disabled):hover,
+button[kind="primary"]:not(:disabled):focus,
+button[kind="primary"]:not(:disabled):active,
+button[data-testid="stBaseButton-primary"]:not(:disabled):hover,
+button[data-testid="stBaseButton-primary"]:not(:disabled):focus,
+button[data-testid="stBaseButton-primary"]:not(:disabled):active,
+button[data-testid="stBaseButton-primaryFormSubmit"]:not(:disabled):hover,
+button[data-testid="stBaseButton-primaryFormSubmit"]:not(:disabled):focus,
+button[data-testid="stBaseButton-primaryFormSubmit"]:not(:disabled):active {
+    color: #ffffff !important;
+}
+
+button[kind="primary"]:disabled,
+button[data-testid="stBaseButton-primary"]:disabled,
+button[data-testid="stBaseButton-primaryFormSubmit"]:disabled {
+    color: rgba(255, 255, 255, 0.55) !important;
 }
 
 .ticker-search-wrap .stButton button:hover {
@@ -742,6 +768,45 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     text-transform: uppercase;
 }
 
+.collection-plan-grid {
+    border-bottom: 1px solid var(--border);
+    margin: 0.45rem 0 0.9rem;
+}
+
+.collection-plan-row {
+    align-items: center;
+    border-top: 1px solid var(--border);
+    display: grid;
+    gap: 0.5rem 0.85rem;
+    grid-template-columns: minmax(150px, 1.25fr) minmax(180px, 1.45fr) 105px 125px;
+    min-height: 48px;
+    padding: 0.55rem 0.2rem;
+}
+
+.collection-plan-source {
+    color: var(--text);
+    font-weight: 750;
+}
+
+.collection-plan-method,
+.collection-plan-ir {
+    color: var(--muted);
+    font-size: 0.84rem;
+}
+
+.collection-plan-status {
+    font-size: 0.78rem;
+    font-weight: 800;
+}
+
+.collection-plan-status.is-selected {
+    color: #73c594;
+}
+
+.collection-plan-status.is-idle {
+    color: var(--muted-2);
+}
+
 div[data-testid="stDataFrame"] {
     border: 1px solid var(--border);
     border-radius: 8px;
@@ -778,6 +843,10 @@ hr {
 
     .metric-card {
         min-height: auto;
+    }
+
+    .collection-plan-row {
+        grid-template-columns: 1fr 1fr;
     }
 
     .workspace-header,

@@ -14,6 +14,7 @@ from app.services.evidence_service import (
     detect_duplicate_groups,
     evidence_from_chunk,
     verify_evidence_record,
+    verify_evidence_records_batch,
 )
 from app.services.package_builder import sha256_file, verify_snapshot
 from app.utils import database
@@ -352,6 +353,157 @@ def run_processing_pipeline(
         )
         _record_version_event(version=version, event_type="PROCESSING_FAILED", details={"processing_run_id": run_id, "error": str(exc)}, db_path=db_path)
         raise
+
+
+def repair_processing_run(
+    processing_run_id: str,
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    """Parse only locked-version documents that still have no chunks, preserving the run."""
+    run = database.get_processing_run(processing_run_id, db_path=db_path)
+    if not run:
+        raise ValueError("Processing run does not exist.")
+    eligibility = validate_processing_eligibility(run["version_id"], db_path=db_path)
+    if not eligibility.is_eligible or not eligibility.version or not eligibility.root:
+        raise ValueError("Processing repair blocked: " + "; ".join(eligibility.errors))
+    existing_chunks = database.list_document_chunks(processing_run_id, version_id=run["version_id"], db_path=db_path)
+    chunks_by_document: dict[str, list[dict[str, Any]]] = {}
+    for chunk in existing_chunks:
+        chunks_by_document.setdefault(chunk["version_document_id"], []).append(chunk)
+    if int(run.get("failed_documents") or 0) > 0:
+        repair_docs = list(eligibility.version_documents)
+    else:
+        repair_docs = [doc for doc in eligibility.version_documents if doc["document_id"] not in chunks_by_document]
+    if not repair_docs:
+        return run
+    ocr_config = json.loads(run.get("ocr_config_json") or "{}")
+    errors: list[str] = []
+    warnings: list[str] = []
+    for version_doc in repair_docs:
+        source_path = (eligibility.root / version_doc["relative_package_path"]).resolve()
+        parsed = parse_version_document(
+            version_doc=version_doc,
+            source_path=source_path,
+            version_id=run["version_id"],
+            processing_run_id=processing_run_id,
+            ocr_enabled=bool(ocr_config.get("enabled", False)),
+        )
+        _store_document_result(parsed, run_id=processing_run_id, version_id=run["version_id"], version_doc=version_doc, db_path=db_path)
+        warnings.extend(f"{version_doc['document_id']}: {warning}" for warning in parsed.warnings)
+        if parsed.error_message:
+            errors.append(f"{version_doc['document_id']}: {parsed.error_message}")
+        for page in parsed.pages:
+            database.create_document_page(
+                {
+                    "page_record_id": _page_id(),
+                    "processing_run_id": processing_run_id,
+                    "version_document_id": version_doc["document_id"],
+                    "page_number": page.page_number,
+                    "page_label": page.page_label,
+                    "extraction_method": page.extraction_method,
+                    "native_text_character_count": page.native_text_character_count,
+                    "ocr_text_character_count": page.ocr_text_character_count,
+                    "ocr_confidence": page.ocr_confidence,
+                    "page_text_path": page.page_text_path,
+                    "normalized_text": page.text[:4000],
+                    "image_render_path": page.image_render_path,
+                    "processing_warnings_json": json.dumps(page.warnings, sort_keys=True),
+                    "created_at": database.utc_now_iso(),
+                },
+                db_path=db_path,
+            )
+        existing_keys = {
+            (
+                chunk["chunk_hash"],
+                chunk.get("page_number"),
+                chunk.get("sheet_name"),
+                chunk.get("row_range"),
+                chunk.get("section_heading"),
+                chunk.get("chunk_index"),
+            )
+            for chunk in chunks_by_document.get(version_doc["document_id"], [])
+        }
+        new_chunks: list[dict[str, Any]] = []
+        new_evidence: list[dict[str, Any]] = []
+        for draft in chunk_parsed_document(parsed):
+            draft_key = (
+                draft.chunk_hash,
+                draft.page_number,
+                draft.sheet_name,
+                draft.row_range,
+                draft.section_heading,
+                draft.chunk_index,
+            )
+            if draft_key in existing_keys:
+                continue
+            locator = dict(draft.source_locator)
+            locator.update({"version_id": run["version_id"], "processing_run_id": processing_run_id})
+            chunk = {
+                "chunk_id": _chunk_id(),
+                "processing_run_id": processing_run_id,
+                "version_id": run["version_id"],
+                "version_document_id": version_doc["document_id"],
+                "page_number": draft.page_number,
+                "sheet_name": draft.sheet_name,
+                "row_range": draft.row_range,
+                "section_heading": draft.section_heading,
+                "chunk_index": draft.chunk_index,
+                "chunk_text": draft.chunk_text,
+                "character_count": draft.character_count,
+                "token_estimate": draft.token_estimate,
+                "extraction_method": draft.extraction_method,
+                "source_locator_json": json.dumps(locator, sort_keys=True),
+                "chunk_hash": draft.chunk_hash,
+                "duplicate_group_id": None,
+                "created_at": database.utc_now_iso(),
+            }
+            new_chunks.append(chunk)
+            new_evidence.extend(evidence_from_chunk(chunk))
+        database.create_document_chunks(new_chunks, db_path=db_path)
+        database.create_evidence_records(new_evidence, db_path=db_path)
+        verify_evidence_records_batch(
+            new_evidence,
+            {chunk["chunk_id"]: chunk for chunk in new_chunks},
+            db_path=db_path,
+        )
+    results = database.list_document_processing_results(processing_run_id, db_path=db_path)
+    latest_by_document = {item["version_document_id"]: item for item in results}
+    chunks = database.list_document_chunks(processing_run_id, version_id=run["version_id"], db_path=db_path)
+    evidence = database.list_evidence_records(processing_run_id, version_id=run["version_id"], db_path=db_path)
+    statuses = [item.get("processing_status") for item in latest_by_document.values()]
+    failed = sum(status == config.DOCUMENT_PROCESSING_FAILED for status in statuses)
+    partial = sum(status in {config.DOCUMENT_PROCESSING_PARTIAL, config.DOCUMENT_PROCESSING_SKIPPED} for status in statuses)
+    successful = sum(status == config.DOCUMENT_PROCESSING_SUCCESS for status in statuses)
+    status = config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS if failed or partial or warnings else config.PROCESSING_STATUS_COMPLETED
+    updated = database.update_processing_run(
+        processing_run_id,
+        {
+            "completed_at": database.utc_now_iso(),
+            "successful_documents": successful,
+            "partial_documents": partial,
+            "failed_documents": failed,
+            "pages_processed": len(database.list_document_pages(processing_run_id, db_path=db_path)),
+            "chunks_created": len(chunks),
+            "evidence_records_created": len(evidence),
+            "warnings_json": json.dumps(sorted(set(warnings)), sort_keys=True),
+            "errors_json": json.dumps(sorted(set(errors)), sort_keys=True),
+            "status": status,
+        },
+        db_path=db_path,
+    ) or run
+    _record_version_event(
+        version=eligibility.version,
+        event_type="PROCESSING_REPAIRED",
+        details={
+            "processing_run_id": processing_run_id,
+            "documents_reprocessed": len(repair_docs),
+            "chunks_available": len(chunks),
+            "evidence_records": len(evidence),
+        },
+        db_path=db_path,
+    )
+    return updated
 
 
 def _store_document_result(

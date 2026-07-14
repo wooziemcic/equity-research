@@ -20,7 +20,7 @@ from app.services.collectors.sec_collector import download_selected_filings, pre
 from app.services.company_resolver import ResolutionResult, resolve_ticker_metadata
 from app.services.package_builder import build_package_version, lock_version, validate_package_readiness, verify_snapshot
 from app.services.package_service import PackageInput, create_package, find_existing_ticker_packages
-from app.services.processing_pipeline import run_processing_pipeline
+from app.services.processing_pipeline import repair_processing_run, run_processing_pipeline
 from app.services.reporting.investment_report import generate_investment_report
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
@@ -141,16 +141,34 @@ def update_research_settings(
     return package
 
 
-def planned_collection_preview(public_materials: list[str] | None = None) -> list[str]:
-    materials = public_materials or []
-    preview = [
-        "SEC filings",
-        "SEC submissions metadata",
-        "Investor-relations materials",
+def planned_collection_preview(
+    public_materials: list[str] | None = None,
+    *,
+    ir_url: str | None = None,
+) -> list[dict[str, Any]]:
+    """Return a display-ready plan without exposing raw collector payloads."""
+    selected = set(public_materials or [])
+    has_ir_url = bool(str(ir_url or "").strip())
+    plan = [
+        ("SEC filings", "SEC EDGAR filing download", True, False),
+        ("SEC submissions metadata", "SEC submissions API", True, False),
+        ("Earnings releases", "Investor-relations discovery", "Earnings releases" in selected, True),
+        ("Earnings presentations", "Investor-relations discovery", "Earnings presentations" in selected, True),
+        ("Investor presentations", "Investor-relations discovery", "Investor presentations" in selected, True),
+        ("Annual reports", "Investor-relations discovery", "Annual reports" in selected, True),
+        ("Investor-day materials", "Investor-relations discovery", "Investor-day materials" in selected, True),
+        ("Supplemental materials", "Investor-relations discovery", "Public supplemental materials" in selected, True),
+        ("ESG or sustainability reports", "Investor-relations discovery", "Public ESG or sustainability reports" in selected, True),
     ]
-    if materials:
-        preview.append("Public company presentations and earnings materials when discoverable")
-    return preview
+    return [
+        {
+            "source": source,
+            "collection_method": method,
+            "selected": is_selected,
+            "ir_url_available": has_ir_url if requires_ir else None,
+        }
+        for source, method, is_selected, requires_ir in plan
+    ]
 
 
 def start_automated_collection(
@@ -341,7 +359,8 @@ def run_research_workflow(
         raise ValueError("Package does not exist.")
     key = idempotency_key or workflow_idempotency_key(package, db_path=db_path)
     existing = database.get_research_workflow_by_key(key, db_path=db_path)
-    if existing and not (retry_failed and existing["status"] == config.WORKFLOW_STATUS_FAILED):
+    retryable = bool(existing and workflow_requires_stabilization_retry(existing, db_path=db_path))
+    if existing and not (retry_failed and retryable):
         return existing
 
     now = database.utc_now_iso()
@@ -443,19 +462,30 @@ def run_research_workflow(
                 {"processing_run_id": processing_run["processing_run_id"]},
                 db_path=db_path,
             ) or workflow
+        elif _processing_run_needs_repair(processing_run, version, db_path=db_path):
+            _persist_stage(workflow_id, stage_statuses, "Processing documents", "Running", db_path=db_path)
+            processing_run = repair_processing_run(processing_run["processing_run_id"], db_path=db_path)
         if processing_run.get("status") not in {config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}:
             raise RuntimeError(f"Processing run ended with technical status {processing_run.get('status')}.")
         processing_status = "Completed with warnings" if processing_run.get("status") == config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS else "Completed"
         _mark_stage(stage_statuses, "Processing documents", processing_status)
-        _mark_stage(stage_statuses, "Extracting evidence", processing_status)
-        _mark_stage(stage_statuses, "Verifying citations", processing_status)
 
-        analysis_run = _existing_analysis_run(workflow, version, processing_run, db_path=db_path)
+        analysis_run = (
+            None
+            if existing and retry_failed
+            else _existing_analysis_run(workflow, version, processing_run, db_path=db_path)
+        )
         if not analysis_run:
-            _persist_stage(workflow_id, stage_statuses, "Calculating metrics", "Running", db_path=db_path)
+            _persist_stage(workflow_id, stage_statuses, "Extracting evidence", "Running", db_path=db_path)
+
+            def analysis_progress(stage: str, status: str) -> None:
+                _persist_stage(workflow_id, stage_statuses, stage, status, db_path=db_path)
+
             analysis_run = create_analysis_run(
                 version["version_id"],
                 processing_run["processing_run_id"],
+                progress_callback=analysis_progress,
+                force_retry=bool(existing and retry_failed),
                 db_path=db_path,
             )
             workflow = database.update_research_workflow_run(
@@ -465,6 +495,10 @@ def run_research_workflow(
             ) or workflow
         analysis_warning_messages = _analysis_warning_messages(analysis_run, db_path=db_path)
         analysis_has_warnings = bool(analysis_warning_messages)
+        if stage_statuses.get("Extracting evidence") in {TIMELINE_WAITING, TIMELINE_RUNNING, TIMELINE_FAILED}:
+            _mark_stage(stage_statuses, "Extracting evidence", TIMELINE_WARNINGS if analysis_has_warnings else TIMELINE_COMPLETED)
+        if stage_statuses.get("Verifying citations") in {TIMELINE_WAITING, TIMELINE_RUNNING, TIMELINE_FAILED}:
+            _mark_stage(stage_statuses, "Verifying citations", TIMELINE_COMPLETED)
         _mark_stage(stage_statuses, "Calculating metrics", TIMELINE_WARNINGS if analysis_has_warnings else TIMELINE_COMPLETED)
         _mark_stage(stage_statuses, "Generating recommendation", "Completed")
 
@@ -500,6 +534,10 @@ def run_research_workflow(
     except AnalysisPipelineError as exc:
         errors.append(exc.safe_message)
         _mark_current_failed(stage_statuses)
+        failed_step = next(
+            (stage for stage in WORKFLOW_STAGES if stage_statuses.get(stage) == TIMELINE_FAILED),
+            "Extracting evidence",
+        )
         analysis_id = exc.analysis_run_id or workflow.get("analysis_run_id")
         if analysis_id and exc.diagnostics.get("provider_code"):
             database.update_analysis_run(
@@ -511,7 +549,7 @@ def run_research_workflow(
             workflow_id,
             {
                 "status": config.WORKFLOW_STATUS_FAILED,
-                "current_step": "Calculating metrics",
+                "current_step": failed_step,
                 "analysis_run_id": analysis_id,
                 "stage_statuses_json": json.dumps(stage_statuses, sort_keys=True),
                 "warnings_json": json.dumps(sorted(set(warnings)), sort_keys=True),
@@ -542,6 +580,35 @@ def run_research_workflow(
 def workflow_stage_rows(workflow: dict[str, Any] | None) -> list[dict[str, str]]:
     statuses = _load_stage_statuses(workflow or {})
     return [{"Stage": stage, "Status": statuses.get(stage, "Waiting")} for stage in WORKFLOW_STAGES]
+
+
+def workflow_requires_stabilization_retry(
+    workflow: dict[str, Any],
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> bool:
+    if workflow.get("status") == config.WORKFLOW_STATUS_FAILED:
+        return True
+    if workflow.get("status") != config.WORKFLOW_STATUS_COMPLETED_WITH_WARNINGS:
+        return False
+    version_id = workflow.get("version_id")
+    processing_run_id = workflow.get("processing_run_id")
+    if not version_id or not processing_run_id:
+        return False
+    version_documents = database.list_package_version_documents(version_id, db_path=db_path)
+    chunks = database.list_document_chunks(processing_run_id, version_id=version_id, db_path=db_path)
+    if bool(version_documents) and not chunks:
+        return True
+    if config.EXTERNAL_LLM_EXTRACTION_ENABLED or config.OPENAI_REQUIRED:
+        analysis_id = workflow.get("analysis_run_id")
+        analysis = database.get_analysis_run(analysis_id, db_path=db_path) if analysis_id else None
+        try:
+            diagnostics = json.loads((analysis or {}).get("openai_diagnostics_json") or "{}")
+        except json.JSONDecodeError:
+            diagnostics = {}
+        if diagnostics.get("extraction") is None:
+            return True
+    return False
 
 
 def reconcile_failed_workflow(
@@ -775,6 +842,24 @@ def _existing_processing_run(
         if run.get("status") in {config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}:
             return run
     return None
+
+
+def _processing_run_needs_repair(
+    run: dict[str, Any],
+    version: dict[str, Any],
+    *,
+    db_path: Path | str,
+) -> bool:
+    version_documents = database.list_package_version_documents(version["version_id"], db_path=db_path)
+    if not version_documents:
+        return False
+    chunks = database.list_document_chunks(
+        run["processing_run_id"],
+        version_id=version["version_id"],
+        db_path=db_path,
+    )
+    chunked_document_ids = {chunk["version_document_id"] for chunk in chunks}
+    return any(document["document_id"] not in chunked_document_ids for document in version_documents)
 
 
 def _existing_analysis_run(

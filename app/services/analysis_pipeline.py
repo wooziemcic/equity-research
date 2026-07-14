@@ -5,7 +5,7 @@ import re
 import secrets
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from app import config
 from app.services.analysis.financial_metrics import (
@@ -16,6 +16,8 @@ from app.services.analysis.financial_metrics import (
     usable_evidence,
 )
 from app.services.analysis.scenario_analysis import create_scenarios
+from app.services.evidence_service import detect_claim_conflicts
+from app.services.openai_evidence_service import OpenAIEvidenceExtractionResult, run_openai_evidence_extraction
 from app.services.processing_pipeline import validate_processing_eligibility
 from app.services.recommendation_engine import (
     evidence_coverage,
@@ -25,7 +27,7 @@ from app.services.recommendation_engine import (
     package_coverage,
     recommendation_confidence,
 )
-from app.services.openai_service import preflight_openai, run_closed_corpus_ai_review
+from app.services.openai_service import OpenAIProviderError, StructuredParseResult, preflight_openai, run_closed_corpus_ai_review
 from app.utils import database
 
 
@@ -51,6 +53,42 @@ class AnalysisPipelineError(RuntimeError):
 
 def _analysis_run_id() -> str:
     return f"RUN-ANALYSIS-{secrets.token_hex(8).upper()}"
+
+
+def _completed_extraction_result(
+    version: dict[str, Any],
+    processing_run_id: str,
+    *,
+    db_path: Path | str,
+) -> OpenAIEvidenceExtractionResult | None:
+    for event in database.list_package_version_events(version["parent_package_id"], db_path=db_path):
+        if event.get("event_type") != "OPENAI_EVIDENCE_EXTRACTION_COMPLETED":
+            continue
+        try:
+            details = json.loads(event.get("event_details_json") or "{}")
+        except json.JSONDecodeError:
+            continue
+        if details.get("processing_run_id") != processing_run_id or details.get("model") != config.OPENAI_MODEL:
+            continue
+        evidence = database.list_evidence_records(processing_run_id, version_id=version["version_id"], db_path=db_path)
+        openai_evidence = [item for item in evidence if item.get("extraction_method") == "OPENAI_STRUCTURED"]
+        verified = [
+            item
+            for item in openai_evidence
+            if item.get("verification_status") in {config.VERIFICATION_SUPPORTS, config.VERIFICATION_PARTIALLY_SUPPORTS}
+        ]
+        endpoint = str(details.get("endpoint") or "")
+        return OpenAIEvidenceExtractionResult(
+            chunks_available=len(database.list_document_chunks(processing_run_id, version_id=version["version_id"], db_path=db_path)),
+            chunks_examined=int(details.get("chunks_examined") or 0),
+            evidence_created=int(details.get("evidence_created") or 0),
+            evidence_reused=int(details.get("evidence_reused") or 0),
+            evidence_rejected=int(details.get("evidence_rejected") or 0),
+            verified_records=len(verified),
+            verified_numeric_records=sum(item.get("value") is not None for item in verified),
+            endpoints=[endpoint] if endpoint else [],
+        )
+    return None
 
 
 def _event_id() -> str:
@@ -240,6 +278,8 @@ def create_analysis_run(
     time_horizon: str = "12 months",
     created_by: str = "analyst",
     db_path: Path | str = config.DATABASE_PATH,
+    progress_callback: Callable[[str, str], None] | None = None,
+    force_retry: bool = False,
 ) -> dict[str, Any]:
     eligibility = validate_analysis_eligibility(version_id, processing_run_id, db_path=db_path)
     if not eligibility.is_eligible or not eligibility.version or not eligibility.processing_run:
@@ -250,17 +290,23 @@ def create_analysis_run(
         processing_run_id=processing_run_id,
         db_path=db_path,
     )
-    for existing in existing_runs:
-        if existing.get("status") != config.ANALYSIS_STATUS_FAILED:
-            return existing
+    if not force_retry:
+        for existing in existing_runs:
+            if existing.get("status") != config.ANALYSIS_STATUS_FAILED:
+                return existing
     if config.OPENAI_REQUIRED:
         preflight = preflight_openai()
         if not preflight.connected:
             raise AnalysisPipelineError(
                 preflight.message or "OpenAI preflight failed.",
                 analysis_run_id=None,
-                diagnostics={"provider_code": preflight.code or "OPENAI_REQUEST_FAILED"},
+                diagnostics={
+                    "provider_code": preflight.code or "OPENAI_REQUEST_FAILED",
+                    "openai": preflight.diagnostics or {},
+                },
             )
+    else:
+        preflight = None
     run_id = _analysis_run_id()
     now = database.utc_now_iso()
     analysis_run = database.create_analysis_run(
@@ -293,14 +339,72 @@ def create_analysis_run(
             "error_message": None,
             "ai_review_status": config.AI_REVIEW_STATUS_RUNNING if config.OPENAI_REQUIRED or config.EXTERNAL_LLM_EXTRACTION_ENABLED or config.EXTERNAL_NARRATIVE_MODEL_ENABLED else config.AI_REVIEW_STATUS_NOT_REQUIRED,
             "ai_model": config.OPENAI_MODEL if config.OPENAI_REQUIRED or config.EXTERNAL_LLM_EXTRACTION_ENABLED or config.EXTERNAL_NARRATIVE_MODEL_ENABLED else None,
+            "ai_endpoint": preflight.endpoint if preflight else None,
+            "openai_diagnostics_json": None,
         },
         db_path=db_path,
     )
     _record_event(version, "ANALYSIS_STARTED", {"analysis_run_id": run_id, "processing_run_id": processing_run_id}, db_path=db_path)
     evidence: list[dict[str, Any]] = []
     try:
+        extraction_result = None
+        ai_endpoint = preflight.endpoint if preflight else None
         evidence = database.list_evidence_records(processing_run_id, version_id=version_id, db_path=db_path)
+        if config.OPENAI_REQUIRED or config.EXTERNAL_LLM_EXTRACTION_ENABLED:
+            if progress_callback:
+                progress_callback("Extracting evidence", "Running")
+            extraction_result = _completed_extraction_result(version, processing_run_id, db_path=db_path)
+            reused_extraction = extraction_result is not None
+            if extraction_result is None:
+                extraction_result = run_openai_evidence_extraction(
+                    version=version,
+                    processing_run_id=processing_run_id,
+                    db_path=db_path,
+                )
+            else:
+                _record_event(
+                    version,
+                    "OPENAI_EVIDENCE_EXTRACTION_REUSED",
+                    {
+                        "analysis_run_id": run_id,
+                        "processing_run_id": processing_run_id,
+                        "model": config.OPENAI_MODEL,
+                        "endpoint": extraction_result.endpoints[-1] if extraction_result.endpoints else None,
+                        "chunks_examined": extraction_result.chunks_examined,
+                    },
+                    db_path=db_path,
+                )
+            if extraction_result.endpoints:
+                ai_endpoint = extraction_result.endpoints[-1]
+            if not reused_extraction:
+                _record_event(
+                    version,
+                    "OPENAI_EVIDENCE_EXTRACTION_COMPLETED",
+                    {
+                        "analysis_run_id": run_id,
+                        "processing_run_id": processing_run_id,
+                        "model": config.OPENAI_MODEL,
+                        "endpoint": ai_endpoint,
+                        "chunks_examined": extraction_result.chunks_examined,
+                        "evidence_created": extraction_result.evidence_created,
+                        "evidence_reused": extraction_result.evidence_reused,
+                        "evidence_rejected": extraction_result.evidence_rejected,
+                    },
+                    db_path=db_path,
+                )
+            if progress_callback:
+                progress_callback(
+                    "Extracting evidence",
+                    "Completed with warnings" if extraction_result.warnings else "Completed",
+                )
+        if progress_callback:
+            progress_callback("Verifying citations", "Running")
+        evidence = database.list_evidence_records(processing_run_id, version_id=version_id, db_path=db_path)
+        detect_claim_conflicts(processing_run_id=processing_run_id, db_path=db_path)
         conflicts = database.list_claim_conflicts(processing_run_id, db_path=db_path)
+        if progress_callback:
+            progress_callback("Verifying citations", "Completed")
+            progress_callback("Calculating metrics", "Running")
         calculate_metrics(evidence, analysis_run_id=run_id, db_path=db_path)
         metrics = database.list_analysis_metrics(run_id, db_path=db_path)
         diagnostics = metric_stage_diagnostics(
@@ -309,6 +413,8 @@ def create_analysis_run(
             processing_run_id=processing_run_id,
             metrics=metrics,
         )
+        if extraction_result is not None:
+            diagnostics["openai_extraction"] = extraction_result.to_dict()
         for metric in metrics:
             _record_event(version, "METRIC_CALCULATED", {"analysis_run_id": run_id, "metric_code": metric["metric_code"]}, db_path=db_path)
         scorecard = generate_scorecard(
@@ -322,33 +428,31 @@ def create_analysis_run(
         _record_event(version, "SCORECARD_GENERATED", {"analysis_run_id": run_id, "items": len(scorecard)}, db_path=db_path)
         scenarios = create_scenarios(run_id, db_path=db_path)
         ai_review = None
-        if config.OPENAI_REQUIRED or config.EXTERNAL_LLM_EXTRACTION_ENABLED or config.EXTERNAL_NARRATIVE_MODEL_ENABLED:
-            ai_review = run_closed_corpus_ai_review(
+        if progress_callback:
+            progress_callback("Calculating metrics", "Completed")
+        if config.OPENAI_REQUIRED or config.EXTERNAL_NARRATIVE_MODEL_ENABLED:
+            if progress_callback:
+                progress_callback("Generating recommendation", "Running")
+            ai_review_result = run_closed_corpus_ai_review(
                 version=version,
                 processing_run_id=processing_run_id,
                 evidence=evidence,
                 metrics=metrics,
                 conflicts=conflicts,
                 db_path=str(db_path),
+                with_endpoint=True,
             )
-            evidence_by_id = {item["evidence_id"]: item for item in evidence}
-            for extracted in ai_review.extracted_claims:
-                if extracted.abstain or not extracted.evidence_ids:
-                    continue
-                target_id = extracted.evidence_ids[0]
-                if target_id in evidence_by_id:
-                    database.update_evidence_record(
-                        target_id,
-                        {"claim_text": extracted.claim_text, "extraction_method": "OPENAI_STRUCTURED"},
-                        db_path=db_path,
-                    )
+            if not isinstance(ai_review_result, StructuredParseResult):
+                raise RuntimeError("OpenAI narrative endpoint metadata was unavailable.")
+            ai_review = ai_review_result.parsed
+            ai_endpoint = ai_review_result.endpoint
             _record_event(
                 version,
                 "AI_REVIEW_COMPLETED",
                 {
                     "analysis_run_id": run_id,
                     "model": config.OPENAI_MODEL,
-                    "extracted_claims": len(ai_review.extracted_claims),
+                    "endpoint": ai_endpoint,
                     "thesis_items": len(ai_review.thesis_items),
                     "conflict_explanations": len(ai_review.conflict_explanations),
                 },
@@ -382,7 +486,7 @@ def create_analysis_run(
         )
         diagnostics_payload = _analysis_payload(
             diagnostics=diagnostics,
-            warnings=eligibility.warnings,
+            warnings=eligibility.warnings + (extraction_result.warnings if extraction_result else []),
             limitations=limitations,
         )
         updated = database.update_analysis_run(
@@ -398,6 +502,16 @@ def create_analysis_run(
                 "reference_price_evidence_id": reference.get("evidence_id"),
                 "error_message": diagnostics_payload,
                 "ai_review_status": config.AI_REVIEW_STATUS_COMPLETED if ai_review is not None else config.AI_REVIEW_STATUS_NOT_REQUIRED,
+                "ai_endpoint": ai_endpoint,
+                "openai_diagnostics_json": json.dumps(
+                    {
+                        "endpoint": ai_endpoint,
+                        "model": config.OPENAI_MODEL,
+                        "pipeline_stage": "completed",
+                        "extraction": extraction_result.to_dict() if extraction_result else None,
+                    },
+                    sort_keys=True,
+                ),
             },
             db_path=db_path,
         )
@@ -413,6 +527,8 @@ def create_analysis_run(
             },
             db_path=db_path,
         )
+        if progress_callback:
+            progress_callback("Generating recommendation", "Completed")
         return updated or analysis_run
     except Exception as exc:
         metrics = database.list_analysis_metrics(run_id, db_path=db_path)
@@ -429,18 +545,24 @@ def create_analysis_run(
             limitations=eligibility.limitations,
         )
         safe_message = safe_error_message(exc)
+        provider_diagnostics = exc.diagnostics.to_dict() if isinstance(exc, OpenAIProviderError) and exc.diagnostics else {}
+        if isinstance(exc, OpenAIProviderError):
+            safe_message = exc.safe_message
+            diagnostics["provider_code"] = exc.code
+            diagnostics["openai"] = provider_diagnostics
         database.update_analysis_run(
             run_id,
             {
                 "status": config.ANALYSIS_STATUS_FAILED,
                 "error_message": diagnostics_payload or safe_message,
                 "ai_review_status": getattr(exc, "code", config.AI_REVIEW_STATUS_RUNNING),
+                "openai_diagnostics_json": json.dumps(provider_diagnostics, sort_keys=True) if provider_diagnostics else None,
             },
             db_path=db_path,
         )
         _record_event(
             version,
-            "METRIC_CALCULATION_FAILED",
+            "ANALYSIS_STAGE_FAILED",
             {"analysis_run_id": run_id, "diagnostics": diagnostics},
             db_path=db_path,
         )

@@ -17,6 +17,7 @@ from app.services.openai_service import (
     OpenAIProviderError,
     RecommendationNarrative,
     _error_code,
+    _attach_trusted_citation_locators,
     _validate_citations,
     preflight_openai,
     responses_parse,
@@ -154,7 +155,10 @@ class _FakeResponses:
 
     def parse(self, **kwargs):
         self.kwargs = kwargs
-        return type("Response", (), {"output_parsed": self.parsed, "output_text": ""})()
+        parsed = self.parsed
+        if parsed is None and kwargs["text_format"].__name__ == "_StructuredConnectivity":
+            parsed = kwargs["text_format"](ok=True)
+        return type("Response", (), {"output_parsed": parsed, "output_text": ""})()
 
 
 class _FakeClient:
@@ -164,7 +168,8 @@ class _FakeClient:
 
 
 def test_openai_preflight_and_responses_structured_output(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(config, "OPENAI_MODEL", "gpt-5.6-terra")
+    monkeypatch.setattr(config, "OPENAI_MODEL", "gpt-4.1-mini")
+    monkeypatch.setattr("app.services.openai_service.get_openai_api_key", lambda: "")
     monkeypatch.delenv("OPENAI_API_KEY", raising=False)
     assert preflight_openai(force=True).code == OPENAI_NOT_CONFIGURED
     client = _FakeClient()
@@ -181,7 +186,8 @@ def test_openai_preflight_and_responses_structured_output(monkeypatch: pytest.Mo
     response_client = _FakeClient(parsed=model)
     parsed = responses_parse(system_prompt="closed corpus", user_payload={"evidence_id": "E-1"}, schema=ClosedCorpusAIReview, client=response_client)
     assert parsed.thesis_items[0].evidence_ids == ["E-1"]
-    assert response_client.responses.kwargs["tools"] == []
+    assert "tools" not in response_client.responses.kwargs
+    assert "reasoning" not in response_client.responses.kwargs
     assert response_client.responses.kwargs["text_format"] is ClosedCorpusAIReview
 
 
@@ -251,3 +257,48 @@ def test_citation_set_must_be_exact_for_selected_evidence() -> None:
     )
     with pytest.raises(OpenAIProviderError, match="outside"):
         _validate_citations(review, [{"evidence_id": "E-1", "source_locator_json": locator}])
+
+
+def test_citation_locator_accepts_equivalent_json_serialization() -> None:
+    review = ClosedCorpusAIReview(
+        extracted_claims=[
+            ExtractedClaim(
+                claim_text="Supported claim",
+                evidence_ids=["E-1"],
+                citation_locators=['{ "page_number": 1, "display_title": "Filing" }'],
+            )
+        ],
+        recommendation=RecommendationNarrative(rationale="", why_not_buy="", why_not_hold="", why_not_sell=""),
+    )
+    _validate_citations(
+        review,
+        [{"evidence_id": "E-1", "source_locator_json": '{"display_title":"Filing","page_number":1}'}],
+    )
+
+
+def test_application_attaches_trusted_locator_from_evidence_id() -> None:
+    review = ClosedCorpusAIReview(
+        thesis_items=[ModelThesisItem(item_type="RISK", claim="Supported", evidence_ids=["E-1"], citation_locators=["invented"])],
+        recommendation=RecommendationNarrative(rationale="", why_not_buy="", why_not_hold="", why_not_sell=""),
+    )
+    evidence = [{"evidence_id": "E-1", "source_locator_json": '{"page_number":1}'}]
+    _attach_trusted_citation_locators(review, evidence)
+    assert review.thesis_items[0].citation_locators == ['{"page_number":1}']
+    _validate_citations(review, evidence)
+
+
+def test_application_abstains_from_out_of_package_narrative_id() -> None:
+    review = ClosedCorpusAIReview(
+        thesis_items=[ModelThesisItem(item_type="RISK", claim="Unsupported", evidence_ids=["E-INVENTED"])],
+        recommendation=RecommendationNarrative(
+            rationale="Unsupported",
+            why_not_buy="",
+            why_not_hold="",
+            why_not_sell="",
+            evidence_ids=["E-INVENTED"],
+        ),
+    )
+    _attach_trusted_citation_locators(review, [{"evidence_id": "E-1", "source_locator_json": '{"page_number":1}'}])
+    assert review.thesis_items[0].abstain
+    assert review.recommendation.abstention_reason
+    _validate_citations(review, [{"evidence_id": "E-1", "source_locator_json": '{"page_number":1}'}])

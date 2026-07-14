@@ -26,6 +26,7 @@ from app.services.research_workflow_service import (
     start_automated_collection,
     update_research_settings,
     workflow_idempotency_key,
+    workflow_requires_stabilization_retry,
     workflow_stage_rows,
 )
 from app.services.taxonomy import category_options
@@ -166,7 +167,23 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
             st.error(str(exc))
 
     st.markdown("**Planned collection preview**")
-    st.write(planned_collection_preview(public_materials))
+    plan_rows = planned_collection_preview(public_materials, ir_url=ir_url)
+    plan_html = ['<div class="collection-plan-grid">']
+    for item in plan_rows:
+        selected_label = "Selected" if item["selected"] else "Not selected"
+        selected_class = "is-selected" if item["selected"] else "is-idle"
+        ir_value = item["ir_url_available"]
+        ir_label = "Not required" if ir_value is None else "Available" if ir_value else "Not available"
+        plan_html.append(
+            '<div class="collection-plan-row">'
+            f'<div class="collection-plan-source">{html.escape(str(item["source"]))}</div>'
+            f'<div class="collection-plan-method">{html.escape(str(item["collection_method"]))}</div>'
+            f'<div class="collection-plan-status {selected_class}">{selected_label}</div>'
+            f'<div class="collection-plan-ir">IR URL: {ir_label}</div>'
+            "</div>"
+        )
+    plan_html.append("</div>")
+    st.markdown("".join(plan_html), unsafe_allow_html=True)
     if st.button("Start Research Collection", type="primary", use_container_width=True, disabled=not filing_types):
         refreshed = database.get_package_by_package_id(package["package_id"]) or package
         try:
@@ -292,7 +309,7 @@ def _additional_research_card(package: dict[str, Any]) -> None:
         "I confirm these files are authorized for internal use and comply with vendor entitlements.",
         key=f"phase7_authorized_{package['package_id']}",
     )
-    if st.button("Upload Accepted Licensed Files", type="primary", disabled=not authorized, use_container_width=True):
+    if st.button("Upload Accepted Research Files", type="primary", disabled=not authorized, use_container_width=True):
         try:
             summary = store_uploaded_files(
                 package,
@@ -467,8 +484,8 @@ def _proceed(package: dict[str, Any]) -> None:
         if errors:
             st.error("; ".join(str(error) for error in errors))
         _metric_diagnostics_expander(workflow)
-        if workflow.get("status") == config.WORKFLOW_STATUS_FAILED:
-            if st.button("Retry From Failed Stage", use_container_width=True):
+        if workflow_requires_stabilization_retry(workflow):
+            if st.button("Retry From Failed Stage", type="primary", use_container_width=True):
                 try:
                     with st.spinner("Resuming the failed workflow stage..."):
                         retried = run_research_workflow(

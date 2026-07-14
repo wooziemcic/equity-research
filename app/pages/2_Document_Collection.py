@@ -333,7 +333,7 @@ def _licensed_uploads(package: dict) -> None:
     authorized = st.checkbox(
         "I confirm that these files are authorized for internal use and that their storage complies with Cutler Capital's vendor entitlements."
     )
-    if st.button("Upload Accepted Licensed Files", type="primary", disabled=not authorized):
+    if st.button("Upload Accepted Research Files", type="primary", disabled=not authorized):
         summary = store_uploaded_files(
             package,
             candidates,

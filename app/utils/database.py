@@ -592,6 +592,7 @@ def _create_phase5_tables(connection: sqlite3.Connection) -> None:
             analyst_note TEXT,
             source_locator_json TEXT,
             source_text_hash TEXT,
+            extraction_fingerprint TEXT,
             created_by TEXT NOT NULL,
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
@@ -668,6 +669,13 @@ def _create_phase5_tables(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_claim_conflicts_run ON claim_conflicts (processing_run_id)",
     ):
         connection.execute(sql)
+    evidence_columns = _table_columns(connection, "evidence_records")
+    if "extraction_fingerprint" not in evidence_columns:
+        connection.execute("ALTER TABLE evidence_records ADD COLUMN extraction_fingerprint TEXT")
+    connection.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_evidence_run_extraction_fingerprint "
+        "ON evidence_records (processing_run_id, extraction_fingerprint) WHERE extraction_fingerprint IS NOT NULL"
+    )
 
 
 def _create_phase6_tables(connection: sqlite3.Connection) -> None:
@@ -703,13 +711,15 @@ def _create_phase6_tables(connection: sqlite3.Connection) -> None:
             error_message TEXT,
             ai_review_status TEXT,
             ai_model TEXT,
+            ai_endpoint TEXT,
+            openai_diagnostics_json TEXT,
             FOREIGN KEY (version_id) REFERENCES package_versions(version_id),
             FOREIGN KEY (processing_run_id) REFERENCES processing_runs(processing_run_id)
         )
         """
     )
     columns = _table_columns(connection, "analysis_runs")
-    for column in ("ai_review_status", "ai_model"):
+    for column in ("ai_review_status", "ai_model", "ai_endpoint", "openai_diagnostics_json"):
         if column not in columns:
             connection.execute(f"ALTER TABLE analysis_runs ADD COLUMN {column} TEXT")
     connection.execute(
@@ -2715,6 +2725,29 @@ def _insert_record(
     return clean_record
 
 
+def _insert_records(
+    table: str,
+    records: list[dict[str, Any]],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    if not records:
+        return []
+    initialize_database(db_path)
+    clean_records = [{key: value for key, value in record.items() if key != "id"} for record in records]
+    keys = list(clean_records[0])
+    if any(list(record) != keys for record in clean_records):
+        raise ValueError("Batch records must use the same ordered fields.")
+    placeholders = ", ".join("?" for _ in keys)
+    columns = ", ".join(keys)
+    with get_connection(db_path) as connection:
+        connection.executemany(
+            f"INSERT INTO {table} ({columns}) VALUES ({placeholders})",
+            [tuple(record[key] for key in keys) for record in clean_records],
+        )
+    return clean_records
+
+
 def create_processing_run(
     run: dict[str, Any],
     *,
@@ -2820,7 +2853,7 @@ def list_document_processing_results(
             SELECT *
             FROM document_processing_results
             WHERE processing_run_id = ?
-            ORDER BY version_document_id
+            ORDER BY version_document_id, id
             """,
             (processing_run_id,),
         ).fetchall()
@@ -2887,6 +2920,14 @@ def create_document_chunk(
     return _insert_record("document_chunks", chunk, db_path=db_path)
 
 
+def create_document_chunks(
+    chunks: list[dict[str, Any]],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    return _insert_records("document_chunks", chunks, db_path=db_path)
+
+
 def update_document_chunk_duplicate_group(
     chunk_id: str,
     duplicate_group_id: str,
@@ -2931,6 +2972,14 @@ def create_evidence_record(
     return _insert_record("evidence_records", evidence, db_path=db_path)
 
 
+def create_evidence_records(
+    evidence: list[dict[str, Any]],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    return _insert_records("evidence_records", evidence, db_path=db_path)
+
+
 def get_evidence_record(
     evidence_id: str,
     *,
@@ -2941,6 +2990,23 @@ def get_evidence_record(
         row = connection.execute(
             "SELECT * FROM evidence_records WHERE evidence_id = ?",
             (evidence_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def get_evidence_by_fingerprint(
+    processing_run_id: str,
+    extraction_fingerprint: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    if not extraction_fingerprint:
+        return None
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM evidence_records WHERE processing_run_id = ? AND extraction_fingerprint = ? LIMIT 1",
+            (processing_run_id, extraction_fingerprint),
         ).fetchone()
     return row_to_dict(row)
 
@@ -3172,6 +3238,8 @@ def update_analysis_run(
         "error_message",
         "ai_review_status",
         "ai_model",
+        "ai_endpoint",
+        "openai_diagnostics_json",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:

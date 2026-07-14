@@ -7,6 +7,7 @@ import json
 import re
 import zipfile
 from dataclasses import dataclass, field
+from html.parser import HTMLParser
 from pathlib import Path
 from typing import Any
 
@@ -19,6 +20,7 @@ from app.services import processing_workspace
 
 PARSER_VERSION = "5.0"
 TEXT_EXTENSIONS = {".txt"}
+HTML_EXTENSIONS = {".htm", ".html"}
 CSV_EXTENSIONS = {".csv"}
 SPREADSHEET_EXTENSIONS = {".xlsx", ".xlsm"}
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg"}
@@ -154,6 +156,8 @@ def parse_version_document(
     try:
         if extension in TEXT_EXTENSIONS:
             parsed = _parse_text(version_doc, source_path, workspace)
+        elif extension in HTML_EXTENSIONS:
+            parsed = _parse_html(version_doc, source_path, workspace)
         elif extension in CSV_EXTENSIONS:
             parsed = _parse_csv(version_doc, source_path, workspace)
         elif extension in SPREADSHEET_EXTENSIONS:
@@ -253,6 +257,80 @@ def _parse_text(version_doc: dict[str, Any], source_path: Path, workspace: Path)
         page_count=1,
         warnings=warnings,
         metadata={"encoding": encoding, "line_count": len(lines)},
+    )
+
+
+class _VisibleHTMLTextParser(HTMLParser):
+    _SKIPPED = {"script", "style", "noscript", "template"}
+    _BLOCKS = {"br", "p", "div", "tr", "li", "table", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"}
+
+    def __init__(self) -> None:
+        super().__init__(convert_charrefs=True)
+        self.parts: list[str] = []
+        self.skip_depth = 0
+
+    def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
+        del attrs
+        lowered = tag.lower()
+        if lowered in self._SKIPPED:
+            self.skip_depth += 1
+        elif lowered in self._BLOCKS and not self.skip_depth:
+            self.parts.append("\n")
+
+    def handle_endtag(self, tag: str) -> None:
+        lowered = tag.lower()
+        if lowered in self._SKIPPED and self.skip_depth:
+            self.skip_depth -= 1
+        elif lowered in self._BLOCKS and not self.skip_depth:
+            self.parts.append("\n")
+
+    def handle_data(self, data: str) -> None:
+        if not self.skip_depth and data.strip():
+            self.parts.append(data)
+
+    def text(self) -> str:
+        return "\n".join(line for line in (normalize_text(part) for part in self.parts) if line)
+
+
+def _parse_html(version_doc: dict[str, Any], source_path: Path, workspace: Path) -> ParsedDocument:
+    warnings: list[str] = []
+    source, encoding, decode_warnings = _safe_read_text(source_path)
+    warnings.extend(decode_warnings)
+    parser = _VisibleHTMLTextParser()
+    parser.feed(source)
+    text = _trim_extracted_text(parser.text(), warnings)
+    lines = text.splitlines()
+    page_path = processing_workspace.atomic_write_text(workspace / "pages" / "html_text.txt", text)
+    locator = _base_locator(version_doc, "HTML_TEXT")
+    locator.update({"line_range": f"1-{len(lines)}", "source_text_hash": sha256_text(text)})
+    segment = SourceSegment(
+        text=text,
+        locator=locator,
+        extraction_method="HTML_TEXT",
+        section_heading=_detect_section_heading(text),
+    )
+    page = ParsedPage(
+        page_number=1,
+        page_label=f"HTML lines 1-{len(lines)}",
+        text=text,
+        extraction_method="HTML_TEXT",
+        native_text_character_count=len(text),
+        page_text_path=processing_workspace.relative_processed_path(page_path),
+        warnings=warnings,
+    )
+    return ParsedDocument(
+        status=config.DOCUMENT_PROCESSING_SUCCESS if text.strip() else config.DOCUMENT_PROCESSING_PARTIAL,
+        parser_used="HTML",
+        parser_version=PARSER_VERSION,
+        detected_language="unknown",
+        pages=[page] if text.strip() else [],
+        sheets=[],
+        segments=[segment] if text.strip() else [],
+        full_text_path=_write_full_text(workspace, text),
+        extracted_character_count=len(text),
+        page_count=1 if text.strip() else 0,
+        warnings=warnings + ([] if text.strip() else ["HTML document contained no visible text."]),
+        metadata={"encoding": encoding, "line_count": len(lines), "source_format": "HTML"},
     )
 
 

@@ -500,7 +500,12 @@ def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str
         if st.button("Test OpenAI Connectivity"):
             result = preflight_openai(force=True)
             if result.connected:
-                st.success(f"OpenAI connected. Model: {result.model}. AI extraction: enabled. AI narrative: enabled.")
+                st.success("OpenAI structured-output preflight passed.")
+                st.write(f"Model: {result.model}")
+                st.write(f"Endpoint: {result.endpoint}")
+                st.write(f"Structured output verified: {'Yes' if result.structured_output_verified else 'No'}")
+                st.write("AI extraction: enabled")
+                st.write("AI narrative: enabled")
             else:
                 st.error(result.message or "OpenAI connectivity failed.")
     if st.button("Create Analysis Run", type="primary", disabled=bool(eligibility.errors)):
@@ -527,6 +532,7 @@ def _analysis_controls(version: dict[str, Any], run: dict[str, Any]) -> dict[str
                 "Evidence Coverage": item.get("evidence_coverage"),
                 "Reference Price": item.get("reference_price"),
                 "AI Review": item.get("ai_review_status") or "",
+                "Endpoint": item.get("ai_endpoint") or "",
                 "Updated": item.get("updated_at"),
             }
             for item in runs
@@ -714,7 +720,10 @@ def _pm_approval_tab(analysis_run: dict[str, Any]) -> None:
     note = st.text_area("PM note", value=analysis_run.get("pm_notes") or "")
     cols = st.columns(3)
     for label, action in (("Approve", "APPROVE"), ("Reject", "REJECT"), ("Return For Revision", "RETURN_FOR_REVISION")):
-        if cols[["Approve", "Reject", "Return For Revision"].index(label)].button(label):
+        if cols[["Approve", "Reject", "Return For Revision"].index(label)].button(
+            label,
+            key=f"pm_{action.lower()}_{analysis_run['analysis_run_id']}",
+        ):
             try:
                 pm_decision(analysis_run["analysis_run_id"], action=action, note=note)
                 st.success(f"PM action recorded: {action}.")
@@ -726,14 +735,14 @@ def _pm_approval_tab(analysis_run: dict[str, Any]) -> None:
 def _analysis_reports_tab(analysis_run: dict[str, Any]) -> None:
     st.write("Reports")
     col1, col2 = st.columns(2)
-    if col1.button("Generate Draft DOCX/PDF"):
+    if col1.button("Generate Draft DOCX/PDF", type="primary"):
         try:
             report = generate_investment_report(analysis_run["analysis_run_id"], final=False)
             st.success(f"Draft report generated: V{report['report_version']:03d}")
             st.rerun()
         except Exception as exc:
             st.error(str(exc))
-    if col2.button("Generate Final DOCX/PDF"):
+    if col2.button("Generate Final DOCX/PDF", type="primary"):
         try:
             report = generate_investment_report(analysis_run["analysis_run_id"], final=True)
             st.success(f"Final report generated: V{report['report_version']:03d}")

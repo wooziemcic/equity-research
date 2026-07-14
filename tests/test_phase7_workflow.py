@@ -199,7 +199,7 @@ def test_workflow_orchestration_is_idempotent_and_records_ids(company_metadata: 
         calls["process"] += 1
         return {"processing_run_id": "RUN-PROC-P7", "status": config.PROCESSING_STATUS_COMPLETED}
 
-    def fake_analysis(version_id: str, processing_run_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> dict:
+    def fake_analysis(version_id: str, processing_run_id: str, *, db_path: Path | str = config.DATABASE_PATH, **kwargs) -> dict:
         calls["analysis"] += 1
         return {"analysis_run_id": "RUN-AN-P7", "status": config.ANALYSIS_STATUS_NEEDS_ANALYST_REVIEW}
 
@@ -334,7 +334,7 @@ def test_retry_resumes_from_metric_stage_without_duplicate_package_or_processing
             db_path=config.DATABASE_PATH,
         )
 
-    def fake_analysis(locked_version_id: str, run_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> dict:
+    def fake_analysis(locked_version_id: str, run_id: str, *, db_path: Path | str = config.DATABASE_PATH, **kwargs) -> dict:
         calls["analysis"] += 1
         analysis_id = "RUN-AN-RETRY-FAIL" if calls["analysis"] == 1 else "RUN-AN-RETRY-OK"
         status = config.ANALYSIS_STATUS_FAILED if calls["analysis"] == 1 else config.ANALYSIS_STATUS_NEEDS_ANALYST_REVIEW

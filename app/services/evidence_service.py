@@ -252,6 +252,84 @@ def verify_evidence_record(
     return verification
 
 
+def verify_evidence_records_batch(
+    evidence_records: list[dict[str, Any]],
+    chunks_by_id: dict[str, dict[str, Any]],
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    """Apply the single-record citation rules in one database transaction."""
+    if not evidence_records:
+        return []
+    verifications: list[dict[str, Any]] = []
+    updates: list[tuple[str, str]] = []
+    for evidence in evidence_records:
+        locator = json.loads(evidence.get("source_locator_json") or "{}")
+        status = config.VERIFICATION_AMBIGUOUS
+        score = 0.0
+        note = "Citation could not be evaluated."
+        if evidence.get("source_text_hash") and sha256_text(evidence.get("source_text") or "") != evidence["source_text_hash"]:
+            status = config.VERIFICATION_HASH_MISMATCH
+            note = "Stored source text hash no longer matches the evidence source text."
+        else:
+            chunk = chunks_by_id.get(str(locator.get("chunk_id") or ""))
+            if (
+                not chunk
+                or chunk.get("processing_run_id") != evidence.get("processing_run_id")
+                or chunk.get("version_id") != evidence.get("version_id")
+                or chunk.get("version_document_id") != evidence.get("version_document_id")
+            ):
+                status = config.VERIFICATION_SOURCE_MISSING
+                note = "Cited chunk could not be found in the selected processing run."
+            else:
+                source_text = normalize_text(evidence.get("source_text") or "")
+                chunk_text = normalize_text(chunk["chunk_text"])
+                if source_text and source_text.lower() not in chunk_text.lower():
+                    status = config.VERIFICATION_DOES_NOT_SUPPORT
+                    score = 0.1
+                    note = "Stored source text is not present in the cited chunk."
+                else:
+                    status, score, note = _deterministic_support(evidence, chunk_text)
+        verifications.append(
+            {
+                "verification_id": _verification_id(),
+                "evidence_id": evidence["evidence_id"],
+                "citation_locator_json": json.dumps(locator, sort_keys=True),
+                "verification_method": "DETERMINISTIC_SOURCE_TEXT",
+                "support_status": status,
+                "support_score": score,
+                "verifier_note": note,
+                "created_at": database.utc_now_iso(),
+            }
+        )
+        updates.append((status, evidence["evidence_id"]))
+    database.initialize_database(db_path)
+    with database.get_connection(db_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO citation_verifications (
+                verification_id, evidence_id, citation_locator_json, verification_method,
+                support_status, support_score, verifier_note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["verification_id"],
+                    item["evidence_id"],
+                    item["citation_locator_json"],
+                    item["verification_method"],
+                    item["support_status"],
+                    item["support_score"],
+                    item["verifier_note"],
+                    item["created_at"],
+                )
+                for item in verifications
+            ],
+        )
+        connection.executemany("UPDATE evidence_records SET verification_status = ? WHERE evidence_id = ?", updates)
+    return verifications
+
+
 def _get_cited_chunk(
     evidence: dict[str, Any],
     locator: dict[str, Any],
@@ -407,6 +485,16 @@ def detect_claim_conflicts(
 ) -> list[dict[str, Any]]:
     evidence = database.list_evidence_records(processing_run_id, db_path=db_path)
     conflicts: list[dict[str, Any]] = []
+    existing = database.list_claim_conflicts(processing_run_id, db_path=db_path)
+    existing_keys = {
+        (
+            *sorted((str(item.get("evidence_id_a") or ""), str(item.get("evidence_id_b") or ""))),
+            str(item.get("conflict_type") or ""),
+        )
+        for item in existing
+    }
+    if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
+        return []
     grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
     for record in evidence:
         metric = record.get("metric_name")
@@ -424,6 +512,9 @@ def detect_claim_conflicts(
                 conflict_type = _conflict_type(left, right)
                 if not conflict_type:
                     continue
+                conflict_key = (*sorted((left["evidence_id"], right["evidence_id"])), conflict_type)
+                if conflict_key in existing_keys:
+                    continue
                 conflict = {
                     "conflict_id": _conflict_id(),
                     "processing_run_id": processing_run_id,
@@ -440,6 +531,9 @@ def detect_claim_conflicts(
                 }
                 database.create_claim_conflict(conflict, db_path=db_path)
                 conflicts.append(conflict)
+                existing_keys.add(conflict_key)
+                if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
+                    return conflicts
     return conflicts
 
 
