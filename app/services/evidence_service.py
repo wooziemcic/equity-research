@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Any
 
 from app import config
+from app.services.conflict_audit_service import conflict_fingerprint, evidence_comparable, normalize_claim_family, normalize_period
 from app.services.document_processing import normalize_text, sha256_text
 from app.utils import database
 
@@ -502,13 +503,16 @@ def detect_claim_conflicts(
             continue
         key = (
             record.get("normalized_subject") or "",
-            metric,
-            record.get("period") or "",
+            normalize_claim_family(metric),
+            normalize_period(record.get("period")),
         )
         grouped.setdefault(key, []).append(record)
     for (subject, metric, period), records in grouped.items():
         for index, left in enumerate(records):
             for right in records[index + 1 :]:
+                comparable, comparability_status = evidence_comparable(left, right)
+                if not comparable:
+                    continue
                 conflict_type = _conflict_type(left, right)
                 if not conflict_type:
                     continue
@@ -527,6 +531,10 @@ def detect_claim_conflicts(
                     "severity": "HIGH" if conflict_type in {"FACTUAL_CONTRADICTION", "GAAP_ADJUSTED_MISMATCH"} else "MEDIUM",
                     "explanation": _conflict_explanation(conflict_type, left, right),
                     "analyst_status": config.ANALYST_STATUS_UNREVIEWED,
+                    "conflict_fingerprint": conflict_fingerprint(
+                        processing_run_id, metric, period, left["evidence_id"], right["evidence_id"], conflict_type
+                    ),
+                    "comparability_status": comparability_status,
                     "created_at": database.utc_now_iso(),
                 }
                 database.create_claim_conflict(conflict, db_path=db_path)
@@ -541,8 +549,6 @@ def _conflict_type(left: dict[str, Any], right: dict[str, Any]) -> str | None:
     left_value = left.get("value")
     right_value = right.get("value")
     if left_value is not None and right_value is not None and abs(float(left_value) - float(right_value)) > 0.0001:
-        if left.get("unit") != right.get("unit"):
-            return "UNIT_MISMATCH"
         if left.get("evidence_type") == "ANALYST_ESTIMATE" or right.get("evidence_type") == "ANALYST_ESTIMATE":
             return "FORECAST_DISAGREEMENT"
         return "VALUE_DIFFERENCE"

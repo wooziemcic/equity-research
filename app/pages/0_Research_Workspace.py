@@ -17,6 +17,7 @@ from app.services.analysis_pipeline import load_analysis_diagnostics
 from app.services.checklist_service import ensure_package_checklist, normalize_checklist_status, normalize_requirement_level
 from app.services.document_reconciliation_service import repair_package_document_records
 from app.services.package_builder import validate_package_readiness
+from app.services.performance_service import performance_summary
 from app.services.research_workflow_service import (
     collection_timeline,
     package_coverage_summary,
@@ -39,6 +40,37 @@ from app.services.upload_service import (
 from app.utils import database
 
 logger = logging.getLogger(__name__)
+
+
+def _performance_panel(workflow: dict[str, Any]) -> None:
+    rows = database.list_workflow_stage_performance(workflow_run_id=workflow["workflow_run_id"])
+    if not rows:
+        return
+    summary = performance_summary(rows)
+    st.markdown("**Run performance**")
+    cols = st.columns(3)
+    cols[0].metric("Total stage time", f"{summary['total_duration_seconds']:.2f}s")
+    cols[1].metric("Slowest stage", summary.get("slowest_stage") or "N/A")
+    cols[2].metric("Slowest duration", f"{summary.get('slowest_duration_seconds', 0):.2f}s")
+    st.dataframe(
+        [
+            {
+                "Stage": row["stage_name"],
+                "Seconds": round(float(row.get("duration_seconds") or 0), 3),
+                "Reused": bool(row.get("reused")),
+                "Files processed": row.get("files_processed", 0),
+                "Chunks": row.get("chunks_examined", 0),
+                "OpenAI batches": row.get("openai_batches", 0),
+                "Evidence": row.get("evidence_created", 0),
+                "Metrics": row.get("metrics_created", 0),
+                "Conflicts": row.get("conflicts_examined", 0),
+                "Reports": row.get("reports_generated", 0),
+            }
+            for row in rows
+        ],
+        hide_index=True,
+        use_container_width=True,
+    )
 
 
 def _safe_page_link(page: str, label: str) -> None:
@@ -480,6 +512,7 @@ def _proceed(package: dict[str, Any]) -> None:
     if workflow:
         st.write(f"Latest workflow: `{workflow['workflow_run_id']}` - {workflow['status']}")
         st.dataframe(workflow_stage_rows(workflow), hide_index=True, use_container_width=True)
+        _performance_panel(workflow)
         errors = json.loads(workflow.get("errors_json") or "[]")
         if errors:
             st.error("; ".join(str(error) for error in errors))

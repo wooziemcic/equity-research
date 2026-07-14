@@ -13,7 +13,9 @@ from app.components.cards import render_empty_state
 from app.components.layout import bootstrap_page
 from app.services.analysis_pipeline import load_analysis_diagnostics
 from app.services.combined_export_service import create_combined_export
+from app.services.conflict_audit_service import audit_historical_conflicts
 from app.services.research_workflow_service import package_coverage_summary
+from app.services.reporting.investment_report import build_compact_memo
 from app.utils import database
 
 
@@ -54,7 +56,7 @@ def _load_result_context() -> dict[str, Any] | None:
     processing_run = database.get_processing_run(analysis["processing_run_id"]) or {}
     decision = database.get_recommendation_decision(analysis["analysis_run_id"]) or {}
     reports = database.list_generated_reports(analysis["analysis_run_id"])
-    report = reports[0] if reports else {}
+    report = next((item for item in reports if item.get("report_mode") == config.REPORT_MODE), {})
     st.session_state[config.SESSION_ACTIVE_PACKAGE_ID] = analysis["package_id"]
     st.session_state[config.SESSION_ACTIVE_VERSION_ID] = analysis["version_id"]
     st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = analysis["processing_run_id"]
@@ -300,6 +302,8 @@ def _advanced_review(context: dict[str, Any]) -> None:
         st.markdown("**Citation verification**")
         st.dataframe(database.list_citation_verifications(processing_run_id=processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
         st.markdown("**Conflicts**")
+        conflict_audit = audit_historical_conflicts(processing_run["processing_run_id"])
+        st.dataframe([{"Measure": key.replace("_", " ").title(), "Count": value} for key, value in conflict_audit.items()], hide_index=True, use_container_width=True)
         st.dataframe(database.list_claim_conflicts(processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
         st.markdown("**Duplicate lineage**")
         st.dataframe(database.list_duplicate_groups(processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
@@ -341,6 +345,60 @@ def _download(context: dict[str, Any]) -> None:
                     use_container_width=True,
                 )
             st.caption(f"Export hash: `{latest['zip_sha256']}`")
+
+
+def _compact_memo_result(context: dict[str, Any]) -> None:
+    memo = build_compact_memo(context["analysis"]["analysis_run_id"])
+    st.title(f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary")
+    cols = st.columns(3)
+    cols[0].metric("Recommendation", memo["recommendation"])
+    cols[1].metric("Confidence", memo["confidence"])
+    cols[2].metric("Research cutoff", memo["research_cutoff"])
+    st.subheader("Investment View")
+    st.write(memo["investment_view"])
+    _memo_items("Key Supporting Evidence", memo["supporting_evidence"])
+    if memo.get("catalysts"):
+        _memo_items("Catalysts", memo["catalysts"])
+    _memo_items("Key Risks", memo["risks"])
+    st.subheader("Important Missing Information")
+    for limitation in memo["limitations"]:
+        st.write(limitation)
+    st.subheader("Conclusion")
+    st.write(memo["conclusion"])
+
+
+def _memo_items(title: str, rows: list[dict[str, str]]) -> None:
+    st.subheader(title)
+    if not rows:
+        st.write("No sufficiently supported items were available in the locked corpus.")
+        return
+    for row in rows:
+        st.write(row["claim"])
+        st.caption(row["citation"])
+
+
+def _memo_downloads(context: dict[str, Any]) -> None:
+    analysis = context["analysis"]
+    report = context["report"]
+    if not report:
+        st.info("Generate the investment memo before downloading result files.")
+        return
+    st.subheader("Downloads")
+    cols = st.columns(2)
+    pdf_path = Path(report.get("pdf_path") or "")
+    docx_path = Path(report.get("docx_path") or "")
+    if pdf_path.exists():
+        cols[0].download_button("Download Investment Memo PDF", pdf_path.read_bytes(), file_name=pdf_path.name, mime="application/pdf", type="primary", use_container_width=True)
+    if docx_path.exists():
+        cols[1].download_button("Download Investment Memo DOCX", docx_path.read_bytes(), file_name=docx_path.name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+    exports = database.list_combined_exports(analysis["analysis_run_id"], limit=1)
+    if st.button("Prepare Full Audit Package ZIP", use_container_width=True):
+        export = create_combined_export(analysis["analysis_run_id"], report_id=report.get("report_id"))
+        exports = [export]
+    if exports:
+        zip_path = Path(exports[0]["zip_path"])
+        if zip_path.exists():
+            st.download_button("Download Full Audit Package ZIP", zip_path.read_bytes(), file_name=zip_path.name, mime="application/zip", use_container_width=True)
 
 
 def _evidence_table(evidence: list[dict[str, Any]]) -> None:
@@ -417,15 +475,11 @@ def main() -> None:
     if not context:
         return
 
-    _header(context)
+    _compact_memo_result(context)
     st.divider()
-    _summary_cards(context)
-    st.divider()
-    _report_sections(context)
+    _memo_downloads(context)
     st.divider()
     _advanced_review(context)
-    st.divider()
-    _download(context)
 
 
 if __name__ == "__main__":

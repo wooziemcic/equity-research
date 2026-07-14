@@ -43,6 +43,8 @@ class FilingCandidate:
     shares: float | None = None
     aggregate_market_value: float | None = None
     issuer: str = ""
+    filing_items: str = ""
+    selection_reason: str = "Included by profile"
 
 
 @dataclass(frozen=True)
@@ -96,6 +98,42 @@ def form_144_preselected(filing: FilingCandidate) -> bool:
             and filing.aggregate_market_value >= config.FORM_144_MIN_MARKET_VALUE
         )
     return bool(checks) and all(checks)
+
+
+def _eight_k_items_from_index(
+    filing_index_url: str,
+    *,
+    session: requests.Session | None,
+) -> str:
+    try:
+        response = request_with_retries(
+            filing_index_url,
+            headers=sec_headers(),
+            delay_seconds=config.SEC_REQUEST_DELAY_SECONDS,
+            session=session,
+        )
+        if response.status_code != 200:
+            return ""
+        found = sorted(set(re.findall(r"Item\s+(\d+\.\d+)", response.text, flags=re.I)))
+        return ",".join(found)
+    except Exception:
+        return ""
+
+
+def _eight_k_selection(items: str) -> tuple[str, bool, str]:
+    mode = config.SEC_8K_COLLECTION_MODE
+    normalized_items = {item.strip().upper().removeprefix("ITEM ") for item in items.split(",") if item.strip()}
+    if mode == "ALL_8K":
+        return "ELIGIBLE", True, "Selected because SEC_8K_COLLECTION_MODE=ALL_8K."
+    if mode == "ANALYST_SELECTION":
+        return "AWAITING_8K_SELECTION", False, "Awaiting analyst selection under ANALYST_SELECTION mode."
+    approved = set(config.SEC_8K_APPROVED_ITEMS)
+    if not approved:
+        return "EXCLUDED_8K_MODE", False, "No investment-team-approved 8-K item list is configured."
+    matched = sorted(normalized_items & approved)
+    if matched:
+        return "ELIGIBLE", True, f"Matched approved 8-K item(s): {', '.join(matched)}."
+    return "EXCLUDED_8K_MODE", False, "Filing items did not match the configured approved-item list."
 
 
 def _parse_date(value: str) -> date:
@@ -207,10 +245,20 @@ def preview_cutler_profile(
         eligible = is_profile_eligible(form, include_form_144=True) and family in enabled
         existing = database.get_document_by_accession(package["package_id"], accession, db_path=db_path)
         status = "ALREADY_COLLECTED" if existing and existing.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED else "ELIGIBLE"
+        filing_items = _at(recent, "items", index)
+        selection_reason = "Included by collection profile."
+        selected = eligible and family != "144" and status != "ALREADY_COLLECTED"
+        if family == "8-K" and eligible and status != "ALREADY_COLLECTED":
+            if config.SEC_8K_COLLECTION_MODE == "MATERIAL_8K_ONLY" and not filing_items:
+                filing_items = _eight_k_items_from_index(build_sec_index_url(cik, accession), session=session)
+            status, selected, selection_reason = _eight_k_selection(filing_items)
         if family == "144":
             status = "AWAITING_SELECTION" if status != "ALREADY_COLLECTED" else status
+            selection_reason = "Form 144 requires analyst selection."
         elif not eligible:
             status = "EXCLUDED_BY_PROFILE"
+            selected = False
+            selection_reason = "Form is outside the active collection profile."
         candidate = FilingCandidate(
             accession_number=accession,
             form_type=form,
@@ -222,8 +270,10 @@ def preview_cutler_profile(
             title=f"{package['ticker']} {form} filed {filing_date}",
             normalized_form_family=family,
             inventory_status=status,
-            selected=eligible and family != "144" and status != "ALREADY_COLLECTED",
+            selected=selected,
             issuer=package.get("company_name") or package.get("ticker") or "",
+            filing_items=filing_items,
+            selection_reason=selection_reason,
         )
         if family == "144":
             candidate = FilingCandidate(**{**candidate.__dict__, "selected": form_144_preselected(candidate)})
@@ -241,6 +291,8 @@ def preview_cutler_profile(
                 "inventory_status": item.inventory_status,
                 "conditional_rule": conditional_rule(item.normalized_form_family),
                 "selected": item.selected,
+                "filing_items": item.filing_items,
+                "selection_reason": item.selection_reason,
                 "metadata_json": json.dumps(
                     {
                         "reporting_person": item.reporting_person,
@@ -437,7 +489,7 @@ def download_profile_inventory(
     selected = [
         item
         for item in inventory
-        if item.selected and item.inventory_status in {"ELIGIBLE", "AWAITING_SELECTION"}
+        if item.selected and item.inventory_status in {"ELIGIBLE", "AWAITING_SELECTION", "AWAITING_8K_SELECTION"}
     ]
     result = download_selected_filings(package, selected, session=session, db_path=db_path)
     result["discovered"] = len(inventory)

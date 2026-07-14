@@ -1,8 +1,10 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import secrets
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +20,25 @@ from app.services.evidence_service import (
 )
 from app.services.package_builder import sha256_file, verify_snapshot
 from app.utils import database
+
+
+def processing_fingerprint(
+    version_id: str,
+    *,
+    ocr_config: dict[str, Any],
+    retrieval_config: dict[str, Any],
+    db_path: Path | str = config.DATABASE_PATH,
+) -> str:
+    documents = database.list_package_version_documents(version_id, db_path=db_path)
+    payload = {
+        "version_id": version_id,
+        "document_hashes": sorted(doc.get("sha256_hash") or "" for doc in documents),
+        "pipeline_version": config.PROCESSING_PIPELINE_VERSION,
+        "parser_version": config.PARSER_CONFIG_VERSION,
+        "chunk_configuration": retrieval_config,
+        "ocr_configuration": ocr_config,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 @dataclass(frozen=True)
@@ -150,11 +171,6 @@ def run_processing_pipeline(
     if not eligibility.is_eligible or not eligibility.version or not eligibility.root:
         raise ValueError("Processing blocked: " + "; ".join(eligibility.errors))
     version = eligibility.version
-    existing_runs = database.list_processing_runs(version_id, db_path=db_path)
-    for existing in existing_runs:
-        if existing.get("status") in {config.PROCESSING_STATUS_RUNNING, config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}:
-            return existing
-    run_id = _run_id()
     ocr_config = {
         "enabled": config.OCR_ENABLED if ocr_enabled is None else bool(ocr_enabled),
         "max_pages": config.MAX_OCR_PAGES,
@@ -166,6 +182,23 @@ def run_processing_pipeline(
         "chunk_size": config.CHUNK_SIZE,
         "chunk_overlap": config.CHUNK_OVERLAP,
     }
+    fingerprint = processing_fingerprint(
+        version_id, ocr_config=ocr_config, retrieval_config=retrieval_config, db_path=db_path
+    )
+    existing_runs = database.list_processing_runs(version_id, db_path=db_path)
+    reusable_statuses = {config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}
+    for existing in existing_runs:
+        exact = existing.get("processing_fingerprint") == fingerprint
+        legacy_compatible = (
+            not existing.get("processing_fingerprint")
+            and existing.get("pipeline_version") == config.PROCESSING_PIPELINE_VERSION
+            and existing.get("parser_config_version") == config.PARSER_CONFIG_VERSION
+            and json.loads(existing.get("ocr_config_json") or "{}") == ocr_config
+            and json.loads(existing.get("retrieval_config_json") or "{}") == retrieval_config
+        )
+        if existing.get("status") in reusable_statuses and (exact or legacy_compatible):
+            return existing
+    run_id = _run_id()
     run = database.create_processing_run(
         {
             "processing_run_id": run_id,
@@ -191,6 +224,9 @@ def run_processing_pipeline(
             "errors_json": json.dumps([], sort_keys=True),
             "created_by": created_by,
             "status": config.PROCESSING_STATUS_RUNNING,
+            "processing_fingerprint": fingerprint,
+            "reused_from_processing_run_id": None,
+            "duration_seconds": None,
         },
         db_path=db_path,
     )
@@ -315,6 +351,8 @@ def run_processing_pipeline(
             if warnings or stats["partial_documents"] or stats["failed_documents"]
             else config.PROCESSING_STATUS_COMPLETED
         )
+        started_value = datetime.fromisoformat(run["started_at"])
+        duration = max(0.0, (datetime.fromisoformat(database.utc_now_iso()) - started_value).total_seconds())
         run = database.update_processing_run(
             run_id,
             {
@@ -323,6 +361,7 @@ def run_processing_pipeline(
                 "warnings_json": json.dumps(warnings, sort_keys=True),
                 "errors_json": json.dumps(errors, sort_keys=True),
                 "status": status,
+                "duration_seconds": duration,
             },
             db_path=db_path,
         ) or run

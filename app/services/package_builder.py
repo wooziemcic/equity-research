@@ -105,11 +105,31 @@ def _managed_path(path_value: str) -> Path:
 
 def included_documents(package_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> list[dict[str, Any]]:
     """Return working documents eligible for package build validation."""
+    inclusion_rows = database.list_draft_document_inclusions(package_id, db_path=db_path)
+    inclusion_by_document = {row["document_id"]: bool(row["included"]) for row in inclusion_rows}
     return [
         doc
         for doc in database.list_documents_by_package(package_id, db_path=db_path)
-        if doc.get("collection_status") != "DELETED"
+        if doc.get("collection_status") != "DELETED" and inclusion_by_document.get(doc["document_id"], True)
     ]
+
+
+def package_build_fingerprint(
+    package: dict[str, Any],
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> str:
+    documents = included_documents(package["package_id"], db_path=db_path)
+    payload = {
+        "documents": sorted((doc["document_id"], doc.get("sha256_hash") or "") for doc in documents),
+        "profile": package.get("collection_profile_snapshot_json") or package.get("collection_profile_name"),
+        "research_cutoff": package.get("research_cutoff_date"),
+        "configuration": {
+            "security_type": package.get("security_type"),
+            "filing_history_years": package.get("filing_history_years"),
+        },
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, separators=(",", ":")).encode("utf-8")).hexdigest()
 
 
 def validate_package_readiness(
@@ -273,6 +293,20 @@ def build_package_version(
             db_path=db_path,
         )
         raise ValueError("Package is not ready to build.")
+    build_fingerprint = package_build_fingerprint(package, db_path=db_path)
+    reusable = database.find_package_version_by_build_fingerprint(
+        package["package_id"], build_fingerprint, db_path=db_path
+    )
+    if reusable:
+        database.create_package_version_event(
+            event_id=f"PVE-{secrets.token_hex(8).upper()}",
+            parent_package_id=package["package_id"],
+            version_id=reusable["version_id"],
+            event_type="PACKAGE_SNAPSHOT_REUSED",
+            event_details_json=json.dumps({"build_fingerprint": build_fingerprint}, sort_keys=True),
+            db_path=db_path,
+        )
+        return reusable
     version = database.allocate_package_version(
         {
             "parent_package_id": package["package_id"],
@@ -290,6 +324,9 @@ def build_package_version(
         db_path=db_path,
     )
     version_id = version["version_id"]
+    version = database.update_package_version(
+        version_id, {"build_fingerprint": build_fingerprint}, db_path=db_path
+    ) or version
     version_number = int(version["version_number"])
     database.create_package_version_event(
         event_id=f"PVE-{secrets.token_hex(8).upper()}",

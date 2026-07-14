@@ -13,6 +13,7 @@ from openpyxl import Workbook
 
 from app import config
 from app.services.package_builder import sha256_file
+from app.services.reporting.investment_report import citation_audit
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
 
@@ -72,8 +73,16 @@ def create_combined_export(
     try:
         evidence_path = staging / "evidence_ledger.xlsx"
         conflicts_path = staging / "conflicts.csv"
+        metrics_path = staging / "metrics.csv"
+        citation_path = staging / "citation_audit.json"
+        inventory_path = staging / "source_inventory.csv"
+        workflow_path = staging / "workflow_audit.json"
         _write_evidence_ledger(evidence_path, run, db_path=db_path)
         _write_conflicts_csv(conflicts_path, run, db_path=db_path)
+        _write_metrics_csv(metrics_path, run, db_path=db_path)
+        citation_path.write_text(json.dumps(citation_audit(analysis_run_id, db_path=db_path), indent=2, sort_keys=True), encoding="utf-8")
+        _write_source_inventory(inventory_path, version_docs)
+        _write_workflow_audit(workflow_path, run, db_path=db_path)
 
         with zipfile.ZipFile(tmp_zip, "w", compression=zipfile.ZIP_DEFLATED) as archive:
             for path in sorted(version_root.rglob("*")):
@@ -92,6 +101,10 @@ def create_combined_export(
                 (Path(report["pdf_path"]), f"{analysis_folder}/Investment_Report.pdf"),
                 (Path(report["docx_path"]), f"{analysis_folder}/Investment_Report.docx"),
                 (evidence_path, f"{analysis_folder}/evidence_ledger.xlsx"),
+                (metrics_path, f"{analysis_folder}/metrics.csv"),
+                (citation_path, f"{analysis_folder}/citation_audit.json"),
+                (inventory_path, f"{analysis_folder}/source_inventory.csv"),
+                (workflow_path, f"{analysis_folder}/workflow_audit.json"),
                 (conflicts_path, f"{analysis_folder}/conflicts.csv"),
             ]
             for source, archive_name in report_files:
@@ -260,6 +273,39 @@ def _write_conflicts_csv(path: Path, run: dict[str, Any], *, db_path: Path | str
         writer.writeheader()
         for conflict in conflicts:
             writer.writerow({field: conflict.get(field, "") for field in fields})
+
+
+def _write_metrics_csv(path: Path, run: dict[str, Any], *, db_path: Path | str) -> None:
+    metrics = database.list_analysis_metrics(run["analysis_run_id"], db_path=db_path)
+    fields = ["metric_code", "display_name", "value", "unit", "currency", "period", "confidence", "verification_status", "warning"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for metric in metrics:
+            writer.writerow({field: metric.get(field, "") for field in fields})
+
+
+def _write_source_inventory(path: Path, version_docs: list[dict[str, Any]]) -> None:
+    fields = ["document_id", "title", "category", "source_type", "relative_package_path", "sha256_hash"]
+    with path.open("w", newline="", encoding="utf-8") as handle:
+        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer.writeheader()
+        for document in version_docs:
+            writer.writerow({field: document.get(field, "") for field in fields})
+
+
+def _write_workflow_audit(path: Path, run: dict[str, Any], *, db_path: Path | str) -> None:
+    workflow = database.latest_research_workflow_run(run["package_id"], db_path=db_path)
+    payload = {
+        "workflow": workflow or {},
+        "performance": database.list_workflow_stage_performance(
+            workflow_run_id=workflow.get("workflow_run_id") if workflow else None,
+            package_id=None if workflow else run["package_id"],
+            db_path=db_path,
+        ),
+        "package_events": database.list_package_version_events(run["package_id"], db_path=db_path),
+    }
+    path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 
 
 def _excluded(path: Path, root: Path) -> bool:

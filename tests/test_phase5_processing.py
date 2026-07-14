@@ -361,6 +361,11 @@ def test_conflict_detection_types_and_no_false_conflict_for_different_metrics(te
         database.create_evidence_record(
             {
                 **base,
+                "version_document_id": (
+                    "VDOC-INDEPENDENT-EPS" if evidence_id == "EVD-C2"
+                    else "VDOC-INDEPENDENT-MARGIN" if evidence_id == "EVD-C5"
+                    else chunk["version_document_id"]
+                ),
                 "evidence_id": evidence_id,
                 "evidence_type": "ANALYST_ESTIMATE" if metric == "eps" else "OTHER_FACT",
                 "claim_text": claim,

@@ -57,6 +57,9 @@ class OpenAIEvidenceValidationError(ValueError):
 class OpenAIEvidenceExtractionResult:
     chunks_available: int = 0
     chunks_examined: int = 0
+    chunks_reused: int = 0
+    openai_batches: int = 0
+    openai_input_size: int = 0
     items_returned: int = 0
     evidence_created: int = 0
     evidence_reused: int = 0
@@ -208,14 +211,31 @@ def run_openai_evidence_extraction(
         result.warnings.append("No relevant trusted chunks were available for OpenAI evidence extraction.")
         return result
     selected_by_id = {str(chunk["chunk_id"]): chunk for _, chunk in selected}
+    pending: list[tuple[str, dict[str, Any]]] = []
+    for group, chunk in selected:
+        cached = database.get_openai_chunk_extraction(
+            processing_run_id,
+            str(chunk.get("chunk_hash") or ""),
+            config.OPENAI_MODEL,
+            config.OPENAI_EVIDENCE_PROMPT_VERSION,
+            config.OPENAI_EVIDENCE_SCHEMA_VERSION,
+            db_path=db_path,
+        )
+        if cached and cached.get("status") == "COMPLETED":
+            result.chunks_reused += 1
+            result.evidence_reused += int(cached.get("evidence_count") or 0)
+        else:
+            pending.append((group, chunk))
+    if not pending:
+        return result
     batch_size = config.OPENAI_EXTRACTION_BATCH_SIZE
     system_prompt = (
         "Extract evidence only from the supplied locked-package chunks. Return the exact chunk_id and an exact verbatim_quote. "
         "Do not invent locators, evidence IDs, arithmetic, facts, or values. Abstain when a claim is unsupported. "
         "numeric_value may identify a reported source value, but the application performs all calculations."
     )
-    for start in range(0, len(selected), batch_size):
-        batch = selected[start : start + batch_size]
+    for start in range(0, len(pending), batch_size):
+        batch = pending[start : start + batch_size]
         payload = {
             "chunks": [
                 {
@@ -226,18 +246,26 @@ def run_openai_evidence_extraction(
                 for group, chunk in batch
             ]
         }
-        parsed: StructuredParseResult[OpenAIEvidenceBatch] = structured_parse(
-            system_prompt=system_prompt,
-            user_payload=payload,
-            schema=OpenAIEvidenceBatch,
-            client=client,
-            max_output_tokens=config.OPENAI_EXTRACTION_MAX_OUTPUT_TOKENS,
-            pipeline_stage="evidence_extraction",
-        )
+        result.openai_batches += 1
+        result.openai_input_size += sum(len(item["text"]) for item in payload["chunks"])
+        try:
+            parsed: StructuredParseResult[OpenAIEvidenceBatch] = structured_parse(
+                system_prompt=system_prompt,
+                user_payload=payload,
+                schema=OpenAIEvidenceBatch,
+                client=client,
+                max_output_tokens=config.OPENAI_EXTRACTION_MAX_OUTPUT_TOKENS,
+                pipeline_stage="evidence_extraction",
+            )
+        except Exception:
+            for _, chunk in batch:
+                _store_chunk_extraction_cache(processing_run_id, chunk, "FAILED", 0, db_path=db_path)
+            raise
         if parsed.endpoint not in result.endpoints:
             result.endpoints.append(parsed.endpoint)
         result.items_returned += len(parsed.parsed.items)
         batch_ids = {str(chunk["chunk_id"]) for _, chunk in batch}
+        evidence_counts = {chunk_id: 0 for chunk_id in batch_ids}
         for item in parsed.parsed.items:
             if item.abstain:
                 continue
@@ -261,11 +289,52 @@ def run_openai_evidence_extraction(
                 result.evidence_created += 1
             else:
                 result.evidence_reused += 1
+            evidence_counts[item.chunk_id] += 1
             if evidence.get("verification_status") in {config.VERIFICATION_SUPPORTS, config.VERIFICATION_PARTIALLY_SUPPORTS}:
                 result.verified_records += 1
                 if evidence.get("value") is not None:
                     result.verified_numeric_records += 1
+        for _, chunk in batch:
+            _store_chunk_extraction_cache(
+                processing_run_id,
+                chunk,
+                "COMPLETED",
+                evidence_counts[str(chunk["chunk_id"])],
+                db_path=db_path,
+            )
     if result.evidence_created + result.evidence_reused == 0:
         result.warnings.append("OpenAI completed extraction but found no supported evidence in the selected chunks.")
     result.warnings = sorted(set(result.warnings))
     return result
+
+
+def _store_chunk_extraction_cache(
+    processing_run_id: str,
+    chunk: dict[str, Any],
+    status: str,
+    evidence_count: int,
+    *,
+    db_path: Path | str,
+) -> None:
+    chunk_hash = str(chunk.get("chunk_hash") or "")
+    parts = (
+        processing_run_id,
+        chunk_hash,
+        config.OPENAI_MODEL,
+        config.OPENAI_EVIDENCE_PROMPT_VERSION,
+        config.OPENAI_EVIDENCE_SCHEMA_VERSION,
+    )
+    database.upsert_openai_chunk_extraction(
+        {
+            "cache_key": hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest(),
+            "processing_run_id": processing_run_id,
+            "chunk_hash": chunk_hash,
+            "model": config.OPENAI_MODEL,
+            "prompt_version": config.OPENAI_EVIDENCE_PROMPT_VERSION,
+            "schema_version": config.OPENAI_EVIDENCE_SCHEMA_VERSION,
+            "status": status,
+            "evidence_count": evidence_count,
+            "completed_at": database.utc_now_iso(),
+        },
+        db_path=db_path,
+    )

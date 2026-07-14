@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from collections import Counter
 from dataclasses import replace
 from pathlib import Path
 
@@ -26,6 +27,17 @@ from app.services.collectors.sec_collector import (
 )
 from app.services.company_resolver import resolve_package_company
 from app.services.document_download_service import DocumentDownloadError, create_public_documents_zip, get_document_download
+from app.services.official_ir_service import (
+    BraveSearchProvider,
+    discover_official_ir_materials,
+    download_official_ir_materials,
+    resolve_official_company_website,
+)
+from app.services.sec_audit_service import (
+    audit_sec_collection,
+    create_new_draft_from_current_profile,
+    reconcile_draft_with_current_profile,
+)
 from app.services.upload_service import (
     DOCUMENT_TYPE_OPTIONS,
     SOURCE_ALIASES,
@@ -160,6 +172,10 @@ def _company_identity(package: dict) -> dict:
 def _sec_collection(package: dict) -> None:
     st.subheader("Cutler collection scope")
     st.caption(package.get("collection_profile_name") or "CUTLER_EQUITY_INTERN_GUIDE")
+    st.caption(
+        f"8-K mode: {config.SEC_8K_COLLECTION_MODE}. "
+        + ("All 8-K filings remain included." if config.SEC_8K_COLLECTION_MODE == "ALL_8K" else "Selection reasons are retained in inventory.")
+    )
     scope_cols = st.columns(2)
     scope_cols[0].markdown("**Required**  \n10-K · 10-Q · 8-K · S-3 · S-4 · DEF 14A")
     scope_cols[1].markdown("**Conditional**  \nSelected Form 144 · Dividend announcements · Y-15 when discovered")
@@ -194,8 +210,8 @@ def _sec_collection(package: dict) -> None:
     candidates: list[FilingCandidate] = st.session_state.get("sec_preview", [])
     if not candidates:
         return
-    regular = [item for item in candidates if item.normalized_form_family != "144" and item.inventory_status != "EXCLUDED_BY_PROFILE"]
-    excluded = [item for item in candidates if item.inventory_status == "EXCLUDED_BY_PROFILE"]
+    regular = [item for item in candidates if item.normalized_form_family != "144" and item.inventory_status not in {"EXCLUDED_BY_PROFILE", "EXCLUDED_8K_MODE"}]
+    excluded = [item for item in candidates if item.inventory_status in {"EXCLUDED_BY_PROFILE", "EXCLUDED_8K_MODE"}]
     form_144 = [item for item in candidates if item.normalized_form_family == "144"]
     metric_cols = st.columns(4)
     metric_cols[0].metric("Discovered", len(candidates))
@@ -210,6 +226,8 @@ def _sec_collection(package: dict) -> None:
             "Filing Date": item.filing_date,
             "Collection source": "SEC EDGAR",
             "Conditional rule": "Included by profile",
+            "8-K items": item.filing_items or "",
+            "Selection reason": item.selection_reason or "",
             "Already collected": item.inventory_status == "ALREADY_COLLECTED",
             "Newly discoverable": item.inventory_status == "ELIGIBLE",
         }
@@ -240,7 +258,7 @@ def _sec_collection(package: dict) -> None:
     if excluded:
         with st.expander(f"Inventory diagnostics · {len(excluded)} excluded"):
             st.dataframe(
-                [{"Original form": item.form_type, "Filing date": item.filing_date, "Status": "Excluded by profile", "Accession": item.accession_number} for item in excluded],
+                [{"Original form": item.form_type, "Filing date": item.filing_date, "Status": item.inventory_status, "Reason": item.selection_reason or "Excluded by profile", "Accession": item.accession_number} for item in excluded],
                 hide_index=True, use_container_width=True,
             )
     candidates = [
@@ -263,6 +281,118 @@ def _sec_collection(package: dict) -> None:
             f"{dividend_summary['downloaded_now']} dividend exhibit(s)."
         )
         _refresh_active_package(package["package_id"])
+
+
+def _sec_audit_panel(package: dict) -> None:
+    versions = [
+        version
+        for version in database.list_package_versions(package["package_id"])
+        if version.get("status") == config.VERSION_STATUS_LOCKED
+    ]
+    version = versions[0] if versions else None
+    audit = audit_sec_collection(package["package_id"], version_id=version.get("version_id") if version else None)
+    with st.expander("SEC Collection Audit", expanded=bool(version)):
+        if version:
+            st.caption("Locked snapshot audit. No historical document or package record is modified.")
+        rows = [
+            ("Total SEC inventory", audit.total_sec_inventory),
+            ("Profile eligible", audit.profile_eligible_filings),
+            ("Selected", audit.selected_filings),
+            ("Already collected", audit.already_collected_filings),
+            ("Excluded by profile", audit.excluded_by_profile_filings),
+            ("Awaiting selection", audit.awaiting_selection_filings),
+            ("Unique accessions", audit.unique_accession_numbers),
+            ("Duplicate accessions", audit.duplicate_accession_numbers),
+            ("Unique source URLs", audit.unique_source_urls),
+            ("Duplicate content hashes", audit.duplicate_content_hashes),
+            ("Amendments", audit.amendments),
+            ("Legacy profile metadata", audit.legacy_without_profile_metadata),
+            ("Eligible next build", audit.eligible_for_next_build),
+        ]
+        st.dataframe([{"Measure": label, "Count": value} for label, value in rows], hide_index=True, use_container_width=True)
+        st.dataframe(
+            [{"Form family": family, "Count": count} for family, count in audit.family_breakdown.items()],
+            hide_index=True,
+            use_container_width=True,
+        )
+        actions = st.columns(2)
+        editable = package.get("status") != config.STATUS_PACKAGE_LOCKED
+        if actions[0].button("Reconcile Draft With Current Collection Profile", disabled=not editable, use_container_width=True):
+            result = reconcile_draft_with_current_profile(package["package_id"])
+            st.success(f"Next build reconciled: {result['included']} included, {result['excluded']} excluded. No files were deleted.")
+            st.rerun()
+        if version and actions[1].button("Create New Draft From Current Profile", use_container_width=True):
+            draft = create_new_draft_from_current_profile(source_version_id=version["version_id"])
+            st.session_state[config.SESSION_ACTIVE_PACKAGE_ID] = draft["package_id"]
+            st.session_state[config.SESSION_ACTIVE_TICKER] = draft["ticker"]
+            st.session_state["active_package"] = draft
+            st.success(f"New draft created with {draft['documents_reused']} eligible document references.")
+            st.rerun()
+
+
+def _official_ir_collection(package: dict) -> None:
+    st.subheader("Official IR Collection")
+    refreshed = database.get_package_by_package_id(package["package_id"]) or package
+    details = st.columns(5)
+    details[0].metric("Official website", refreshed.get("official_website_url") or "Not resolved")
+    details[1].metric("Verified IR domain", refreshed.get("official_ir_domain") or "Not resolved")
+    details[2].metric("Discovery source", refreshed.get("official_website_source") or "N/A")
+    details[3].metric("Confidence", refreshed.get("official_website_confidence") or "N/A")
+    details[4].metric("Last checked", refreshed.get("official_website_checked_at") or "N/A")
+
+    manual_url = st.text_input("Enter Official IR URL Manually", value=refreshed.get("official_ir_url") or "")
+    actions = st.columns(3)
+    discover_site = actions[0].button("Discover Official IR Site", disabled=not package.get("cik"), use_container_width=True)
+    refresh_discovery = actions[1].button("Refresh Discovery", disabled=not refreshed.get("official_website_url"), use_container_width=True)
+    discover_materials = actions[2].button("Review Discovered Materials", disabled=not (refreshed.get("official_website_url") or manual_url), use_container_width=True)
+    if discover_site:
+        provider = BraveSearchProvider(config.SEARCH_API_KEY) if config.SEARCH_PROVIDER == "brave" and config.SEARCH_API_KEY else None
+        resolved, candidates = resolve_official_company_website(refreshed, analyst_url=manual_url or None, search_provider=provider)
+        if resolved:
+            st.success(f"Official company site verified from {resolved.discovery_source}.")
+            st.rerun()
+        else:
+            st.warning(f"No candidate passed official-domain validation ({len(candidates)} reviewed).")
+    if refresh_discovery or discover_materials:
+        official_url = refreshed.get("official_website_url") or manual_url
+        result = discover_official_ir_materials(
+            refreshed,
+            official_url,
+            analyst_confirmed_ir_url=manual_url or None,
+        )
+        st.info(
+            f"{result['pages_crawled']} pages crawled; {len(result['materials'])} materials discovered. Status: {result['status']}."
+        )
+        st.rerun()
+
+    materials = database.list_ir_material_candidates(package["package_id"])
+    if materials:
+        category_counts = Counter(item.get("category") or "Unclassified" for item in materials)
+        st.caption(" · ".join(f"{category}: {count}" for category, count in sorted(category_counts.items())))
+        rows = [
+            {
+                "Select": bool(item.get("selected")),
+                "Title": item.get("title"),
+                "Category": item.get("category"),
+                "Date": item.get("publication_date") or item.get("document_date") or "",
+                "Type": item.get("file_extension") or item.get("mime_type"),
+                "Confidence": item.get("confidence"),
+                "Cutoff": item.get("cutoff_eligibility"),
+                "Status": item.get("download_status"),
+                "URL": item.get("source_url"),
+            }
+            for item in materials
+        ]
+        edited = st.data_editor(rows, hide_index=True, use_container_width=True, disabled=[key for key in rows[0] if key != "Select"])
+        selected_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
+        selected = [item for item, row in zip(materials, selected_rows, strict=False) if row.get("Select")]
+        if st.button("Download Selected Materials", disabled=not selected, type="primary"):
+            summary = download_official_ir_materials(refreshed, selected)
+            st.success(
+                f"{summary['downloaded_now']} downloaded, {summary['already_collected']} already collected, "
+                f"{summary['duplicate']} duplicates, {summary['excluded']} excluded, {summary['failed']} failed."
+            )
+            st.rerun()
 
 
 def _ir_collection(package: dict) -> None:
@@ -497,7 +627,8 @@ def _collected_documents(package: dict) -> None:
 def _collection_history(package: dict) -> None:
     st.subheader("Collection History")
     runs = database.list_recent_collection_runs(package["package_id"])
-    if not runs:
+    ir_runs = database.list_ir_discovery_runs(package["package_id"])
+    if not runs and not ir_runs:
         st.info("No collection runs have been recorded for this package.")
         return
     st.dataframe(
@@ -522,12 +653,23 @@ def _collection_history(package: dict) -> None:
         hide_index=True,
         use_container_width=True,
     )
+    if ir_runs:
+        latest = ir_runs[0]
+        timeline = [
+            {"Event": "Official website resolved", "Count": int(bool(latest.get("official_url")))},
+            {"Event": "Investor-relations site resolved", "Count": int(bool(latest.get("ir_url")))},
+            {"Event": "IR pages crawled", "Count": latest.get("pages_crawled", 0)},
+            {"Event": "Materials discovered", "Count": latest.get("materials_discovered", 0)},
+            {"Event": "Materials downloaded", "Count": latest.get("materials_downloaded", 0)},
+            {"Event": "Materials requiring review", "Count": latest.get("materials_needing_review", 0)},
+        ]
+        st.dataframe(timeline, hide_index=True, use_container_width=True)
 
 
 def main() -> None:
     bootstrap_page("Public Collection")
     render_sidebar()
-    st.markdown('<div class="eyebrow">Phase 2</div>', unsafe_allow_html=True)
+    st.markdown('<div class="eyebrow">Phase 3</div>', unsafe_allow_html=True)
     st.title("Public Document Collection")
     st.write("Resolve SEC identity, preview public filings, and collect approved public documents.")
     try:
@@ -539,6 +681,10 @@ def main() -> None:
         package = _company_identity(package)
         st.divider()
         _sec_collection(package)
+        st.divider()
+        _sec_audit_panel(package)
+        st.divider()
+        _official_ir_collection(package)
         st.divider()
         _licensed_uploads(package)
         st.divider()

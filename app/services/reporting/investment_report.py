@@ -1,10 +1,14 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import os
+import re
 import secrets
 import tempfile
+from datetime import date
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 from app import config
@@ -13,6 +17,24 @@ from app.services.reporting.docx_generator import build_docx_report
 from app.services.reporting.pdf_generator import build_pdf_report
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
+
+
+VERIFIED = {config.VERIFICATION_SUPPORTS, config.VERIFICATION_PARTIALLY_SUPPORTS}
+FINANCIAL_CONTEXT = (
+    "revenue", "sales", "income", "ebitda", "margin", "cash", "debt", "liquidity",
+    "earnings", "expense", "profit", "loss", "flow", "capital", "volume", "backlog",
+)
+METRIC_ALIASES: dict[str, tuple[str, ...]] = {
+    "revenue": ("revenue", "net sales", "sales"),
+    "sales": ("revenue", "net sales", "sales"),
+    "ebitda": ("ebitda",),
+    "margin": ("margin",),
+    "cash flow": ("cash flow", "operating activities", "investing activities", "financing activities"),
+    "liquidity": ("liquidity", "cash", "capital resources", "debt"),
+    "debt": ("debt", "borrowings", "notes"),
+    "income": ("income", "earnings", "profit", "loss"),
+}
+AMOUNT_METRIC_TERMS = ("revenue", "sales", "ebitda", "income", "cash", "debt", "liquidity", "flow", "capex", "profit", "loss", "expense")
 
 
 def _report_id() -> str:
@@ -39,36 +61,333 @@ def _atomic_build(path: Path, builder: Any, sections: list[dict[str, Any]]) -> N
         builder(temp_path, sections)
         os.replace(temp_path, path)
     finally:
-        if temp_path.exists():
-            temp_path.unlink()
+        temp_path.unlink(missing_ok=True)
 
 
 def citation_audit(analysis_run_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> dict[str, Any]:
     thesis_items = database.list_thesis_items(analysis_run_id, db_path=db_path)
     unsupported = [
-        item
-        for item in thesis_items
-        if item.get("citation_status") not in {config.VERIFICATION_SUPPORTS, config.VERIFICATION_PARTIALLY_SUPPORTS}
-        and json.loads(item.get("evidence_ids_json") or "[]")
+        item for item in thesis_items
+        if item.get("citation_status") not in VERIFIED and json.loads(item.get("evidence_ids_json") or "[]")
     ]
     uncited_material = [
-        item
-        for item in thesis_items
+        item for item in thesis_items
         if item.get("confidence") != config.CONFIDENCE_INSUFFICIENT and not json.loads(item.get("evidence_ids_json") or "[]")
     ]
-    status = "PASSED" if not unsupported and not uncited_material else "FAILED"
     return {
-        "status": status,
+        "status": "PASSED" if not unsupported and not uncited_material else "FAILED",
         "unsupported": [item["thesis_item_id"] for item in unsupported],
         "uncited_material": [item["thesis_item_id"] for item in uncited_material],
     }
 
 
+def build_compact_memo(analysis_run_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> dict[str, Any]:
+    run = database.get_analysis_run(analysis_run_id, db_path=db_path)
+    if not run:
+        raise ValueError("Analysis run does not exist.")
+    version = database.get_package_version(run["version_id"], db_path=db_path) or {}
+    package = database.get_package_by_package_id(run["package_id"], db_path=db_path) or {}
+    decision = database.get_recommendation_decision(analysis_run_id, db_path=db_path) or {}
+    evidence = database.list_evidence_records(run["processing_run_id"], version_id=run["version_id"], db_path=db_path)
+    evidence_by_id = {item["evidence_id"]: item for item in evidence}
+    docs = _document_lookup(run["version_id"], db_path=db_path)
+    supporting = _supporting_facts(evidence, docs)
+    thesis = database.list_thesis_items(analysis_run_id, db_path=db_path)
+    risks = _thesis_facts(thesis, "RISK", evidence_by_id, docs, limit=4)
+    catalysts = _thesis_facts(thesis, "CATALYST", evidence_by_id, docs, limit=3)
+    limitations = _limitations(run, decision, supporting)
+    recommendation = _recommendation(decision, run)
+    conclusion = (
+        f"The current evidence set supports {'an' if recommendation[0].lower() in 'aeiou' else 'a'} {recommendation} stance. "
+        "The decision remains subject to the cited evidence, risks, and missing information summarized below."
+    )
+    return {
+        "mode": config.REPORT_MODE,
+        "company_name": version.get("company_name") or package.get("company_name") or version.get("ticker") or "Company",
+        "ticker": version.get("ticker") or package.get("ticker") or "",
+        "research_cutoff": _readable_date(run.get("research_cutoff") or version.get("research_cutoff_date")),
+        "recommendation": recommendation,
+        "confidence": str(decision.get("confidence") or run.get("confidence") or "Not available").title(),
+        "investment_view": conclusion[:650],
+        "supporting_evidence": supporting,
+        "catalysts": catalysts,
+        "risks": risks,
+        "limitations": limitations,
+        "conclusion": _conclusion(recommendation, limitations),
+    }
+
+
+def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
+    header = (
+        f"Recommendation: {memo['recommendation']}\n"
+        f"Confidence: {memo['confidence']}\n"
+        f"Research cutoff: {memo['research_cutoff']}"
+    )
+    sections: list[dict[str, Any]] = [
+        {"title": f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary", "paragraphs": [header]},
+        {"title": "Investment View", "paragraphs": [memo["investment_view"]]},
+        {"title": "Key Supporting Evidence", "paragraphs": _fact_paragraphs(memo["supporting_evidence"])},
+    ]
+    if memo.get("catalysts"):
+        sections.append({"title": "Catalysts", "paragraphs": _fact_paragraphs(memo["catalysts"])})
+    sections.extend(
+        [
+            {"title": "Key Risks", "paragraphs": _fact_paragraphs(memo["risks"]) or ["No sufficiently supported material risks were extracted from the locked corpus."]},
+            {"title": "Important Missing Information", "paragraphs": memo["limitations"]},
+            {"title": "Conclusion", "paragraphs": [memo["conclusion"]]},
+        ]
+    )
+    return sections
+
+
+def _fact_paragraphs(items: list[dict[str, str]]) -> list[str]:
+    paragraphs: list[str] = []
+    for item in items:
+        paragraphs.extend((item["claim"], item["citation"]))
+    return paragraphs
+
+
+def _document_lookup(version_id: str, *, db_path: Path | str) -> dict[str, dict[str, Any]]:
+    rows: dict[str, dict[str, Any]] = {}
+    for version_doc in database.list_package_version_documents(version_id, db_path=db_path):
+        original = database.get_document_by_document_id(version_doc.get("original_document_id"), db_path=db_path) or {}
+        rows[version_doc["document_id"]] = {**original, **version_doc}
+    return rows
+
+
+def _supporting_facts(evidence: list[dict[str, Any]], docs: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
+    candidates: list[tuple[str, str, dict[str, str]]] = []
+    seen: set[str] = set()
+    for item in evidence:
+        if not _financial_evidence_is_reportable(item, docs):
+            continue
+        key = str(item.get("source_text_hash") or "") + "|" + str(item.get("metric_name") or "").casefold()
+        if key in seen:
+            continue
+        seen.add(key)
+        claim = _source_claim(item)
+        claim_key = re.sub(r"\W+", " ", claim.casefold()).strip()
+        if claim_key in seen:
+            continue
+        seen.add(claim_key)
+        citation = _citation(item, docs[item["version_document_id"]])
+        candidates.append((_sort_date(item.get("period")), _claim_family(item.get("metric_name")), {"claim": claim, "citation": citation}))
+    candidates.sort(key=lambda row: row[0], reverse=True)
+    selected: list[dict[str, str]] = []
+    family_counts: dict[str, int] = {}
+    for _, family, fact in candidates:
+        if family_counts.get(family, 0):
+            continue
+        selected.append(fact)
+        family_counts[family] = 1
+        if len(selected) == 5:
+            return selected
+    for _, family, fact in candidates:
+        if fact in selected or family_counts.get(family, 0) >= 2:
+            continue
+        selected.append(fact)
+        family_counts[family] = family_counts.get(family, 0) + 1
+        if len(selected) == 5:
+            break
+    return selected
+
+
+def _financial_evidence_is_reportable(item: dict[str, Any], docs: dict[str, dict[str, Any]]) -> bool:
+    if item.get("verification_status") not in VERIFIED or item.get("value") is None:
+        return False
+    required = (item.get("metric_name"), item.get("unit"), item.get("period"), item.get("source_text"), item.get("source_locator_json"))
+    if not all(required) or item.get("version_document_id") not in docs:
+        return False
+    doc = docs[item["version_document_id"]]
+    if not (doc.get("publication_date") or doc.get("filing_date") or doc.get("document_date")):
+        return False
+    context = str(item.get("source_text") or "").lower()
+    if not any(term in context for term in FINANCIAL_CONTEXT):
+        return False
+    metric_name = str(item.get("metric_name") or "").strip().lower()
+    if not _metric_context_matches(metric_name, context):
+        return False
+    if ("revenue" in metric_name or "sales" in metric_name) and "industry" in context and "company" not in context and "qxo" not in context:
+        return False
+    unit = str(item.get("unit") or "").lower()
+    if ("%" in unit or "percent" in unit) and len(re.findall(r"\d+(?:\.\d+)?\s*%", context)) > 2:
+        return False
+    if any(term in metric_name for term in AMOUNT_METRIC_TERMS) and (not item.get("currency") or "%" in unit or "percent" in unit):
+        return False
+    if any(term in unit for term in ("dollar", "usd", "$", "million", "billion")) and not item.get("currency") and "usd" not in unit and "$" not in unit:
+        return False
+    value_text = f"{float(item['value']):g}"
+    if not re.search(rf"(?<!\d){re.escape(value_text)}(?:0+)?(?!\d)", context.replace(",", "")):
+        return False
+    period_year = re.search(r"20\d{2}", str(item.get("period") or ""))
+    if period_year and period_year.group(0) not in context:
+        return False
+    locator = json.loads(item.get("source_locator_json") or "{}")
+    return bool(locator and (item.get("page_number") or item.get("section_heading") or item.get("cell_or_row_range") or locator.get("display_title")))
+
+
+def _source_claim(item: dict[str, Any]) -> str:
+    text = _clean_text(item.get("claim_text") or item.get("source_text") or "")
+    metric_name = str(item.get("metric_name") or "").strip()
+    if "ebitda" in metric_name.lower():
+        value = f"{float(item['value']):g}"
+        currency = str(item.get("currency") or "")
+        unit = str(item.get("unit") or "")
+        if currency and "dollar" in unit.lower():
+            unit = re.sub(r"\bdollars?\b", "", unit, flags=re.I).strip()
+        amount = " ".join(part for part in (currency, value, unit) if part)
+        return f"{metric_name} was {amount} for {item['period']}."
+    if len(text) <= 360:
+        return text.rstrip(".") + "."
+    value_text = f"{float(item['value']):g}"
+    aliases = next(
+        (values for key, values in METRIC_ALIASES.items() if key in str(item.get("metric_name") or "").lower()),
+        (),
+    )
+    sentences = re.split(r"(?<=[.!?])\s+", text)
+    for sentence in sentences:
+        lowered = sentence.lower()
+        if value_text in sentence.replace(",", "") and any(alias in lowered for alias in aliases):
+            return _truncate_claim(sentence)
+    return _truncate_claim(text)
+
+
+def _metric_context_matches(metric_name: str, context: str) -> bool:
+    if "revenue" in metric_name or "sales" in metric_name:
+        cleaned = context.replace("internal revenue code", "")
+        return "net sales" in cleaned or "sales revenue" in cleaned or bool(re.search(r"\brevenue\b", cleaned))
+    aliases = next((values for key, values in METRIC_ALIASES.items() if key in metric_name), (metric_name,))
+    return any(alias and alias in context for alias in aliases)
+
+
+def _truncate_claim(value: str, limit: int = 320) -> str:
+    cleaned = value.strip()
+    if len(cleaned) <= limit:
+        return cleaned.rstrip(".") + "."
+    shortened = cleaned[:limit].rsplit(" ", 1)[0].rstrip(" ,;.")
+    return shortened + "..."
+
+
+def _claim_family(value: Any) -> str:
+    metric = re.sub(r"[^a-z0-9]+", " ", str(value or "").lower()).strip()
+    if "ebitda" in metric:
+        return "ebitda"
+    if "revenue" in metric or "sales" in metric:
+        return "revenue"
+    if "debt" in metric:
+        return "debt"
+    if "liquidity" in metric or "cash" in metric:
+        return "liquidity"
+    if "margin" in metric:
+        return "margin"
+    return metric
+
+
+def _thesis_facts(
+    thesis: list[dict[str, Any]], item_type: str, evidence_by_id: dict[str, dict[str, Any]],
+    docs: dict[str, dict[str, Any]], *, limit: int,
+) -> list[dict[str, str]]:
+    rows: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for item in thesis:
+        if item.get("item_type") != item_type or item.get("citation_status") not in VERIFIED:
+            continue
+        for evidence_id in json.loads(item.get("evidence_ids_json") or "[]"):
+            evidence = evidence_by_id.get(evidence_id)
+            if not evidence or evidence.get("verification_status") not in VERIFIED or evidence.get("version_document_id") not in docs:
+                continue
+            claim = _clean_text(item.get("claim") or "")
+            key = re.sub(r"\W+", " ", claim.casefold()).strip()
+            if not claim or key in seen:
+                continue
+            seen.add(key)
+            rows.append({"claim": claim, "citation": _citation(evidence, docs[evidence["version_document_id"]])})
+            break
+        if len(rows) >= limit:
+            break
+    return rows
+
+
+def _citation(evidence: dict[str, Any], doc: dict[str, Any]) -> str:
+    form = str(doc.get("form_type") or "").replace("/A", " amendment")
+    title = str(doc.get("title") or doc.get("document_title") or "Official company material")
+    ticker = str(doc.get("ticker") or "").strip()
+    source = f"{ticker} {form}".strip() if form else title
+    filed = doc.get("publication_date") or doc.get("filing_date") or doc.get("document_date")
+    pieces = [source, f"filed {_readable_date(filed)}" if filed else ""]
+    section = str(evidence.get("section_heading") or "").strip()
+    if section and re.search(r"[A-Za-z]", section) and not re.fullmatch(r"FORM\s+\d+-?[A-Z]?", section, flags=re.I):
+        pieces.append(section)
+    elif evidence.get("page_number"):
+        pieces.append(f"page {evidence['page_number']}")
+    return f"[From: {', '.join(piece for piece in pieces if piece)}]"
+
+
+def _limitations(run: dict[str, Any], decision: dict[str, Any], facts: list[dict[str, str]]) -> list[str]:
+    rows: list[str] = ["Closed-corpus limitation: the memo uses only evidence available in the locked research package as of the cutoff date."]
+    if run.get("reference_price") is None:
+        rows.append("A current reference price and package-contained valuation evidence were unavailable.")
+    if not facts:
+        rows.append("No financial facts met every verification, unit, period, context, and source-locator requirement.")
+    if decision.get("abstention_reason"):
+        rows.append(_clean_text(decision["abstention_reason"])[:350])
+    return list(dict.fromkeys(rows)) or ["The memo is limited to evidence available in the locked research corpus as of the cutoff date."]
+
+
+def _recommendation(decision: dict[str, Any], run: dict[str, Any]) -> str:
+    value = str(decision.get("effective_rating") or run.get("preliminary_recommendation") or "ANALYST_REVIEW_REQUIRED").upper()
+    mapping = {
+        "BUY": "Buy", "HOLD": "Hold", "SELL": "Sell",
+        "ANALYST_REVIEW_REQUIRED": "Analyst Review Required",
+        "INSUFFICIENT_EVIDENCE": "Insufficient Evidence",
+        "ABSTAIN": "Insufficient Evidence",
+    }
+    return mapping.get(value, "Analyst Review Required")
+
+
+def _conclusion(recommendation: str, limitations: list[str]) -> str:
+    if recommendation in {"Analyst Review Required", "Insufficient Evidence"}:
+        return f"{limitations[0]} Analyst review is required before assigning a final recommendation."
+    return f"The verified evidence supports a {recommendation} recommendation, subject to the risks and limitations above."
+
+
+def _clean_text(value: Any) -> str:
+    text = re.sub(r"\s+", " ", str(value or "")).strip()
+    text = re.sub(r"\b(?:EVD|PV|RUN|PKG|DOC|RPT)-[A-Z0-9-]+\b", "", text, flags=re.I)
+    text = re.sub(r"\b[a-f0-9]{64}\b", "", text, flags=re.I)
+    return re.sub(r"\s+", " ", text).strip()
+
+
+def _readable_date(value: Any) -> str:
+    try:
+        return date.fromisoformat(str(value)[:10]).strftime("%B %d, %Y").replace(" 0", " ")
+    except (TypeError, ValueError):
+        return str(value or "Not available")
+
+
+def _sort_date(value: Any) -> str:
+    match = re.search(r"(20\d{2})(?:[-/]?(\d{2}))?(?:[-/]?(\d{2}))?", str(value or ""))
+    return "" if not match else f"{match.group(1)}-{match.group(2) or '00'}-{match.group(3) or '00'}"
+
+
+def _report_fingerprint(run: dict[str, Any], decision: dict[str, Any], memo: dict[str, Any], *, db_path: Path | str) -> str:
+    evidence = database.list_evidence_records(run["processing_run_id"], version_id=run["version_id"], db_path=db_path)
+    metrics = database.list_analysis_metrics(run["analysis_run_id"], db_path=db_path)
+    payload = {
+        "evidence": sorted((row.get("source_text_hash"), row.get("verification_status"), row.get("updated_at")) for row in evidence),
+        "metrics": sorted((row.get("metric_code"), row.get("value"), row.get("unit"), row.get("period"), row.get("source_evidence_ids_json")) for row in metrics),
+        "recommendation": decision,
+        "analyst_notes": run.get("analyst_notes"),
+        "pm_notes": run.get("pm_notes"),
+        "template": config.REPORT_TEMPLATE_VERSION,
+        "mode": config.REPORT_MODE,
+        "memo": memo,
+    }
+    return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
 def generate_investment_report(
-    analysis_run_id: str,
-    *,
-    final: bool = False,
-    db_path: Path | str = config.DATABASE_PATH,
+    analysis_run_id: str, *, final: bool = False, db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     run = database.get_analysis_run(analysis_run_id, db_path=db_path)
     if not run:
@@ -82,210 +401,41 @@ def generate_investment_report(
         raise ValueError("Recommendation decision is required before report generation.")
     audit = citation_audit(analysis_run_id, db_path=db_path)
     if final and audit["status"] != "PASSED":
-        version = database.get_package_version(run["version_id"], db_path=db_path)
-        if version:
-            database.create_package_version_event(
-                event_id=_event_id(),
-                parent_package_id=run["package_id"],
-                version_id=run["version_id"],
-                event_type="CITATION_AUDIT_FAILED",
-                event_details_json=json.dumps({"analysis_run_id": analysis_run_id, "audit": audit}, sort_keys=True),
-                db_path=db_path,
-            )
         raise ValueError("Final report citation audit failed.")
-    existing_reports = database.list_generated_reports(analysis_run_id, db_path=db_path)
+    memo = build_compact_memo(analysis_run_id, db_path=db_path)
+    fingerprint = _report_fingerprint(run, decision, memo, db_path=db_path)
     desired_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
-    for existing in existing_reports:
-        if existing.get("report_status") == desired_status:
+    for existing in database.list_generated_reports(analysis_run_id, db_path=db_path):
+        if existing.get("report_status") == desired_status and existing.get("input_fingerprint") == fingerprint:
             return existing
+
     report_version = database.next_report_version(analysis_run_id, db_path=db_path)
-    report_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
     root = _report_root(run["version_id"], analysis_run_id)
-    ticker = _ticker_for_run(run, db_path=db_path)
     suffix = "PM_APPROVED" if final else "DRAFT"
-    base_name = sanitize_filename(f"{ticker}_Investment_Report_V{report_version:03d}_{suffix}")
-    docx_path = root / f"{base_name}.docx"
-    pdf_path = root / f"{base_name}.pdf"
-    sections = _report_sections(run, decision, audit, db_path=db_path)
+    base_name = sanitize_filename(f"{memo['ticker']}_Investment_Memo_V{report_version:03d}_{suffix}")
+    docx_path, pdf_path = root / f"{base_name}.docx", root / f"{base_name}.pdf"
+    sections = memo_to_sections(memo)
+    started = perf_counter()
     _atomic_build(docx_path, build_docx_report, sections)
     _atomic_build(pdf_path, build_pdf_report, sections)
     report = {
-        "report_id": _report_id(),
-        "analysis_run_id": analysis_run_id,
-        "package_id": run["package_id"],
-        "version_id": run["version_id"],
-        "processing_run_id": run["processing_run_id"],
-        "report_version": report_version,
-        "report_kind": "INVESTMENT_REPORT",
-        "report_status": report_status,
-        "recommendation": decision.get("effective_rating"),
-        "confidence": decision.get("confidence"),
-        "docx_path": str(docx_path),
-        "docx_sha256": sha256_file(docx_path),
-        "pdf_path": str(pdf_path),
-        "pdf_sha256": sha256_file(pdf_path),
-        "template_version": config.REPORT_TEMPLATE_VERSION,
-        "citation_audit_status": audit["status"],
-        "warnings_json": json.dumps([] if audit["status"] == "PASSED" else ["Draft report contains citation audit warnings."], sort_keys=True),
+        "report_id": _report_id(), "analysis_run_id": analysis_run_id, "package_id": run["package_id"],
+        "version_id": run["version_id"], "processing_run_id": run["processing_run_id"],
+        "report_version": report_version, "report_kind": "INVESTMENT_MEMO", "report_status": desired_status,
+        "recommendation": decision.get("effective_rating"), "confidence": decision.get("confidence"),
+        "docx_path": str(docx_path), "docx_sha256": sha256_file(docx_path),
+        "pdf_path": str(pdf_path), "pdf_sha256": sha256_file(pdf_path),
+        "template_version": config.REPORT_TEMPLATE_VERSION, "citation_audit_status": audit["status"],
+        "warnings_json": json.dumps([] if audit["status"] == "PASSED" else ["Draft memo contains citation audit warnings."]),
+        "input_fingerprint": fingerprint, "report_mode": config.REPORT_MODE,
+        "memo_json": json.dumps(memo, sort_keys=True), "duration_seconds": round(perf_counter() - started, 6),
         "created_at": database.utc_now_iso(),
     }
     database.create_generated_report(report, db_path=db_path)
     database.create_package_version_event(
-        event_id=_event_id(),
-        parent_package_id=run["package_id"],
-        version_id=run["version_id"],
+        event_id=_event_id(), parent_package_id=run["package_id"], version_id=run["version_id"],
         event_type="REPORT_GENERATED",
-        event_details_json=json.dumps({"analysis_run_id": analysis_run_id, "report_id": report["report_id"], "status": report_status}, sort_keys=True),
+        event_details_json=json.dumps({"analysis_run_id": analysis_run_id, "report_id": report["report_id"], "status": desired_status}, sort_keys=True),
         db_path=db_path,
     )
     return report
-
-
-def _ticker_for_run(run: dict[str, Any], *, db_path: Path | str) -> str:
-    version = database.get_package_version(run["version_id"], db_path=db_path) or {}
-    return version.get("ticker") or "Research"
-
-
-def _report_sections(run: dict[str, Any], decision: dict[str, Any], audit: dict[str, Any], *, db_path: Path | str) -> list[dict[str, Any]]:
-    metrics = database.list_analysis_metrics(run["analysis_run_id"], db_path=db_path)
-    scorecard = database.list_scorecard_items(run["analysis_run_id"], db_path=db_path)
-    scenarios = database.list_analysis_scenarios(run["analysis_run_id"], db_path=db_path)
-    thesis = database.list_thesis_items(run["analysis_run_id"], db_path=db_path)
-    version_docs = database.list_package_version_documents(run["version_id"], db_path=db_path)
-    evidence = database.list_evidence_records(run["processing_run_id"], version_id=run["version_id"], db_path=db_path)
-    evidence_by_id = {item["evidence_id"]: item for item in evidence}
-    return [
-        {
-            "title": "Cover Page",
-            "paragraphs": [
-                "Cutler Research AI Investment Report",
-                f"Package version: {run['version_id']}",
-                f"Processing run: {run['processing_run_id']}",
-                f"Analysis run: {run['analysis_run_id']}",
-                f"Research cutoff: {run.get('research_cutoff')}",
-                f"Recommendation status: {run.get('status')}",
-                f"PM approval exists: {run.get('status') == config.ANALYSIS_STATUS_PM_APPROVED}",
-                "Closed-corpus limitation: no external sources, web search, or live market data were used.",
-                "This system produces an evidence-grounded research draft for analyst and portfolio-manager review. It does not independently execute investment decisions or trades.",
-            ],
-            "page_break": True,
-        },
-        {
-            "title": "Investment Conclusion",
-            "paragraphs": [
-                f"Preliminary recommendation: {decision.get('preliminary_rating')}",
-                f"Effective recommendation: {decision.get('effective_rating')}",
-                f"Confidence: {decision.get('confidence')}",
-                decision.get("recommendation_rationale") or "",
-            ],
-        },
-        {
-            "title": "Why The Other Ratings Were Not Selected",
-            "paragraphs": [
-                f"Why not Buy: {decision.get('why_not_buy')}",
-                f"Why not Hold: {decision.get('why_not_hold')}",
-                f"Why not Sell: {decision.get('why_not_sell')}",
-                f"Abstention reason: {decision.get('abstention_reason') or 'None'}",
-            ],
-        },
-        {
-            "title": "Financial Metrics",
-            "tables": [
-                {
-                    "rows": [["Metric", "Value", "Unit", "Period", "Evidence IDs", "Warning"]]
-                    + [
-                        [
-                            metric["display_name"],
-                            metric.get("value"),
-                            metric.get("unit") or metric.get("currency") or "",
-                            metric.get("period") or "",
-                            metric.get("source_evidence_ids_json") or "[]",
-                            metric.get("warning") or "",
-                        ]
-                        for metric in metrics
-                    ]
-                }
-            ],
-        },
-        {
-            "title": "Scorecard",
-            "tables": [
-                {
-                    "rows": [["Pillar", "Score", "Weight", "Effective", "Rationale"]]
-                    + [
-                        [item["pillar_name"], item["score"], item["weight"], item["effective_score"], item["rationale"]]
-                        for item in scorecard
-                    ]
-                }
-            ],
-        },
-        {
-            "title": "Bull / Base / Bear Scenarios",
-            "tables": [
-                {
-                    "rows": [["Scenario", "Implied Value", "Reference Price", "Upside/Downside", "Probability", "Warnings"]]
-                    + [
-                        [
-                            scenario["scenario_name"],
-                            scenario.get("implied_value"),
-                            scenario.get("reference_price"),
-                            scenario.get("upside_downside"),
-                            scenario.get("probability"),
-                            scenario.get("warnings_json"),
-                        ]
-                        for scenario in scenarios
-                    ]
-                }
-            ],
-        },
-        {
-            "title": "Thesis, Catalysts, And Risks",
-            "paragraphs": [_thesis_paragraph(item, evidence_by_id) for item in thesis],
-        },
-        {
-            "title": "Evidence Coverage And Citation Audit",
-            "paragraphs": [
-                f"Evidence coverage: {run.get('evidence_coverage')}",
-                f"Recommendation confidence: {run.get('confidence')}",
-                f"Citation audit status: {audit['status']}",
-                f"Unsupported thesis items: {audit['unsupported']}",
-                f"Uncited material items: {audit['uncited_material']}",
-            ],
-        },
-        {
-            "title": "Source Inventory",
-            "tables": [
-                {
-                    "rows": [["Version Document ID", "Title", "Path", "SHA-256"]]
-                    + [[doc["document_id"], doc.get("title") or "", doc["relative_package_path"], doc["sha256_hash"]] for doc in version_docs]
-                }
-            ],
-        },
-        {
-            "title": "Analyst Review And PM Approval",
-            "paragraphs": [
-                f"Analyst recommendation: {run.get('analyst_adjusted_recommendation') or 'Pending'}",
-                f"Analyst notes: {run.get('analyst_notes') or ''}",
-                f"PM recommendation: {run.get('pm_approved_recommendation') or 'Pending'}",
-                f"PM notes: {run.get('pm_notes') or ''}",
-            ],
-        },
-    ]
-
-
-def _thesis_paragraph(item: dict[str, Any], evidence_by_id: dict[str, dict[str, Any]]) -> str:
-    evidence_ids = json.loads(item.get("evidence_ids_json") or "[]")
-    citations = []
-    for evidence_id in evidence_ids:
-        evidence = evidence_by_id.get(evidence_id, {})
-        locator = json.loads(evidence.get("source_locator_json") or "{}")
-        title = locator.get("display_title") or evidence.get("version_document_id") or evidence_id
-        pieces = [str(title)]
-        if evidence.get("page_number"):
-            pieces.append(f"p. {evidence['page_number']}")
-        if evidence.get("sheet_name"):
-            pieces.append(str(evidence["sheet_name"]))
-        if evidence.get("cell_or_row_range"):
-            pieces.append(str(evidence["cell_or_row_range"]))
-        citations.append("[" + ", ".join(pieces) + "]")
-    return f"{item['item_type']}: {item['claim']} {' '.join(citations)}"

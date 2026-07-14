@@ -20,6 +20,7 @@ from app.services.collectors.sec_collector import download_selected_filings, pre
 from app.services.company_resolver import ResolutionResult, resolve_ticker_metadata
 from app.services.package_builder import build_package_version, lock_version, validate_package_readiness, verify_snapshot
 from app.services.package_service import PackageInput, create_package, find_existing_ticker_packages
+from app.services.performance_service import StageTimer
 from app.services.processing_pipeline import repair_processing_run, run_processing_pipeline
 from app.services.reporting.investment_report import generate_investment_report
 from app.services.workspace_service import ensure_inside, sanitize_filename
@@ -425,6 +426,8 @@ def run_research_workflow(
         warnings.extend(readiness.warnings)
 
         version = _existing_version(workflow, db_path=db_path)
+        build_reused = bool(version)
+        build_timer = StageTimer("Building package", workflow_run_id=workflow_id, package_id=package_id, db_path=db_path)
         if version and version.get("status") == config.VERSION_STATUS_BUILDING:
             database.update_package_version(
                 version["version_id"],
@@ -440,20 +443,34 @@ def run_research_workflow(
                 {"version_id": version["version_id"]},
                 db_path=db_path,
             ) or workflow
+        version_documents = database.list_package_version_documents(version["version_id"], db_path=db_path)
+        build_timer.finish(
+            reused=build_reused,
+            files_examined=len(version_documents),
+            files_reused=len(version_documents) if build_reused else 0,
+            files_processed=0 if build_reused else len(version_documents),
+        )
         _mark_stage(stage_statuses, "Building package", "Completed")
+        StageTimer("Creating manifest", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path).finish(reused=build_reused)
         _mark_stage(stage_statuses, "Creating manifest", "Completed")
+        StageTimer("Verifying integrity", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path).finish(files_examined=len(version_documents))
         _mark_stage(
             stage_statuses,
             "Verifying integrity",
             "Completed with warnings" if version.get("integrity_status") == config.INTEGRITY_VERIFIED_WITH_WARNINGS else "Completed",
         )
 
-        if version.get("status") != config.VERSION_STATUS_LOCKED:
+        lock_reused = version.get("status") == config.VERSION_STATUS_LOCKED
+        lock_timer = StageTimer("Locking package", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path)
+        if not lock_reused:
             _persist_stage(workflow_id, stage_statuses, "Locking package", "Running", db_path=db_path)
             version = lock_version(version["version_id"], db_path=db_path)
+        lock_timer.finish(reused=lock_reused, files_examined=len(version_documents))
         _mark_stage(stage_statuses, "Locking package", "Completed")
 
         processing_run = _existing_processing_run(workflow, version, db_path=db_path)
+        processing_reused = bool(processing_run)
+        processing_timer = StageTimer("Processing documents", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path)
         if not processing_run:
             _persist_stage(workflow_id, stage_statuses, "Processing documents", "Running", db_path=db_path)
             processing_run = run_processing_pipeline(version["version_id"], db_path=db_path)
@@ -468,6 +485,15 @@ def run_research_workflow(
         if processing_run.get("status") not in {config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS}:
             raise RuntimeError(f"Processing run ended with technical status {processing_run.get('status')}.")
         processing_status = "Completed with warnings" if processing_run.get("status") == config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS else "Completed"
+        processing_timer.processing_run_id = processing_run["processing_run_id"]
+        processing_timer.finish(
+            reused=processing_reused,
+            files_examined=int(processing_run.get("total_documents") or 0),
+            files_reused=int(processing_run.get("total_documents") or 0) if processing_reused else 0,
+            files_processed=0 if processing_reused else int(processing_run.get("successful_documents") or 0) + int(processing_run.get("partial_documents") or 0),
+            chunks_examined=int(processing_run.get("chunks_created") or 0),
+            evidence_created=int(processing_run.get("evidence_records_created") or 0),
+        )
         _mark_stage(stage_statuses, "Processing documents", processing_status)
 
         analysis_run = (
@@ -477,9 +503,31 @@ def run_research_workflow(
         )
         if not analysis_run:
             _persist_stage(workflow_id, stage_statuses, "Extracting evidence", "Running", db_path=db_path)
+            analysis_timers: dict[str, StageTimer] = {}
+            analysis_finished: set[str] = set()
+            analysis_total_timer = StageTimer(
+                "Analysis totals",
+                workflow_run_id=workflow_id,
+                package_id=package_id,
+                version_id=version["version_id"],
+                processing_run_id=processing_run["processing_run_id"],
+                db_path=db_path,
+            )
 
             def analysis_progress(stage: str, status: str) -> None:
                 _persist_stage(workflow_id, stage_statuses, stage, status, db_path=db_path)
+                if status == "Running" and stage not in analysis_timers:
+                    analysis_timers[stage] = StageTimer(
+                        stage,
+                        workflow_run_id=workflow_id,
+                        package_id=package_id,
+                        version_id=version["version_id"],
+                        processing_run_id=processing_run["processing_run_id"],
+                        db_path=db_path,
+                    )
+                elif status != "Running" and stage in analysis_timers:
+                    analysis_timers.pop(stage).finish()
+                    analysis_finished.add(stage)
 
             analysis_run = create_analysis_run(
                 version["version_id"],
@@ -488,11 +536,58 @@ def run_research_workflow(
                 force_retry=bool(existing and retry_failed),
                 db_path=db_path,
             )
+            extraction_details = json.loads(analysis_run.get("openai_diagnostics_json") or "{}")
+            extraction = extraction_details.get("extraction") or {}
+            metric_count = len(database.list_analysis_metrics(analysis_run["analysis_run_id"], db_path=db_path))
+            conflict_count = len(database.list_claim_conflicts(processing_run["processing_run_id"], db_path=db_path))
+            for stage in ("Extracting evidence", "Verifying citations", "Calculating metrics", "Generating recommendation"):
+                if stage in analysis_finished:
+                    continue
+                timer = analysis_timers.pop(stage, None) or StageTimer(
+                    stage,
+                    workflow_run_id=workflow_id,
+                    package_id=package_id,
+                    version_id=version["version_id"],
+                    processing_run_id=processing_run["processing_run_id"],
+                    analysis_run_id=analysis_run["analysis_run_id"],
+                    db_path=db_path,
+                )
+                timer.analysis_run_id = analysis_run["analysis_run_id"]
+                timer.finish(
+                    reused=bool(extraction.get("chunks_reused")) if stage == "Extracting evidence" else False,
+                    chunks_examined=int(extraction.get("chunks_examined") or 0) if stage == "Extracting evidence" else 0,
+                    openai_batches=int(extraction.get("openai_batches") or 0) if stage == "Extracting evidence" else 0,
+                    openai_input_size=int(extraction.get("openai_input_size") or 0) if stage == "Extracting evidence" else 0,
+                    evidence_created=int(extraction.get("evidence_created") or 0) if stage == "Extracting evidence" else 0,
+                    metrics_created=metric_count if stage == "Calculating metrics" else 0,
+                    conflicts_examined=conflict_count if stage == "Verifying citations" else 0,
+                )
+            analysis_total_timer.analysis_run_id = analysis_run["analysis_run_id"]
+            analysis_total_timer.finish(
+                reused=bool(extraction.get("chunks_reused")),
+                chunks_examined=int(extraction.get("chunks_examined") or 0),
+                openai_batches=int(extraction.get("openai_batches") or 0),
+                openai_input_size=int(extraction.get("openai_input_size") or 0),
+                evidence_created=int(extraction.get("evidence_created") or 0),
+                metrics_created=metric_count,
+                conflicts_examined=conflict_count,
+            )
             workflow = database.update_research_workflow_run(
                 workflow_id,
                 {"analysis_run_id": analysis_run["analysis_run_id"]},
                 db_path=db_path,
             ) or workflow
+        else:
+            for stage in ("Extracting evidence", "Verifying citations", "Calculating metrics", "Generating recommendation"):
+                StageTimer(
+                    stage,
+                    workflow_run_id=workflow_id,
+                    package_id=package_id,
+                    version_id=version["version_id"],
+                    processing_run_id=processing_run["processing_run_id"],
+                    analysis_run_id=analysis_run["analysis_run_id"],
+                    db_path=db_path,
+                ).finish(reused=True)
         analysis_warning_messages = _analysis_warning_messages(analysis_run, db_path=db_path)
         analysis_has_warnings = bool(analysis_warning_messages)
         if stage_statuses.get("Extracting evidence") in {TIMELINE_WAITING, TIMELINE_RUNNING, TIMELINE_FAILED}:
@@ -503,6 +598,8 @@ def run_research_workflow(
         _mark_stage(stage_statuses, "Generating recommendation", "Completed")
 
         report = _existing_report(workflow, analysis_run, db_path=db_path)
+        report_reused = bool(report)
+        report_timer = StageTimer("Creating report", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], processing_run_id=processing_run["processing_run_id"], analysis_run_id=analysis_run["analysis_run_id"], db_path=db_path)
         if not report:
             _persist_stage(workflow_id, stage_statuses, "Creating report", "Running", db_path=db_path)
             report = generate_investment_report(analysis_run["analysis_run_id"], final=False, db_path=db_path)
@@ -511,6 +608,7 @@ def run_research_workflow(
                 {"report_id": report["report_id"]},
                 db_path=db_path,
             ) or workflow
+        report_timer.finish(reused=report_reused, reports_generated=0 if report_reused else 1)
         _mark_stage(stage_statuses, "Creating report", "Completed")
         if analysis_has_warnings:
             warnings.extend(analysis_warning_messages)
@@ -892,7 +990,10 @@ def _existing_report(
     db_path: Path | str,
 ) -> dict[str, Any] | None:
     report_id = workflow.get("report_id")
-    reports = database.list_generated_reports(analysis_run["analysis_run_id"], db_path=db_path)
+    reports = [
+        report for report in database.list_generated_reports(analysis_run["analysis_run_id"], db_path=db_path)
+        if report.get("report_mode") == config.REPORT_MODE and report.get("input_fingerprint")
+    ]
     for report in reports:
         if report.get("report_id") == report_id:
             return report

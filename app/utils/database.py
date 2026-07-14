@@ -82,6 +82,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase5_tables(connection)
         _create_phase6_tables(connection)
         _create_phase7_tables(connection)
+        _create_phase3_official_ir_schema(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -1004,6 +1005,111 @@ def _create_phase7_tables(connection: sqlite3.Connection) -> None:
         connection.execute(sql)
 
 
+def _create_phase3_official_ir_schema(connection: sqlite3.Connection) -> None:
+    """Add Phase 3 audit, reuse, performance, and official-IR records without backfilling history."""
+    additions_by_table = {
+        "packages": {
+            "official_website_url": "TEXT", "official_website_domain": "TEXT", "official_website_confidence": "TEXT",
+            "official_website_source": "TEXT", "official_website_checked_at": "TEXT", "official_ir_url": "TEXT",
+            "official_ir_domain": "TEXT", "official_ir_confirmed": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "documents": {
+            "excluded_from_next_build": "INTEGER NOT NULL DEFAULT 0", "profile_exclusion_reason": "TEXT",
+            "canonical_url": "TEXT", "official_domain": "TEXT", "discovery_page": "TEXT",
+            "discovery_method": "TEXT", "discovery_confidence": "TEXT",
+        },
+        "sec_filing_inventory": {"filing_items": "TEXT", "selection_reason": "TEXT"},
+        "package_versions": {"build_fingerprint": "TEXT", "reused_from_version_id": "TEXT"},
+        "processing_runs": {"processing_fingerprint": "TEXT", "reused_from_processing_run_id": "TEXT", "duration_seconds": "REAL"},
+        "analysis_runs": {"evidence_fingerprint": "TEXT", "metrics_fingerprint": "TEXT", "duration_seconds": "REAL"},
+        "claim_conflicts": {"conflict_fingerprint": "TEXT", "comparability_status": "TEXT"},
+        "generated_reports": {"input_fingerprint": "TEXT", "report_mode": "TEXT", "memo_json": "TEXT", "duration_seconds": "REAL"},
+    }
+    for table, additions in additions_by_table.items():
+        columns = _table_columns(connection, table)
+        for column, definition in additions.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS official_website_candidates (
+            candidate_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, url TEXT NOT NULL, domain TEXT NOT NULL,
+            discovery_source TEXT NOT NULL, discovered_at TEXT NOT NULL, confidence TEXT NOT NULL,
+            validation_reasons_json TEXT NOT NULL, rejection_reasons_json TEXT NOT NULL,
+            analyst_confirmation_status TEXT NOT NULL, is_verified INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(package_id, url)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ir_discovery_runs (
+            discovery_run_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, official_url TEXT, official_domain TEXT,
+            ir_url TEXT, ir_domain TEXT, status TEXT NOT NULL, started_at TEXT NOT NULL, completed_at TEXT,
+            duration_seconds REAL, pages_crawled INTEGER NOT NULL DEFAULT 0, materials_discovered INTEGER NOT NULL DEFAULT 0,
+            materials_downloaded INTEGER NOT NULL DEFAULT 0, materials_needing_review INTEGER NOT NULL DEFAULT 0,
+            warnings_json TEXT, errors_json TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS ir_material_candidates (
+            candidate_id TEXT PRIMARY KEY, package_id TEXT NOT NULL, discovery_run_id TEXT NOT NULL,
+            title TEXT NOT NULL, source_url TEXT NOT NULL, canonical_url TEXT NOT NULL, official_domain TEXT NOT NULL,
+            category TEXT NOT NULL, publication_date TEXT, document_date TEXT, mime_type TEXT, file_extension TEXT,
+            discovery_page TEXT, discovery_method TEXT NOT NULL, confidence TEXT NOT NULL,
+            cutoff_eligibility TEXT NOT NULL, download_status TEXT NOT NULL, selected INTEGER NOT NULL DEFAULT 0,
+            rejection_reason TEXT, created_at TEXT NOT NULL, UNIQUE(package_id, canonical_url)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS workflow_stage_performance (
+            performance_id TEXT PRIMARY KEY, workflow_run_id TEXT, package_id TEXT, version_id TEXT,
+            processing_run_id TEXT, analysis_run_id TEXT, stage_name TEXT NOT NULL, started_at TEXT NOT NULL,
+            completed_at TEXT NOT NULL, duration_seconds REAL NOT NULL, files_examined INTEGER NOT NULL DEFAULT 0,
+            files_reused INTEGER NOT NULL DEFAULT 0, files_processed INTEGER NOT NULL DEFAULT 0,
+            chunks_examined INTEGER NOT NULL DEFAULT 0, openai_batches INTEGER NOT NULL DEFAULT 0,
+            openai_input_size INTEGER NOT NULL DEFAULT 0, evidence_created INTEGER NOT NULL DEFAULT 0,
+            metrics_created INTEGER NOT NULL DEFAULT 0, conflicts_examined INTEGER NOT NULL DEFAULT 0,
+            reports_generated INTEGER NOT NULL DEFAULT 0, reused INTEGER NOT NULL DEFAULT 0, details_json TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openai_chunk_extractions (
+            cache_key TEXT PRIMARY KEY, processing_run_id TEXT NOT NULL, chunk_hash TEXT NOT NULL,
+            model TEXT NOT NULL, prompt_version TEXT NOT NULL, schema_version TEXT NOT NULL,
+            status TEXT NOT NULL, evidence_count INTEGER NOT NULL DEFAULT 0, completed_at TEXT NOT NULL,
+            UNIQUE(processing_run_id, chunk_hash, model, prompt_version, schema_version)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS draft_document_inclusions (
+            package_id TEXT NOT NULL, document_id TEXT NOT NULL, included INTEGER NOT NULL,
+            reason TEXT, profile_name TEXT, updated_at TEXT NOT NULL,
+            PRIMARY KEY(package_id, document_id)
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_official_candidates_package ON official_website_candidates(package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ir_runs_package ON ir_discovery_runs(package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_ir_materials_package ON ir_material_candidates(package_id)",
+        "CREATE INDEX IF NOT EXISTS idx_performance_workflow ON workflow_stage_performance(workflow_run_id)",
+        "CREATE INDEX IF NOT EXISTS idx_versions_build_fingerprint ON package_versions(parent_package_id, build_fingerprint)",
+        "CREATE INDEX IF NOT EXISTS idx_processing_fingerprint ON processing_runs(version_id, processing_fingerprint)",
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_conflicts_fingerprint ON claim_conflicts(conflict_fingerprint) WHERE conflict_fingerprint IS NOT NULL",
+    ):
+        connection.execute(sql)
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Convert a SQLite row to a regular dictionary."""
     return dict(row) if row is not None else None
@@ -1326,8 +1432,8 @@ def replace_sec_filing_inventory(
             INSERT INTO sec_filing_inventory (
                 package_id, accession_number, primary_document, original_form_type,
                 normalized_form_family, filing_date, source_url, inventory_status,
-                conditional_rule, selected, metadata_json, discovered_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                conditional_rule, selected, metadata_json, filing_items, selection_reason, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 (
@@ -1342,6 +1448,8 @@ def replace_sec_filing_inventory(
                     row.get("conditional_rule"),
                     int(bool(row.get("selected"))),
                     row.get("metadata_json"),
+                    row.get("filing_items"),
+                    row.get("selection_reason"),
                     now,
                 )
                 for row in rows
@@ -2344,6 +2452,14 @@ def update_document_metadata(
         "source_name",
         "source_type",
         "document_type",
+        "is_public",
+        "excluded_from_next_build",
+        "profile_exclusion_reason",
+        "canonical_url",
+        "official_domain",
+        "discovery_page",
+        "discovery_method",
+        "discovery_confidence",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2676,6 +2792,8 @@ def update_package_version(
         "locked_at",
         "notes",
         "error_message",
+        "build_fingerprint",
+        "reused_from_version_id",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2940,6 +3058,9 @@ def update_processing_run(
         "warnings_json",
         "errors_json",
         "status",
+        "processing_fingerprint",
+        "reused_from_processing_run_id",
+        "duration_seconds",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -3300,7 +3421,19 @@ def create_claim_conflict(
     *,
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
-    return _insert_record("claim_conflicts", conflict, db_path=db_path)
+    try:
+        return _insert_record("claim_conflicts", conflict, db_path=db_path)
+    except sqlite3.IntegrityError:
+        fingerprint = conflict.get("conflict_fingerprint")
+        if not fingerprint:
+            raise
+        initialize_database(db_path)
+        with get_connection(db_path) as connection:
+            row = connection.execute(
+                "SELECT * FROM claim_conflicts WHERE conflict_fingerprint = ?",
+                (fingerprint,),
+            ).fetchone()
+        return dict(row) if row else conflict
 
 
 def list_claim_conflicts(
@@ -3320,6 +3453,238 @@ def list_claim_conflicts(
             (processing_run_id,),
         ).fetchall()
     return [dict(row) for row in rows]
+
+
+def find_package_version_by_build_fingerprint(
+    package_id: str,
+    build_fingerprint: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM package_versions
+            WHERE parent_package_id = ? AND build_fingerprint = ?
+              AND status IN ('BUILT', 'LOCKED')
+            ORDER BY version_number DESC LIMIT 1
+            """,
+            (package_id, build_fingerprint),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def update_package_official_sites(
+    package_id: str,
+    updates: dict[str, Any],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    allowed = {
+        "official_website_url", "official_website_domain", "official_website_confidence",
+        "official_website_source", "official_website_checked_at", "official_ir_url",
+        "official_ir_domain", "official_ir_confirmed",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    if not selected:
+        return get_package_by_package_id(package_id, db_path=db_path)
+    selected["updated_at"] = utc_now_iso()
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        sql = ", ".join(f"{key} = ?" for key in selected)
+        connection.execute(f"UPDATE packages SET {sql} WHERE package_id = ?", (*selected.values(), package_id))
+    return get_package_by_package_id(package_id, db_path=db_path)
+
+
+def upsert_official_website_candidate(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    initialize_database(db_path)
+    fields = (
+        "candidate_id", "package_id", "url", "domain", "discovery_source", "discovered_at", "confidence",
+        "validation_reasons_json", "rejection_reasons_json", "analyst_confirmation_status", "is_verified",
+    )
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO official_website_candidates ({', '.join(fields)})
+            VALUES ({', '.join('?' for _ in fields)})
+            ON CONFLICT(package_id, url) DO UPDATE SET
+              domain=excluded.domain, discovery_source=excluded.discovery_source, discovered_at=excluded.discovered_at,
+              confidence=excluded.confidence, validation_reasons_json=excluded.validation_reasons_json,
+              rejection_reasons_json=excluded.rejection_reasons_json,
+              analyst_confirmation_status=excluded.analyst_confirmation_status, is_verified=excluded.is_verified
+            """,
+            tuple(record.get(field) for field in fields),
+        )
+        row = connection.execute(
+            "SELECT * FROM official_website_candidates WHERE package_id = ? AND url = ?",
+            (record["package_id"], record["url"]),
+        ).fetchone()
+    return dict(row) if row else record
+
+
+def list_official_website_candidates(package_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM official_website_candidates WHERE package_id = ? ORDER BY is_verified DESC, discovered_at DESC",
+            (package_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_ir_discovery_run(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("ir_discovery_runs", record, db_path=db_path)
+
+
+def update_ir_discovery_run(run_id: str, updates: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any] | None:
+    allowed = {
+        "official_url", "official_domain", "ir_url", "ir_domain", "status", "completed_at", "duration_seconds",
+        "pages_crawled", "materials_discovered", "materials_downloaded", "materials_needing_review", "warnings_json", "errors_json",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        if selected:
+            sql = ", ".join(f"{key} = ?" for key in selected)
+            connection.execute(f"UPDATE ir_discovery_runs SET {sql} WHERE discovery_run_id = ?", (*selected.values(), run_id))
+        row = connection.execute("SELECT * FROM ir_discovery_runs WHERE discovery_run_id = ?", (run_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_ir_discovery_runs(package_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM ir_discovery_runs WHERE package_id = ? ORDER BY started_at DESC", (package_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_ir_material_candidate(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    initialize_database(db_path)
+    fields = tuple(record.keys())
+    updates = [field for field in fields if field not in {"candidate_id", "package_id", "canonical_url", "created_at"}]
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO ir_material_candidates ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})
+            ON CONFLICT(package_id, canonical_url) DO UPDATE SET {', '.join(f'{field}=excluded.{field}' for field in updates)}
+            """,
+            tuple(record[field] for field in fields),
+        )
+        row = connection.execute(
+            "SELECT * FROM ir_material_candidates WHERE package_id = ? AND canonical_url = ?",
+            (record["package_id"], record["canonical_url"]),
+        ).fetchone()
+    return dict(row) if row else record
+
+
+def list_ir_material_candidates(package_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM ir_material_candidates WHERE package_id = ? ORDER BY publication_date DESC, title",
+            (package_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def update_ir_material_candidate(candidate_id: str, updates: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any] | None:
+    allowed = {"selected", "download_status", "rejection_reason", "confidence", "category"}
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        if selected:
+            sql = ", ".join(f"{key} = ?" for key in selected)
+            connection.execute(f"UPDATE ir_material_candidates SET {sql} WHERE candidate_id = ?", (*selected.values(), candidate_id))
+        row = connection.execute("SELECT * FROM ir_material_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def create_workflow_stage_performance(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("workflow_stage_performance", record, db_path=db_path)
+
+
+def list_workflow_stage_performance(
+    *, workflow_run_id: str | None = None, package_id: str | None = None, db_path: Path | str = DATABASE_PATH
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    clauses: list[str] = []
+    params: list[Any] = []
+    if workflow_run_id:
+        clauses.append("workflow_run_id = ?")
+        params.append(workflow_run_id)
+    if package_id:
+        clauses.append("package_id = ?")
+        params.append(package_id)
+    sql = "SELECT * FROM workflow_stage_performance"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY started_at"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(params)).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_openai_chunk_extraction(
+    processing_run_id: str, chunk_hash: str, model: str, prompt_version: str, schema_version: str,
+    *, db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            """
+            SELECT * FROM openai_chunk_extractions
+            WHERE processing_run_id = ? AND chunk_hash = ? AND model = ? AND prompt_version = ? AND schema_version = ?
+            """,
+            (processing_run_id, chunk_hash, model, prompt_version, schema_version),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def replace_draft_document_inclusions(
+    package_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        connection.execute("DELETE FROM draft_document_inclusions WHERE package_id = ?", (package_id,))
+        connection.executemany(
+            """
+            INSERT INTO draft_document_inclusions(package_id, document_id, included, reason, profile_name, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (package_id, row["document_id"], int(bool(row.get("included"))), row.get("reason"), row.get("profile_name"), utc_now_iso())
+                for row in rows
+            ],
+        )
+
+
+def list_draft_document_inclusions(package_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM draft_document_inclusions WHERE package_id = ?", (package_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_openai_chunk_extraction(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    initialize_database(db_path)
+    fields = ("cache_key", "processing_run_id", "chunk_hash", "model", "prompt_version", "schema_version", "status", "evidence_count", "completed_at")
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO openai_chunk_extractions ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})
+            ON CONFLICT(cache_key) DO UPDATE SET status=excluded.status, evidence_count=excluded.evidence_count, completed_at=excluded.completed_at
+            """,
+            tuple(record.get(field) for field in fields),
+        )
+    return record
 
 
 def phase5_dashboard_metrics(*, db_path: Path | str = DATABASE_PATH) -> dict[str, int]:

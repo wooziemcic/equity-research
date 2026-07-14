@@ -182,16 +182,14 @@ def test_build_version_structure_manifest_inventory_zip_and_lock(temp_db: Path) 
     assert locked["locked_at"]
 
 
-def test_second_version_and_zip_not_overwritten(temp_db: Path) -> None:
+def test_unchanged_second_build_reuses_content_addressed_snapshot(temp_db: Path) -> None:
     package = prepared_package(temp_db)
     first = build_package_version(package, db_path=temp_db)
     second = build_package_version(package, db_path=temp_db)
     assert first["display_version"].endswith("V001")
-    assert second["display_version"].endswith("V002")
-    assert first["version_id"] != second["version_id"]
-    assert first["zip_path"] != second["zip_path"]
+    assert second["version_id"] == first["version_id"]
+    assert second["zip_path"] == first["zip_path"]
     assert Path(first["zip_path"]).exists()
-    assert Path(second["zip_path"]).exists()
 
 
 def test_failed_validation_does_not_create_version(temp_db: Path) -> None:

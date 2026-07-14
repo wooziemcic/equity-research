@@ -317,6 +317,22 @@ def _optional_float(name: str) -> float | None:
 
 FORM_144_MIN_SHARES = _optional_float("FORM_144_MIN_SHARES")
 FORM_144_MIN_MARKET_VALUE = _optional_float("FORM_144_MIN_MARKET_VALUE")
+SEC_8K_COLLECTION_MODE = os.getenv("SEC_8K_COLLECTION_MODE", "ALL_8K").strip().upper()
+if SEC_8K_COLLECTION_MODE not in {"ALL_8K", "MATERIAL_8K_ONLY", "ANALYST_SELECTION"}:
+    SEC_8K_COLLECTION_MODE = "ALL_8K"
+SEC_8K_APPROVED_ITEMS = tuple(
+    item.strip().upper()
+    for item in os.getenv("SEC_8K_APPROVED_ITEMS", "").split(",")
+    if item.strip()
+)
+SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "none").strip().lower()
+SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
+SEARCH_MAX_RESULTS = max(1, int(os.getenv("SEARCH_MAX_RESULTS", "10")))
+IR_MAX_REDIRECTS = max(0, int(os.getenv("IR_MAX_REDIRECTS", "5")))
+IR_REQUEST_DELAY_SECONDS = float(os.getenv("IR_REQUEST_DELAY_SECONDS", "0.2"))
+OPENAI_EVIDENCE_PROMPT_VERSION = os.getenv("OPENAI_EVIDENCE_PROMPT_VERSION", "1.0")
+OPENAI_EVIDENCE_SCHEMA_VERSION = os.getenv("OPENAI_EVIDENCE_SCHEMA_VERSION", "1.0")
+REPORT_MODE = os.getenv("REPORT_MODE", "COMPACT_INVESTMENT_MEMO").strip().upper()
 SEC_TICKER_MAPPING_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_SUBMISSIONS_URL_TEMPLATE = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE_URL = "https://www.sec.gov/Archives/edgar/data"
