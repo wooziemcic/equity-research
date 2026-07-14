@@ -33,6 +33,7 @@ from app.services.official_ir_service import (
     download_official_ir_materials,
     resolve_official_company_website,
 )
+from app.services.research_window import window_from_package
 from app.services.sec_audit_service import (
     audit_sec_collection,
     create_new_draft_from_current_profile,
@@ -176,6 +177,9 @@ def _sec_collection(package: dict) -> None:
         f"8-K mode: {config.SEC_8K_COLLECTION_MODE}. "
         + ("All 8-K filings remain included." if config.SEC_8K_COLLECTION_MODE == "ALL_8K" else "Selection reasons are retained in inventory.")
     )
+    modes = ["ALL_8K", "MATERIAL_8K_ONLY", "ANALYST_SELECTION"]
+    selected_mode = st.selectbox("8-K collection mode", options=modes, index=modes.index(config.SEC_8K_COLLECTION_MODE))
+    config.SEC_8K_COLLECTION_MODE = selected_mode
     scope_cols = st.columns(2)
     scope_cols[0].markdown("**Required**  \n10-K · 10-Q · 8-K · S-3 · S-4 · DEF 14A")
     scope_cols[1].markdown("**Conditional**  \nSelected Form 144 · Dividend announcements · Y-15 when discovered")
@@ -197,8 +201,9 @@ def _sec_collection(package: dict) -> None:
                 st.success("Y-15 regulatory report stored from the official source.")
             except Exception as exc:
                 st.error(f"Y-15 could not be stored: {exc}")
+    research_window = window_from_package(package)
     st.caption(
-        f"Allowed date range is derived from the package: {package['filing_history_years']} year(s) through {package['research_cutoff_date']}."
+        f"Selected years: {', '.join(str(year) for year in research_window.years)}; cutoff: {package['research_cutoff_date']}."
     )
     if st.button("Retrieve Filing Inventory", disabled=not enabled):
         try:
@@ -210,9 +215,10 @@ def _sec_collection(package: dict) -> None:
     candidates: list[FilingCandidate] = st.session_state.get("sec_preview", [])
     if not candidates:
         return
-    regular = [item for item in candidates if item.normalized_form_family != "144" and item.inventory_status not in {"EXCLUDED_BY_PROFILE", "EXCLUDED_8K_MODE"}]
-    excluded = [item for item in candidates if item.inventory_status in {"EXCLUDED_BY_PROFILE", "EXCLUDED_8K_MODE"}]
-    form_144 = [item for item in candidates if item.normalized_form_family == "144"]
+    excluded_statuses = {"EXCLUDED_BY_PROFILE", "EXCLUDED_8K_MODE", config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW}
+    regular = [item for item in candidates if item.normalized_form_family != "144" and item.inventory_status not in excluded_statuses]
+    excluded = [item for item in candidates if item.inventory_status in excluded_statuses]
+    form_144 = [item for item in candidates if item.normalized_form_family == "144" and item.inventory_status != config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW]
     metric_cols = st.columns(4)
     metric_cols[0].metric("Discovered", len(candidates))
     metric_cols[1].metric("Eligible", len(regular) + len(form_144))
@@ -315,6 +321,9 @@ def _sec_audit_panel(package: dict) -> None:
             hide_index=True,
             use_container_width=True,
         )
+        if config.SEC_8K_COLLECTION_MODE == "ALL_8K":
+            eight_k_count = int(audit.family_breakdown.get("8-K", 0))
+            st.info(f"{eight_k_count} unique 8-K filings are included because the current collection mode is ALL_8K.")
         actions = st.columns(2)
         editable = package.get("status") != config.STATUS_PACKAGE_LOCKED
         if actions[0].button("Reconcile Draft With Current Collection Profile", disabled=not editable, use_container_width=True):
@@ -393,6 +402,16 @@ def _official_ir_collection(package: dict) -> None:
                 f"{summary['duplicate']} duplicates, {summary['excluded']} excluded, {summary['failed']} failed."
             )
             st.rerun()
+        manual_review = [item for item in materials if item.get("download_status") == "NEEDS_MANUAL_REVIEW"]
+        for item in manual_review:
+            with st.expander(item.get("title") or "Official material requiring manual review"):
+                st.write(item.get("category") or "Official company material")
+                st.caption(
+                    item.get("rejection_reason")
+                    or "The official page uses JavaScript-loaded content that the static collector could not safely download."
+                )
+                st.link_button("Open Official Page", item["source_url"])
+                _safe_page_link("pages/2_Document_Collection.py", "Add Downloaded Files")
 
 
 def _ir_collection(package: dict) -> None:
@@ -568,7 +587,7 @@ def _collected_documents(package: dict) -> None:
     )
     status_filter = st.multiselect(
         "Status filter",
-        sorted({doc["collection_status"] for doc in documents if doc.get("collection_status")}),
+        sorted({doc.get("selected_window_status") or doc["collection_status"] for doc in documents if doc.get("collection_status")}),
     )
     filtered = documents
     if source_filter:
@@ -576,7 +595,7 @@ def _collected_documents(package: dict) -> None:
     if category_filter:
         filtered = [doc for doc in filtered if doc["category"] in category_filter]
     if status_filter:
-        filtered = [doc for doc in filtered if doc["collection_status"] in status_filter]
+        filtered = [doc for doc in filtered if (doc.get("selected_window_status") or doc["collection_status"]) in status_filter]
     st.dataframe(
         [
             {
@@ -586,7 +605,7 @@ def _collected_documents(package: dict) -> None:
                 "Source": doc["source_name"],
                 "Date": doc.get("publication_date") or "",
                 "Size": doc.get("file_size_bytes") or "",
-                "Status": doc["collection_status"],
+                "Status": doc.get("selected_window_status") or doc["collection_status"],
                 "Hash": (doc.get("sha256_hash") or "")[:12],
                 "Local": "Available" if doc.get("local_path") and Path(doc["local_path"]).exists() else "",
                 "Source URL": doc["source_url"],

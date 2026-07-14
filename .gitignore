@@ -9,6 +9,7 @@ data/processed/
 data/packages/
 data/reports/
 data/cache/
+data/database/
 *.db-journal
 
 .env

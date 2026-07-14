@@ -261,35 +261,59 @@ def _parse_text(version_doc: dict[str, Any], source_path: Path, workspace: Path)
 
 
 class _VisibleHTMLTextParser(HTMLParser):
-    _SKIPPED = {"script", "style", "noscript", "template"}
+    _SKIPPED = {"script", "style", "noscript", "template", "nav", "header", "footer", "metadata", "ix:header"}
     _BLOCKS = {"br", "p", "div", "tr", "li", "table", "section", "article", "h1", "h2", "h3", "h4", "h5", "h6"}
+    _VOID = {"area", "base", "br", "col", "embed", "hr", "img", "input", "link", "meta", "param", "source", "track", "wbr"}
 
     def __init__(self) -> None:
         super().__init__(convert_charrefs=True)
         self.parts: list[str] = []
-        self.skip_depth = 0
+        self.stack: list[tuple[str, bool]] = []
+
+    def _is_skipping(self) -> bool:
+        return bool(self.stack and self.stack[-1][1])
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
-        del attrs
         lowered = tag.lower()
-        if lowered in self._SKIPPED:
-            self.skip_depth += 1
-        elif lowered in self._BLOCKS and not self.skip_depth:
+        attributes = {str(key).lower(): str(value or "").lower() for key, value in attrs}
+        style = attributes.get("style", "").replace(" ", "")
+        hidden = (
+            "hidden" in attributes
+            or attributes.get("aria-hidden") == "true"
+            or "display:none" in style
+            or "visibility:hidden" in style
+        )
+        xbrl_metadata = lowered.startswith(("xbrli:", "link:")) or lowered in {"ix:hidden", "ix:references", "ix:resources"}
+        skipped = self._is_skipping() or lowered in self._SKIPPED or lowered.startswith("ix:header") or xbrl_metadata or hidden
+        if lowered not in self._VOID:
+            self.stack.append((lowered, skipped))
+        if lowered in self._BLOCKS and not skipped:
             self.parts.append("\n")
 
     def handle_endtag(self, tag: str) -> None:
         lowered = tag.lower()
-        if lowered in self._SKIPPED and self.skip_depth:
-            self.skip_depth -= 1
-        elif lowered in self._BLOCKS and not self.skip_depth:
+        was_skipping = self._is_skipping()
+        for index in range(len(self.stack) - 1, -1, -1):
+            if self.stack[index][0] == lowered:
+                del self.stack[index:]
+                break
+        if lowered in self._BLOCKS and not was_skipping:
             self.parts.append("\n")
 
     def handle_data(self, data: str) -> None:
-        if not self.skip_depth and data.strip():
+        if not self._is_skipping() and data.strip():
             self.parts.append(data)
 
     def text(self) -> str:
-        return "\n".join(line for line in (normalize_text(part) for part in self.parts) if line)
+        lines: list[str] = []
+        seen: set[str] = set()
+        for line in (normalize_text(part) for part in self.parts):
+            fingerprint = re.sub(r"\s+", " ", line).strip().casefold()
+            if not line or fingerprint in seen:
+                continue
+            seen.add(fingerprint)
+            lines.append(line)
+        return "\n".join(lines)
 
 
 def _parse_html(version_doc: dict[str, Any], source_path: Path, workspace: Path) -> ParsedDocument:
@@ -330,7 +354,13 @@ def _parse_html(version_doc: dict[str, Any], source_path: Path, workspace: Path)
         extracted_character_count=len(text),
         page_count=1 if text.strip() else 0,
         warnings=warnings + ([] if text.strip() else ["HTML document contained no visible text."]),
-        metadata={"encoding": encoding, "line_count": len(lines), "source_format": "HTML"},
+        metadata={
+            "encoding": encoding,
+            "line_count": len(lines),
+            "source_format": "HTML",
+            "source_character_count": len(source),
+            "normalized_character_reduction": max(0, len(source) - len(text)),
+        },
     )
 
 

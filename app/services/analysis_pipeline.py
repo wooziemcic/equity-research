@@ -359,6 +359,7 @@ def create_analysis_run(
                 extraction_result = run_openai_evidence_extraction(
                     version=version,
                     processing_run_id=processing_run_id,
+                    progress_callback=progress_callback,
                     db_path=db_path,
                 )
             else:

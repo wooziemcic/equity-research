@@ -50,4 +50,9 @@ def bootstrap_page(current_step: str = "Company Setup") -> None:
     config.ensure_directories()
     load_css()
     initialize_session_state()
+    if not config.DURABLE_STORAGE_APPROVED:
+        st.markdown(
+            '<div class="demo-storage-notice">Demo environment: stored packages and reports may not be permanent.</div>',
+            unsafe_allow_html=True,
+        )
     st.session_state[config.SESSION_CURRENT_WORKFLOW_STEP] = current_step

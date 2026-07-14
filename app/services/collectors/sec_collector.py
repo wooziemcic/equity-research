@@ -20,6 +20,7 @@ from app.services.collection_profile import (
     is_profile_eligible,
     normalize_sec_form,
 )
+from app.services.research_window import selected_date_bounds, window_from_package
 from app.services.http_client import HttpClientError, request_with_retries, response_bytes_with_limit
 from app.services.workspace_service import atomic_write_bytes, safe_document_path, sanitize_filename, write_metadata_json
 from app.utils import database
@@ -141,8 +142,7 @@ def _parse_date(value: str) -> date:
 
 
 def allowed_start_date(package: dict[str, Any]) -> date:
-    cutoff = _parse_date(package["research_cutoff_date"])
-    return cutoff.replace(year=cutoff.year - int(package["filing_history_years"]))
+    return selected_date_bounds(window_from_package(package))[0]
 
 
 def preview_filings(
@@ -164,8 +164,7 @@ def preview_filings(
     if response.status_code != 200:
         return []
     recent = response.json().get("filings", {}).get("recent", {})
-    cutoff = _parse_date(package["research_cutoff_date"])
-    start = allowed_start_date(package)
+    window = window_from_package(package)
     candidates: list[FilingCandidate] = []
     for index, form in enumerate(recent.get("form", [])):
         filing_date = recent.get("filingDate", [""])[index]
@@ -174,7 +173,7 @@ def preview_filings(
         if not filing_date or not primary or not accession or form not in form_types:
             continue
         parsed = _parse_date(filing_date)
-        if parsed > cutoff or parsed < start:
+        if not window.contains(parsed):
             continue
         report_periods = recent.get("reportDate", [""])
         report_period = report_periods[index] if index < len(report_periods) else ""
@@ -219,8 +218,7 @@ def preview_cutler_profile(
     if response.status_code != 200:
         return []
     recent = response.json().get("filings", {}).get("recent", {})
-    cutoff = _parse_date(package["research_cutoff_date"])
-    start = allowed_start_date(package)
+    window = window_from_package(package)
     enabled = enabled_families or set(config.SEC_SUPPORTED_FORMS)
     inventory: list[FilingCandidate] = []
     seen: set[tuple[str, str]] = set()
@@ -235,8 +233,7 @@ def preview_cutler_profile(
             parsed = _parse_date(filing_date)
         except ValueError:
             continue
-        if parsed > cutoff or parsed < start:
-            continue
+        outside_window = not window.contains(parsed)
         identity = (accession, primary.lower())
         if identity in seen:
             continue
@@ -248,14 +245,18 @@ def preview_cutler_profile(
         filing_items = _at(recent, "items", index)
         selection_reason = "Included by collection profile."
         selected = eligible and family != "144" and status != "ALREADY_COLLECTED"
-        if family == "8-K" and eligible and status != "ALREADY_COLLECTED":
+        if outside_window:
+            status = config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW
+            selected = False
+            selection_reason = "Filing date is outside the selected research time window."
+        if family == "8-K" and eligible and status not in {"ALREADY_COLLECTED", config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW}:
             if config.SEC_8K_COLLECTION_MODE == "MATERIAL_8K_ONLY" and not filing_items:
                 filing_items = _eight_k_items_from_index(build_sec_index_url(cik, accession), session=session)
             status, selected, selection_reason = _eight_k_selection(filing_items)
-        if family == "144":
+        if family == "144" and not outside_window:
             status = "AWAITING_SELECTION" if status != "ALREADY_COLLECTED" else status
             selection_reason = "Form 144 requires analyst selection."
-        elif not eligible:
+        elif not eligible and not outside_window:
             status = "EXCLUDED_BY_PROFILE"
             selected = False
             selection_reason = "Form is outside the active collection profile."
@@ -275,7 +276,7 @@ def preview_cutler_profile(
             filing_items=filing_items,
             selection_reason=selection_reason,
         )
-        if family == "144":
+        if family == "144" and not outside_window:
             candidate = FilingCandidate(**{**candidate.__dict__, "selected": form_144_preselected(candidate)})
         inventory.append(candidate)
     database.replace_sec_filing_inventory(
@@ -387,7 +388,11 @@ def download_selected_filings(
         "failed": 0,
         "not_found": 0,
     }
+    window = window_from_package(package)
     for filing in filings:
+        if not window.contains(filing.filing_date):
+            summary["skipped"] += 1
+            continue
         existing = database.get_document_by_accession(
             package["package_id"],
             filing.accession_number,
@@ -430,7 +435,10 @@ def download_selected_filings(
             )
             database.update_document_metadata(
                 created["document_id"],
-                {"normalized_form_family": filing.normalized_form_family or normalize_sec_form(filing.form_type)},
+                {
+                    "normalized_form_family": filing.normalized_form_family or normalize_sec_form(filing.form_type),
+                    "selected_window_status": "ELIGIBLE",
+                },
                 db_path=db_path,
             )
             summary["downloaded"] += 1

@@ -493,6 +493,32 @@ div[data-testid="stVerticalBlockBorderWrapper"] {
     margin-top: 0.3rem;
 }
 
+.result-status-badge {
+    background: rgba(179, 38, 45, 0.16);
+    border: 1px solid rgba(214, 84, 91, 0.58);
+    border-radius: 999px;
+    color: #f2b8bd;
+    display: inline-flex;
+    font-size: 0.78rem;
+    font-weight: 800;
+    line-height: 1;
+    padding: 0.42rem 0.68rem;
+    text-transform: uppercase;
+}
+
+.demo-storage-notice {
+    background: #17191d;
+    border: 1px solid #3a3e46;
+    border-radius: 4px;
+    bottom: 0.7rem;
+    color: #b7bdc8;
+    font-size: 0.72rem;
+    padding: 0.35rem 0.55rem;
+    position: fixed;
+    right: 0.8rem;
+    z-index: 999;
+}
+
 .result-meta {
     grid-template-columns: repeat(4, minmax(0, 1fr));
     margin-bottom: 1rem;

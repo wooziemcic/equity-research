@@ -296,6 +296,7 @@ def _write_source_inventory(path: Path, version_docs: list[dict[str, Any]]) -> N
 
 def _write_workflow_audit(path: Path, run: dict[str, Any], *, db_path: Path | str) -> None:
     workflow = database.latest_research_workflow_run(run["package_id"], db_path=db_path)
+    package = database.get_package_by_package_id(run["package_id"], db_path=db_path) or {}
     payload = {
         "workflow": workflow or {},
         "performance": database.list_workflow_stage_performance(
@@ -304,6 +305,18 @@ def _write_workflow_audit(path: Path, run: dict[str, Any], *, db_path: Path | st
             db_path=db_path,
         ),
         "package_events": database.list_package_version_events(run["package_id"], db_path=db_path),
+        "research_time_window": {
+            "selected_years": json.loads(package.get("selected_years_json") or "[]"),
+            "selected_months": json.loads(package.get("selected_months_json") or "[]"),
+            "research_cutoff_date": package.get("research_cutoff_date"),
+            "fingerprint": package.get("research_window_fingerprint"),
+        },
+        "document_processing_performance": database.list_processing_stage_timings(
+            run["processing_run_id"], db_path=db_path
+        ),
+        "conflict_summary": database.get_conflict_analysis_summary(
+            run["processing_run_id"], db_path=db_path
+        ) or {},
     }
     path.write_text(json.dumps(payload, indent=2, sort_keys=True, default=str), encoding="utf-8")
 

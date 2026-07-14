@@ -94,12 +94,13 @@ def build_compact_memo(analysis_run_id: str, *, db_path: Path | str = config.DAT
     supporting = _supporting_facts(evidence, docs)
     thesis = database.list_thesis_items(analysis_run_id, db_path=db_path)
     risks = _thesis_facts(thesis, "RISK", evidence_by_id, docs, limit=4)
-    catalysts = _thesis_facts(thesis, "CATALYST", evidence_by_id, docs, limit=3)
     limitations = _limitations(run, decision, supporting)
     recommendation = _recommendation(decision, run)
-    conclusion = (
-        f"The current evidence set supports {'an' if recommendation[0].lower() in 'aeiou' else 'a'} {recommendation} stance. "
-        "The decision remains subject to the cited evidence, risks, and missing information summarized below."
+    review_required = recommendation in {"Analyst Review Required", "Insufficient Evidence"}
+    investment_view = (
+        _review_explanation(run, decision)
+        if review_required
+        else f"The verified locked-corpus evidence supports a {recommendation} recommendation. The view remains subject to the cited facts, risks, and missing information below."
     )
     return {
         "mode": config.REPORT_MODE,
@@ -108,12 +109,11 @@ def build_compact_memo(analysis_run_id: str, *, db_path: Path | str = config.DAT
         "research_cutoff": _readable_date(run.get("research_cutoff") or version.get("research_cutoff_date")),
         "recommendation": recommendation,
         "confidence": str(decision.get("confidence") or run.get("confidence") or "Not available").title(),
-        "investment_view": conclusion[:650],
-        "supporting_evidence": supporting,
-        "catalysts": catalysts,
-        "risks": risks,
-        "limitations": limitations,
-        "conclusion": _conclusion(recommendation, limitations),
+        "investment_view": _limit_words(investment_view, 120),
+        "supporting_facts": supporting[:5],
+        "risks": risks[:4],
+        "missing_information": limitations[:3],
+        "conclusion": _limit_words(_conclusion(recommendation, limitations), 80),
     }
 
 
@@ -126,15 +126,19 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
     sections: list[dict[str, Any]] = [
         {"title": f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary", "paragraphs": [header]},
         {"title": "Investment View", "paragraphs": [memo["investment_view"]]},
-        {"title": "Key Supporting Evidence", "paragraphs": _fact_paragraphs(memo["supporting_evidence"])},
+        {"title": "Key Supporting Facts", "paragraphs": _fact_paragraphs(memo.get("supporting_facts", memo.get("supporting_evidence", []))[:5])},
     ]
-    if memo.get("catalysts"):
-        sections.append({"title": "Catalysts", "paragraphs": _fact_paragraphs(memo["catalysts"])})
     sections.extend(
         [
-            {"title": "Key Risks", "paragraphs": _fact_paragraphs(memo["risks"]) or ["No sufficiently supported material risks were extracted from the locked corpus."]},
-            {"title": "Important Missing Information", "paragraphs": memo["limitations"]},
-            {"title": "Conclusion", "paragraphs": [memo["conclusion"]]},
+            {"title": "Key Risks", "paragraphs": _fact_paragraphs(memo.get("risks", [])[:4]) or ["No sufficiently supported material risks were extracted from the locked corpus."]},
+            {"title": "Important Missing Information", "paragraphs": memo.get("missing_information", memo.get("limitations", []))[:3]},
+            {
+                "title": "Conclusion",
+                "paragraphs": [
+                    memo["conclusion"],
+                    "Closed-corpus memo: conclusions are limited to the locked research package and its verified citations.",
+                ],
+            },
         ]
     )
     return sections
@@ -143,7 +147,7 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
 def _fact_paragraphs(items: list[dict[str, str]]) -> list[str]:
     paragraphs: list[str] = []
     for item in items:
-        paragraphs.extend((item["claim"], item["citation"]))
+        paragraphs.extend((_limit_words(item["claim"], 45), item["citation"]))
     return paragraphs
 
 
@@ -156,7 +160,7 @@ def _document_lookup(version_id: str, *, db_path: Path | str) -> dict[str, dict[
 
 
 def _supporting_facts(evidence: list[dict[str, Any]], docs: dict[str, dict[str, Any]]) -> list[dict[str, str]]:
-    candidates: list[tuple[str, str, dict[str, str]]] = []
+    candidates: list[tuple[str, str, int, str, dict[str, str]]] = []
     seen: set[str] = set()
     for item in evidence:
         if not _financial_evidence_is_reportable(item, docs):
@@ -165,24 +169,26 @@ def _supporting_facts(evidence: list[dict[str, Any]], docs: dict[str, dict[str, 
         if key in seen:
             continue
         seen.add(key)
-        claim = _source_claim(item)
+        claim = _limit_words(_source_claim(item), 45)
         claim_key = re.sub(r"\W+", " ", claim.casefold()).strip()
         if claim_key in seen:
             continue
         seen.add(claim_key)
         citation = _citation(item, docs[item["version_document_id"]])
-        candidates.append((_sort_date(item.get("period")), _claim_family(item.get("metric_name")), {"claim": claim, "citation": citation}))
-    candidates.sort(key=lambda row: row[0], reverse=True)
+        doc = docs[item["version_document_id"]]
+        source_date = doc.get("publication_date") or doc.get("filing_date") or doc.get("document_date")
+        candidates.append((_sort_date(source_date), _sort_date(item.get("period")), _source_priority(doc), _claim_family(item.get("metric_name")), {"claim": claim, "citation": citation}))
+    candidates.sort(key=lambda row: (row[0], row[1], row[2]), reverse=True)
     selected: list[dict[str, str]] = []
     family_counts: dict[str, int] = {}
-    for _, family, fact in candidates:
+    for _, _, _, family, fact in candidates:
         if family_counts.get(family, 0):
             continue
         selected.append(fact)
         family_counts[family] = 1
         if len(selected) == 5:
             return selected
-    for _, family, fact in candidates:
+    for _, _, _, family, fact in candidates:
         if fact in selected or family_counts.get(family, 0) >= 2:
             continue
         selected.append(fact)
@@ -301,7 +307,7 @@ def _thesis_facts(
             if not claim or key in seen:
                 continue
             seen.add(key)
-            rows.append({"claim": claim, "citation": _citation(evidence, docs[evidence["version_document_id"]])})
+            rows.append({"claim": _limit_words(claim, 45), "citation": _citation(evidence, docs[evidence["version_document_id"]])})
             break
         if len(rows) >= limit:
             break
@@ -314,7 +320,8 @@ def _citation(evidence: dict[str, Any], doc: dict[str, Any]) -> str:
     ticker = str(doc.get("ticker") or "").strip()
     source = f"{ticker} {form}".strip() if form else title
     filed = doc.get("publication_date") or doc.get("filing_date") or doc.get("document_date")
-    pieces = [source, f"filed {_readable_date(filed)}" if filed else ""]
+    filing_source = bool(form)
+    pieces = [source, f"{'filed' if filing_source else 'dated'} {_readable_date(filed)}" if filed else ""]
     section = str(evidence.get("section_heading") or "").strip()
     if section and re.search(r"[A-Za-z]", section) and not re.fullmatch(r"FORM\s+\d+-?[A-Z]?", section, flags=re.I):
         pieces.append(section)
@@ -324,13 +331,14 @@ def _citation(evidence: dict[str, Any], doc: dict[str, Any]) -> str:
 
 
 def _limitations(run: dict[str, Any], decision: dict[str, Any], facts: list[dict[str, str]]) -> list[str]:
-    rows: list[str] = ["Closed-corpus limitation: the memo uses only evidence available in the locked research package as of the cutoff date."]
+    rows: list[str] = []
     if run.get("reference_price") is None:
         rows.append("A current reference price and package-contained valuation evidence were unavailable.")
     if not facts:
         rows.append("No financial facts met every verification, unit, period, context, and source-locator requirement.")
     if decision.get("abstention_reason"):
-        rows.append(_clean_text(decision["abstention_reason"])[:350])
+        rows.append(_limit_words(_clean_text(decision["abstention_reason"]), 45))
+    rows.append("The memo uses only evidence available in the locked research package as of the cutoff date.")
     return list(dict.fromkeys(rows)) or ["The memo is limited to evidence available in the locked research corpus as of the cutoff date."]
 
 
@@ -340,6 +348,7 @@ def _recommendation(decision: dict[str, Any], run: dict[str, Any]) -> str:
         "BUY": "Buy", "HOLD": "Hold", "SELL": "Sell",
         "ANALYST_REVIEW_REQUIRED": "Analyst Review Required",
         "INSUFFICIENT_EVIDENCE": "Insufficient Evidence",
+        "NEEDS_ANALYST_REVIEW": "Analyst Review Required",
         "ABSTAIN": "Insufficient Evidence",
     }
     return mapping.get(value, "Analyst Review Required")
@@ -349,6 +358,33 @@ def _conclusion(recommendation: str, limitations: list[str]) -> str:
     if recommendation in {"Analyst Review Required", "Insufficient Evidence"}:
         return f"{limitations[0]} Analyst review is required before assigning a final recommendation."
     return f"The verified evidence supports a {recommendation} recommendation, subject to the risks and limitations above."
+
+
+def _review_explanation(run: dict[str, Any], decision: dict[str, Any]) -> str:
+    if run.get("reference_price") is None:
+        return "Analyst review is required because the locked package does not contain a current reference price or sufficient valuation evidence."
+    if decision.get("abstention_reason"):
+        return _limit_words(_clean_text(decision["abstention_reason"]), 120)
+    return "Analyst review is required because the locked evidence does not support a sufficiently confident final recommendation."
+
+
+def _source_priority(document: dict[str, Any]) -> int:
+    form = str(document.get("form_type") or "").upper()
+    title = str(document.get("title") or "").lower()
+    if form.startswith(("10-Q", "10-K")):
+        return 6
+    if "earnings" in title and ("release" in title or "presentation" in title):
+        return 5
+    if document.get("is_public"):
+        return 4
+    return 3
+
+
+def _limit_words(value: Any, limit: int) -> str:
+    words = _clean_text(value).split()
+    if len(words) <= limit:
+        return " ".join(words)
+    return " ".join(words[:limit]).rstrip(" ,;:") + "."
 
 
 def _clean_text(value: Any) -> str:
@@ -374,8 +410,14 @@ def _report_fingerprint(run: dict[str, Any], decision: dict[str, Any], memo: dic
     evidence = database.list_evidence_records(run["processing_run_id"], version_id=run["version_id"], db_path=db_path)
     metrics = database.list_analysis_metrics(run["analysis_run_id"], db_path=db_path)
     payload = {
-        "evidence": sorted((row.get("source_text_hash"), row.get("verification_status"), row.get("updated_at")) for row in evidence),
-        "metrics": sorted((row.get("metric_code"), row.get("value"), row.get("unit"), row.get("period"), row.get("source_evidence_ids_json")) for row in metrics),
+        "evidence": _stable_rows(
+            (row.get("source_text_hash"), row.get("verification_status"), row.get("updated_at"))
+            for row in evidence
+        ),
+        "metrics": _stable_rows(
+            (row.get("metric_code"), row.get("value"), row.get("unit"), row.get("period"), row.get("source_evidence_ids_json"))
+            for row in metrics
+        ),
         "recommendation": decision,
         "analyst_notes": run.get("analyst_notes"),
         "pm_notes": run.get("pm_notes"),
@@ -384,6 +426,45 @@ def _report_fingerprint(run: dict[str, Any], decision: dict[str, Any], memo: dic
         "memo": memo,
     }
     return hashlib.sha256(json.dumps(payload, sort_keys=True, default=str).encode("utf-8")).hexdigest()
+
+
+def _stable_rows(rows: Any) -> list[tuple[Any, ...]]:
+    return sorted(rows, key=lambda row: json.dumps(row, default=str, separators=(",", ":")))
+
+
+def fit_memo_to_one_page(memo: dict[str, Any]) -> dict[str, Any]:
+    """Remove lower-priority memo items until the professional PDF layout is one page."""
+    fitted = json.loads(json.dumps(memo))
+    config.REPORT_DIR.mkdir(parents=True, exist_ok=True)
+    handle, temp_name = tempfile.mkstemp(prefix=".memo-fit.", suffix=".pdf", dir=config.REPORT_DIR)
+    os.close(handle)
+    temp_path = Path(temp_name)
+    try:
+        for _ in range(12):
+            build_pdf_report(temp_path, memo_to_sections(fitted))
+            if _pdf_page_count(temp_path) == 1:
+                return fitted
+            if len(fitted.get("supporting_facts", [])) > 3:
+                fitted["supporting_facts"].pop()
+            elif len(fitted.get("risks", [])) > 2:
+                fitted["risks"].pop()
+            elif len(fitted.get("missing_information", [])) > 1:
+                fitted["missing_information"].pop()
+            elif len(str(fitted.get("investment_view") or "").split()) > 80:
+                fitted["investment_view"] = _limit_words(fitted["investment_view"], 80)
+            elif len(str(fitted.get("conclusion") or "").split()) > 55:
+                fitted["conclusion"] = _limit_words(fitted["conclusion"], 55)
+            else:
+                break
+    finally:
+        temp_path.unlink(missing_ok=True)
+    raise ValueError("The investment memo could not fit one readable PDF page within the content limits.")
+
+
+def _pdf_page_count(path: Path) -> int:
+    from pypdf import PdfReader
+
+    return len(PdfReader(str(path)).pages)
 
 
 def generate_investment_report(
@@ -402,7 +483,7 @@ def generate_investment_report(
     audit = citation_audit(analysis_run_id, db_path=db_path)
     if final and audit["status"] != "PASSED":
         raise ValueError("Final report citation audit failed.")
-    memo = build_compact_memo(analysis_run_id, db_path=db_path)
+    memo = fit_memo_to_one_page(build_compact_memo(analysis_run_id, db_path=db_path))
     fingerprint = _report_fingerprint(run, decision, memo, db_path=db_path)
     desired_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
     for existing in database.list_generated_reports(analysis_run_id, db_path=db_path):
@@ -418,6 +499,8 @@ def generate_investment_report(
     started = perf_counter()
     _atomic_build(docx_path, build_docx_report, sections)
     _atomic_build(pdf_path, build_pdf_report, sections)
+    if _pdf_page_count(pdf_path) != 1:
+        raise ValueError("Investment memo PDF must contain exactly one page.")
     report = {
         "report_id": _report_id(), "analysis_run_id": analysis_run_id, "package_id": run["package_id"],
         "version_id": run["version_id"], "processing_run_id": run["processing_run_id"],

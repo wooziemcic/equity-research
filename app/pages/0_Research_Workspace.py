@@ -3,8 +3,10 @@ from __future__ import annotations
 import html
 import json
 import logging
+from calendar import month_name
 from datetime import date
 from pathlib import Path
+from time import perf_counter
 from typing import Any
 
 import streamlit as st
@@ -142,24 +144,41 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
     st.markdown('<div class="workflow-card-title">Automated Research</div>', unsafe_allow_html=True)
     st.caption("Collect supported SEC filings and optional public company materials from an analyst-supplied IR URL.")
 
-    filing_options = list(config.FILING_HISTORY_OPTIONS.values())
-    current_years = int(package.get("filing_history_years") or 3)
-    if current_years not in filing_options:
-        current_years = 3
-    years = st.radio(
-        "Filing history",
-        options=filing_options,
-        index=filing_options.index(current_years),
-        format_func=lambda value: f"{value} year" if value == 1 else f"{value} years",
-        horizontal=True,
-        key=f"filing_years_{package['package_id']}",
-    )
     cutoff = st.date_input(
         "Research cutoff date",
         value=date.fromisoformat(str(package["research_cutoff_date"])),
         max_value=date.today(),
         key=f"cutoff_{package['package_id']}",
     )
+    try:
+        stored_years = json.loads(package.get("selected_years_json") or "[]")
+        stored_months = json.loads(package.get("selected_months_json") or "[]")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored_years, stored_months = [], []
+    if not stored_years:
+        count = int(package.get("filing_history_years") or 3)
+        stored_years = list(range(cutoff.year - count + 1, cutoff.year + 1))
+    year_options = list(range(cutoff.year, 1989, -1))
+    years = st.multiselect(
+        "Research years",
+        options=year_options,
+        default=[year for year in stored_years if year in year_options],
+        key=f"research_years_{package['package_id']}",
+    )
+    selected_months: tuple[int, ...] | None = None
+    if len(years) == 1:
+        last_month = cutoff.month if years[0] == cutoff.year else 12
+        month_options = ["All months", *[month_name[index] for index in range(1, last_month + 1)]]
+        default_months = ["All months"] if not stored_months or set(stored_months) >= set(range(1, last_month + 1)) else [month_name[index] for index in stored_months if 1 <= index <= last_month]
+        labels = st.multiselect(
+            "Research months",
+            options=month_options,
+            default=default_months,
+            key=f"research_months_{package['package_id']}",
+        )
+        selected_months = tuple(range(1, last_month + 1)) if "All months" in labels else tuple(index for index in range(1, last_month + 1) if month_name[index] in labels)
+    elif len(years) > 1:
+        st.info("All months are included when multiple years are selected.")
     filing_types = st.multiselect(
         "Filing types",
         options=list(config.SEC_SUPPORTED_FORMS),
@@ -190,8 +209,10 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
         try:
             package = update_research_settings(
                 package["package_id"],
-                filing_history_years=int(years),
+                filing_history_years=max(1, len(years)),
                 research_cutoff_date=cutoff,
+                selected_years=tuple(years),
+                selected_months=selected_months,
             )
             _sync_active_package(package)
             st.success("Research settings updated.")
@@ -556,12 +577,31 @@ def _proceed(package: dict[str, Any]) -> None:
     can_proceed = readiness.status in {config.READINESS_READY, config.READINESS_READY_WITH_WARNINGS}
     if st.button("Build Package and Generate Analysis", type="primary", disabled=not can_proceed, use_container_width=True):
         try:
-            with st.spinner("Running research workflow against the locked corpus..."):
-                refreshed = database.get_package_by_package_id(package["package_id"]) or package
-                workflow = run_research_workflow(
-                    package["package_id"],
-                    idempotency_key=workflow_idempotency_key(refreshed),
+            progress_bar = st.progress(0.0)
+            stage_text = st.empty()
+            started = perf_counter()
+
+            def show_progress(payload: dict[str, Any]) -> None:
+                total = int(payload.get("total") or 0)
+                completed = int(payload.get("completed") or 0)
+                if total:
+                    progress_bar.progress(min(completed / total, 1.0))
+                elapsed = perf_counter() - started
+                eta = payload.get("estimated_remaining")
+                eta_text = f"; estimated work remaining {float(eta):.0f}s" if eta is not None and completed else ""
+                stage_text.write(
+                    f"{payload.get('stage') or 'Working'}; elapsed {elapsed:.1f}s; "
+                    f"reused {payload.get('reused', 0)}; completed {completed}; failed {payload.get('failed', 0)}{eta_text}"
                 )
+
+            refreshed = database.get_package_by_package_id(package["package_id"]) or package
+            workflow = run_research_workflow(
+                package["package_id"],
+                idempotency_key=workflow_idempotency_key(refreshed),
+                progress_callback=show_progress,
+            )
+            progress_bar.progress(1.0)
+            stage_text.write("Complete")
             st.session_state[config.SESSION_WORKFLOW_STATE] = workflow
             st.session_state[config.SESSION_ACTIVE_VERSION_ID] = workflow.get("version_id")
             st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = workflow.get("processing_run_id")

@@ -15,7 +15,7 @@ def build_pdf_report(path: Path, sections: list[dict[str, Any]]) -> None:
     styles = getSampleStyleSheet()
     styles.add(ParagraphStyle(name="MemoTitle", parent=styles["Heading1"], fontName="Helvetica-Bold", fontSize=15, leading=17, textColor=colors.HexColor("#A10F1B"), spaceAfter=5, alignment=TA_LEFT))
     styles.add(ParagraphStyle(name="MemoHeading", parent=styles["Heading2"], fontName="Helvetica-Bold", fontSize=10, leading=12, textColor=colors.HexColor("#222222"), spaceBefore=4, spaceAfter=2))
-    styles.add(ParagraphStyle(name="MemoBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=8.5, leading=10.5, spaceAfter=3))
+    styles.add(ParagraphStyle(name="MemoBody", parent=styles["BodyText"], fontName="Helvetica", fontSize=9.5, leading=11.5, spaceAfter=3))
     doc = SimpleDocTemplate(str(path), pagesize=LETTER, rightMargin=36, leftMargin=36, topMargin=32, bottomMargin=32)
     story: list[Any] = []
     for section in sections:

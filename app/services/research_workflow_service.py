@@ -8,7 +8,7 @@ import shutil
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -18,10 +18,11 @@ from app.services.checklist_service import coverage_summary, ensure_package_chec
 from app.services.collectors.ir_collector import discover_public_documents, download_selected_ir_documents
 from app.services.collectors.sec_collector import download_selected_filings, preview_filings
 from app.services.company_resolver import ResolutionResult, resolve_ticker_metadata
-from app.services.package_builder import build_package_version, lock_version, validate_package_readiness, verify_snapshot
+from app.services.package_builder import build_package_version, included_documents, lock_version, validate_package_readiness, verify_snapshot
 from app.services.package_service import PackageInput, create_package, find_existing_ticker_packages
 from app.services.performance_service import StageTimer
 from app.services.processing_pipeline import repair_processing_run, run_processing_pipeline
+from app.services.research_window import document_window_status, normalize_window
 from app.services.reporting.investment_report import generate_investment_report
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
@@ -48,6 +49,13 @@ WORKFLOW_STAGES = (
     "Generating recommendation",
     "Creating report",
 )
+
+
+def _notify_workflow_progress(
+    callback: Callable[[dict[str, Any]], None] | None, **payload: Any
+) -> None:
+    if callback:
+        callback(payload)
 
 
 @dataclass(frozen=True)
@@ -123,22 +131,49 @@ def update_research_settings(
     *,
     filing_history_years: int,
     research_cutoff_date: date,
+    selected_years: tuple[int, ...] | list[int] | None = None,
+    selected_months: tuple[int, ...] | list[int] | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     """Persist editable automated-research settings on the working package."""
-    if filing_history_years not in config.FILING_HISTORY_OPTIONS.values():
+    if selected_years is None and filing_history_years not in config.FILING_HISTORY_OPTIONS.values():
         raise ValueError("Select a supported filing history period.")
     cutoff_result = validate_cutoff_date(research_cutoff_date)
     if not cutoff_result.is_valid:
         raise ValueError(cutoff_result.error)
+    years = tuple(selected_years) if selected_years is not None else tuple(
+        range(research_cutoff_date.year - filing_history_years + 1, research_cutoff_date.year + 1)
+    )
+    window = normalize_window(
+        selected_years=years,
+        selected_months=selected_months,
+        cutoff=cutoff_result.value,
+    )
     package = database.update_package_research_settings(
         package_id,
-        filing_history_years=filing_history_years,
+        filing_history_years=len(window.years),
         research_cutoff_date=cutoff_result.value,
+        selected_years_json=json.dumps(list(window.years)),
+        selected_months_json=json.dumps(list(window.months)),
+        research_window_fingerprint=window.fingerprint(),
         db_path=db_path,
     )
     if not package:
         raise ValueError("Package does not exist.")
+    documents = database.list_documents_by_package(package_id, db_path=db_path)
+    database.update_document_window_statuses(
+        [
+            (
+                document["document_id"],
+                document_window_status(
+                    package,
+                    document.get("publication_date") or document.get("document_date"),
+                ),
+            )
+            for document in documents
+        ],
+        db_path=db_path,
+    )
     return package
 
 
@@ -322,12 +357,15 @@ def workflow_idempotency_key(
     *,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> str:
-    documents = database.list_documents_by_package(package["package_id"], db_path=db_path)
+    documents = included_documents(package["package_id"], db_path=db_path)
     payload = {
         "package_id": package["package_id"],
         "ticker": package["ticker"],
         "research_cutoff_date": package["research_cutoff_date"],
         "filing_history_years": package["filing_history_years"],
+        "selected_years_json": package.get("selected_years_json"),
+        "selected_months_json": package.get("selected_months_json"),
+        "research_window_fingerprint": package.get("research_window_fingerprint"),
         "checklist_reviewed": package.get("checklist_reviewed"),
         "missing_core_acknowledged": package.get("missing_core_acknowledged"),
         "stale_documents_acknowledged": package.get("stale_documents_acknowledged"),
@@ -352,6 +390,7 @@ def run_research_workflow(
     *,
     idempotency_key: str | None = None,
     retry_failed: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     """Build, lock, process, analyze, and draft-report the active package."""
@@ -450,6 +489,14 @@ def run_research_workflow(
             files_reused=len(version_documents) if build_reused else 0,
             files_processed=0 if build_reused else len(version_documents),
         )
+        _notify_workflow_progress(
+            progress_callback,
+            stage="Package reused" if build_reused else "Package built",
+            completed=1,
+            total=1,
+            reused=len(version_documents) if build_reused else 0,
+            failed=0,
+        )
         _mark_stage(stage_statuses, "Building package", "Completed")
         StageTimer("Creating manifest", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path).finish(reused=build_reused)
         _mark_stage(stage_statuses, "Creating manifest", "Completed")
@@ -473,7 +520,10 @@ def run_research_workflow(
         processing_timer = StageTimer("Processing documents", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], db_path=db_path)
         if not processing_run:
             _persist_stage(workflow_id, stage_statuses, "Processing documents", "Running", db_path=db_path)
-            processing_run = run_processing_pipeline(version["version_id"], db_path=db_path)
+            processing_kwargs: dict[str, Any] = {"db_path": db_path}
+            if progress_callback:
+                processing_kwargs["progress_callback"] = progress_callback
+            processing_run = run_processing_pipeline(version["version_id"], **processing_kwargs)
             workflow = database.update_research_workflow_run(
                 workflow_id,
                 {"processing_run_id": processing_run["processing_run_id"]},
@@ -516,6 +566,15 @@ def run_research_workflow(
 
             def analysis_progress(stage: str, status: str) -> None:
                 _persist_stage(workflow_id, stage_statuses, stage, status, db_path=db_path)
+                _notify_workflow_progress(
+                    progress_callback,
+                    stage=stage,
+                    status=status,
+                    completed=0,
+                    total=0,
+                    reused=0,
+                    failed=0,
+                )
                 if status == "Running" and stage not in analysis_timers:
                     analysis_timers[stage] = StageTimer(
                         stage,

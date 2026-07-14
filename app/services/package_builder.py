@@ -17,6 +17,7 @@ from openpyxl import Workbook
 
 from app import config
 from app.services.checklist_service import coverage_summary, ensure_package_checklist
+from app.services.research_window import window_from_package
 from app.services.taxonomy import CATEGORIES
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
@@ -107,10 +108,14 @@ def included_documents(package_id: str, *, db_path: Path | str = config.DATABASE
     """Return working documents eligible for package build validation."""
     inclusion_rows = database.list_draft_document_inclusions(package_id, db_path=db_path)
     inclusion_by_document = {row["document_id"]: bool(row["included"]) for row in inclusion_rows}
+    package = database.get_package_by_package_id(package_id, db_path=db_path)
+    window = window_from_package(package) if package else None
     return [
         doc
         for doc in database.list_documents_by_package(package_id, db_path=db_path)
-        if doc.get("collection_status") != "DELETED" and inclusion_by_document.get(doc["document_id"], True)
+        if doc.get("collection_status") != "DELETED"
+        and inclusion_by_document.get(doc["document_id"], True)
+        and (window is None or window.contains(doc.get("publication_date") or doc.get("document_date")))
     ]
 
 
@@ -124,6 +129,9 @@ def package_build_fingerprint(
         "documents": sorted((doc["document_id"], doc.get("sha256_hash") or "") for doc in documents),
         "profile": package.get("collection_profile_snapshot_json") or package.get("collection_profile_name"),
         "research_cutoff": package.get("research_cutoff_date"),
+        "research_window_fingerprint": package.get("research_window_fingerprint"),
+        "selected_years_json": package.get("selected_years_json"),
+        "selected_months_json": package.get("selected_months_json"),
         "configuration": {
             "security_type": package.get("security_type"),
             "filing_history_years": package.get("filing_history_years"),
@@ -320,6 +328,9 @@ def build_package_version(
             "notes": notes,
             "collection_profile_name": package.get("collection_profile_name"),
             "collection_profile_snapshot_json": package.get("collection_profile_snapshot_json"),
+            "selected_years_json": package.get("selected_years_json"),
+            "selected_months_json": package.get("selected_months_json"),
+            "research_window_fingerprint": package.get("research_window_fingerprint"),
         },
         db_path=db_path,
     )
@@ -555,6 +566,11 @@ def _manifest(package: dict[str, Any], version: dict[str, Any], docs: list[dict[
         "security_type": package["security_type"],
         "research_cutoff_date": package["research_cutoff_date"],
         "filing_history_years": package["filing_history_years"],
+        "research_time_window": {
+            "selected_years": json.loads(package.get("selected_years_json") or "[]"),
+            "selected_months": json.loads(package.get("selected_months_json") or "[]"),
+            "fingerprint": package.get("research_window_fingerprint"),
+        },
         "created_timestamp": version["created_at"],
         "locked_timestamp": None,
         "analyst_review_acknowledgement": bool(package.get("checklist_reviewed")),

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from calendar import month_name
 from datetime import date
 
 import streamlit as st
@@ -95,34 +96,44 @@ def main() -> None:
         "Create a persistent package workspace. Phase 1 does not resolve tickers or collect documents."
     )
 
-    with st.form("new_research_package_form", clear_on_submit=False):
-        ticker = st.text_input(
-            "Ticker",
-            max_chars=12,
-            help="Common symbols such as QXO, BRK.B, BF-B, and GOOGL are accepted.",
+    ticker = st.text_input(
+        "Ticker",
+        max_chars=12,
+        help="Common symbols such as QXO, BRK.B, BF-B, and GOOGL are accepted.",
+    )
+    security_type = st.selectbox(
+        "Security type",
+        options=list(config.SUPPORTED_SECURITY_TYPES),
+        index=0,
+    )
+    cutoff_date = st.date_input(
+        "Research cutoff date",
+        value=date.today(),
+        max_value=date.today(),
+        help="The cutoff is the upper boundary for filing and publication dates.",
+    )
+    st.markdown("**Research Time Window**")
+    year_options = list(range(cutoff_date.year, 1989, -1))
+    default_years = [year for year in range(cutoff_date.year - 2, cutoff_date.year + 1) if year in year_options]
+    selected_years = st.multiselect("Calendar years", options=year_options, default=default_years)
+    selected_months: tuple[int, ...] | None = None
+    if len(selected_years) == 1:
+        last_month = cutoff_date.month if selected_years[0] == cutoff_date.year else 12
+        month_options = ["All months", *[month_name[index] for index in range(1, last_month + 1)]]
+        month_labels = st.multiselect("Months", options=month_options, default=["All months"])
+        selected_months = (
+            tuple(range(1, last_month + 1))
+            if "All months" in month_labels
+            else tuple(index for index in range(1, last_month + 1) if month_name[index] in month_labels)
         )
-        security_type = st.selectbox(
-            "Security type",
-            options=list(config.SUPPORTED_SECURITY_TYPES),
-            index=0,
-        )
-        cutoff_date = st.date_input(
-            "Research cutoff date",
-            value=date.today(),
-            max_value=date.today(),
-            help="Documents will eventually be collected through this date.",
-        )
-        filing_history_label = st.selectbox(
-            "Filing history period",
-            options=list(config.FILING_HISTORY_OPTIONS.keys()),
-            index=2,
-        )
-        analyst_notes = st.text_area(
-            "Analyst notes",
-            max_chars=MAX_ANALYST_NOTES_LENGTH,
-            help="Optional setup context. Do not enter confidential credentials or secrets.",
-        )
-        submitted = st.form_submit_button("Create Package", type="primary")
+    elif len(selected_years) > 1:
+        st.info("All months are included when multiple years are selected.")
+    analyst_notes = st.text_area(
+        "Analyst notes",
+        max_chars=MAX_ANALYST_NOTES_LENGTH,
+        help="Optional setup context. Do not enter confidential credentials or secrets.",
+    )
+    submitted = st.button("Create Package", type="primary")
 
     _show_existing_ticker_warning(ticker)
 
@@ -140,7 +151,8 @@ def main() -> None:
         normalized_ticker,
         security_type,
         cutoff_date.isoformat(),
-        _selected_filing_years(filing_history_label),
+        tuple(sorted(selected_years)),
+        selected_months,
         sanitize_analyst_notes(analyst_notes).value,
     )
     if (
@@ -157,8 +169,10 @@ def main() -> None:
                 ticker=normalized_ticker,
                 security_type=security_type,
                 research_cutoff_date=cutoff_date,
-                filing_history_years=_selected_filing_years(filing_history_label),
+                filing_history_years=max(1, len(selected_years)),
                 analyst_notes=analyst_notes,
+                selected_years=tuple(selected_years),
+                selected_months=selected_months,
             )
         )
     except (ValueError, DatabaseError):

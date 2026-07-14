@@ -83,6 +83,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase6_tables(connection)
         _create_phase7_tables(connection)
         _create_phase3_official_ir_schema(connection)
+        _create_phase4_final_schema(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -1110,6 +1111,120 @@ def _create_phase3_official_ir_schema(connection: sqlite3.Connection) -> None:
         connection.execute(sql)
 
 
+def _create_phase4_final_schema(connection: sqlite3.Connection) -> None:
+    """Add final-phase resumability and research-window fields without rewriting history."""
+    additions_by_table = {
+        "packages": {
+            "selected_years_json": "TEXT",
+            "selected_months_json": "TEXT",
+            "research_window_fingerprint": "TEXT",
+            "archived_at": "TEXT",
+            "archive_reason": "TEXT",
+        },
+        "package_versions": {
+            "selected_years_json": "TEXT",
+            "selected_months_json": "TEXT",
+            "research_window_fingerprint": "TEXT",
+        },
+        "documents": {"selected_window_status": "TEXT"},
+        "processing_runs": {
+            "last_checkpoint_at": "TEXT",
+            "resume_count": "INTEGER NOT NULL DEFAULT 0",
+            "reused_documents": "INTEGER NOT NULL DEFAULT 0",
+            "database_write_seconds": "REAL NOT NULL DEFAULT 0",
+            "chunking_seconds": "REAL NOT NULL DEFAULT 0",
+            "deterministic_extraction_seconds": "REAL NOT NULL DEFAULT 0",
+            "conflict_analysis_seconds": "REAL NOT NULL DEFAULT 0",
+            "openai_extraction_seconds": "REAL NOT NULL DEFAULT 0",
+        },
+        "document_processing_results": {
+            "processing_fingerprint": "TEXT",
+            "parse_started_at": "TEXT",
+            "parse_completed_at": "TEXT",
+            "parse_duration_seconds": "REAL",
+            "document_type": "TEXT",
+            "file_size_bytes": "INTEGER NOT NULL DEFAULT 0",
+            "normalized_character_reduction": "INTEGER NOT NULL DEFAULT 0",
+            "chunk_count": "INTEGER NOT NULL DEFAULT 0",
+            "evidence_count": "INTEGER NOT NULL DEFAULT 0",
+            "reuse_status": "TEXT",
+            "warnings_json": "TEXT",
+            "errors_json": "TEXT",
+            "chunking_duration_seconds": "REAL NOT NULL DEFAULT 0",
+            "extraction_duration_seconds": "REAL NOT NULL DEFAULT 0",
+            "database_write_duration_seconds": "REAL NOT NULL DEFAULT 0",
+            "attempt_count": "INTEGER NOT NULL DEFAULT 1",
+        },
+    }
+    for table, additions in additions_by_table.items():
+        columns = _table_columns(connection, table)
+        for column, definition in additions.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processing_document_items (
+            processing_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            processing_fingerprint TEXT NOT NULL,
+            status TEXT NOT NULL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            reuse_status TEXT NOT NULL DEFAULT 'NEW',
+            parse_started_at TEXT,
+            parse_completed_at TEXT,
+            parse_duration_seconds REAL NOT NULL DEFAULT 0,
+            file_size_bytes INTEGER NOT NULL DEFAULT 0,
+            document_type TEXT,
+            extracted_character_count INTEGER NOT NULL DEFAULT 0,
+            page_count INTEGER NOT NULL DEFAULT 0,
+            chunk_count INTEGER NOT NULL DEFAULT 0,
+            evidence_count INTEGER NOT NULL DEFAULT 0,
+            warning_count INTEGER NOT NULL DEFAULT 0,
+            error_message TEXT,
+            updated_at TEXT NOT NULL,
+            PRIMARY KEY(processing_run_id, version_document_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS processing_stage_timings (
+            timing_id TEXT PRIMARY KEY,
+            processing_run_id TEXT NOT NULL,
+            version_document_id TEXT,
+            stage_name TEXT NOT NULL,
+            duration_seconds REAL NOT NULL,
+            details_json TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS conflict_analysis_summaries (
+            processing_run_id TEXT PRIMARY KEY,
+            valid_unresolved_conflicts INTEGER NOT NULL DEFAULT 0,
+            excluded_same_source INTEGER NOT NULL DEFAULT 0,
+            excluded_unit_mismatches INTEGER NOT NULL DEFAULT 0,
+            excluded_currency_mismatches INTEGER NOT NULL DEFAULT 0,
+            excluded_period_mismatches INTEGER NOT NULL DEFAULT 0,
+            excluded_duplicate_evidence INTEGER NOT NULL DEFAULT 0,
+            pairs_examined INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_processing_items_status ON processing_document_items(processing_run_id, status)",
+        "CREATE INDEX IF NOT EXISTS idx_processing_items_fingerprint ON processing_document_items(version_document_id, processing_fingerprint)",
+        "CREATE INDEX IF NOT EXISTS idx_processing_timings_run ON processing_stage_timings(processing_run_id, stage_name)",
+        "CREATE INDEX IF NOT EXISTS idx_documents_window_status ON documents(package_id, selected_window_status)",
+    ):
+        connection.execute(sql)
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Convert a SQLite row to a regular dictionary."""
     return dict(row) if row is not None else None
@@ -1127,6 +1242,9 @@ def create_package_record(
     analyst_notes: str,
     collection_profile_name: str | None = None,
     collection_profile_snapshot_json: str | None = None,
+    selected_years_json: str | None = None,
+    selected_months_json: str | None = None,
+    research_window_fingerprint: str | None = None,
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
     """Insert and return a package record."""
@@ -1138,9 +1256,10 @@ def create_package_record(
                 package_id, ticker, company_name, security_type, status,
                 research_cutoff_date, filing_history_years, analyst_notes,
                 collection_profile_name, collection_profile_snapshot_json,
+                selected_years_json, selected_months_json, research_window_fingerprint,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 package_id,
@@ -1153,6 +1272,9 @@ def create_package_record(
                 analyst_notes,
                 collection_profile_name,
                 collection_profile_snapshot_json,
+                selected_years_json,
+                selected_months_json,
+                research_window_fingerprint,
                 now,
                 now,
             ),
@@ -1166,11 +1288,15 @@ def create_package_record(
 def list_packages(
     *,
     limit: int | None = None,
+    include_archived: bool = False,
     db_path: Path | str = DATABASE_PATH,
 ) -> list[dict[str, Any]]:
     """Return packages ordered by most recently updated."""
     initialize_database(db_path)
-    sql = "SELECT * FROM packages ORDER BY updated_at DESC, created_at DESC"
+    sql = "SELECT * FROM packages"
+    if not include_archived:
+        sql += " WHERE archived_at IS NULL"
+    sql += " ORDER BY updated_at DESC, created_at DESC"
     params: tuple[Any, ...] = ()
     if limit is not None:
         sql += " LIMIT ?"
@@ -1178,6 +1304,31 @@ def list_packages(
     with get_connection(db_path) as connection:
         rows = connection.execute(sql, params).fetchall()
     return [dict(row) for row in rows]
+
+
+def archive_draft_package(
+    package_id: str,
+    *,
+    reason: str,
+    db_path: Path | str = DATABASE_PATH,
+) -> dict[str, Any]:
+    """Archive an unlocked draft without deleting any package or audit rows."""
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        locked = connection.execute(
+            "SELECT 1 FROM package_versions WHERE parent_package_id = ? AND status = 'LOCKED' LIMIT 1",
+            (package_id,),
+        ).fetchone()
+        if locked:
+            raise ValueError("Packages with locked versions cannot be archived as manual-test drafts.")
+        now = utc_now_iso()
+        cursor = connection.execute(
+            "UPDATE packages SET archived_at = ?, archive_reason = ?, updated_at = ? WHERE package_id = ? AND archived_at IS NULL",
+            (now, reason[:500], now, package_id),
+        )
+        if not cursor.rowcount:
+            raise ValueError("Draft package does not exist or is already archived.")
+    return get_package_by_package_id(package_id, db_path=db_path) or {}
 
 
 def get_package_by_package_id(
@@ -1316,6 +1467,9 @@ def update_package_research_settings(
     *,
     filing_history_years: int,
     research_cutoff_date: str,
+    selected_years_json: str | None = None,
+    selected_months_json: str | None = None,
+    research_window_fingerprint: str | None = None,
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any] | None:
     """Update editable research settings on the working package."""
@@ -1324,10 +1478,20 @@ def update_package_research_settings(
         connection.execute(
             """
             UPDATE packages
-            SET filing_history_years = ?, research_cutoff_date = ?, updated_at = ?
+            SET filing_history_years = ?, research_cutoff_date = ?,
+                selected_years_json = ?, selected_months_json = ?, research_window_fingerprint = ?,
+                updated_at = ?
             WHERE package_id = ?
             """,
-            (filing_history_years, research_cutoff_date, utc_now_iso(), package_id),
+            (
+                filing_history_years,
+                research_cutoff_date,
+                selected_years_json,
+                selected_months_json,
+                research_window_fingerprint,
+                utc_now_iso(),
+                package_id,
+            ),
         )
     return get_package_by_package_id(package_id, db_path=db_path)
 
@@ -2460,6 +2624,7 @@ def update_document_metadata(
         "discovery_page",
         "discovery_method",
         "discovery_confidence",
+        "selected_window_status",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2473,6 +2638,20 @@ def update_document_metadata(
             (*selected.values(), document_id),
         )
     return get_document_by_document_id(document_id, db_path=db_path)
+
+
+def update_document_window_statuses(
+    rows: list[tuple[str, str]], *, db_path: Path | str = DATABASE_PATH
+) -> None:
+    if not rows:
+        return
+    initialize_database(db_path)
+    now = utc_now_iso()
+    with get_connection(db_path) as connection:
+        connection.executemany(
+            "UPDATE documents SET selected_window_status = ?, updated_at = ? WHERE document_id = ?",
+            [(status, now, document_id) for document_id, status in rows],
+        )
 
 
 def mark_document_deleted(
@@ -2650,9 +2829,10 @@ def allocate_package_version(
                         ticker, company_name, security_type, research_cutoff_date, status,
                         document_count, public_document_count, licensed_document_count, total_size_bytes,
                         checklist_snapshot_json, collection_profile_name, collection_profile_snapshot_json,
+                        selected_years_json, selected_months_json, research_window_fingerprint,
                         created_by, created_at, notes, error_message
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["version_id"],
@@ -2672,6 +2852,9 @@ def allocate_package_version(
                         record.get("checklist_snapshot_json"),
                         record.get("collection_profile_name"),
                         record.get("collection_profile_snapshot_json"),
+                        record.get("selected_years_json"),
+                        record.get("selected_months_json"),
+                        record.get("research_window_fingerprint"),
                         record.get("created_by", "analyst"),
                         record["created_at"],
                         record.get("notes"),
@@ -2722,10 +2905,11 @@ def create_package_version(
                 ticker, company_name, security_type, research_cutoff_date, status,
                 document_count, public_document_count, licensed_document_count,
                 total_size_bytes, checklist_snapshot_json, collection_profile_name,
-                collection_profile_snapshot_json, created_by, created_at,
+                collection_profile_snapshot_json, selected_years_json, selected_months_json,
+                research_window_fingerprint, created_by, created_at,
                 notes, error_message
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 version_id,
@@ -2745,6 +2929,9 @@ def create_package_version(
                 version.get("checklist_snapshot_json"),
                 version.get("collection_profile_name"),
                 version.get("collection_profile_snapshot_json"),
+                version.get("selected_years_json"),
+                version.get("selected_months_json"),
+                version.get("research_window_fingerprint"),
                 version.get("created_by", "analyst"),
                 version.get("created_at", utc_now_iso()),
                 version.get("notes"),
@@ -3061,6 +3248,14 @@ def update_processing_run(
         "processing_fingerprint",
         "reused_from_processing_run_id",
         "duration_seconds",
+        "last_checkpoint_at",
+        "resume_count",
+        "reused_documents",
+        "database_write_seconds",
+        "chunking_seconds",
+        "deterministic_extraction_seconds",
+        "conflict_analysis_seconds",
+        "openai_extraction_seconds",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -3109,6 +3304,212 @@ def create_document_processing_result(
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
     return _insert_record("document_processing_results", result, db_path=db_path)
+
+
+def upsert_processing_document_item(
+    item: dict[str, Any], *, db_path: Path | str = DATABASE_PATH
+) -> dict[str, Any]:
+    initialize_database(db_path)
+    fields = (
+        "processing_run_id", "version_id", "version_document_id", "processing_fingerprint",
+        "status", "attempt_count", "reuse_status", "parse_started_at", "parse_completed_at",
+        "parse_duration_seconds", "file_size_bytes", "document_type", "extracted_character_count",
+        "page_count", "chunk_count", "evidence_count", "warning_count", "error_message", "updated_at",
+    )
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"""
+            INSERT INTO processing_document_items ({', '.join(fields)})
+            VALUES ({', '.join('?' for _ in fields)})
+            ON CONFLICT(processing_run_id, version_document_id) DO UPDATE SET
+                processing_fingerprint=excluded.processing_fingerprint,
+                status=excluded.status,
+                attempt_count=excluded.attempt_count,
+                reuse_status=excluded.reuse_status,
+                parse_started_at=excluded.parse_started_at,
+                parse_completed_at=excluded.parse_completed_at,
+                parse_duration_seconds=excluded.parse_duration_seconds,
+                file_size_bytes=excluded.file_size_bytes,
+                document_type=excluded.document_type,
+                extracted_character_count=excluded.extracted_character_count,
+                page_count=excluded.page_count,
+                chunk_count=excluded.chunk_count,
+                evidence_count=excluded.evidence_count,
+                warning_count=excluded.warning_count,
+                error_message=excluded.error_message,
+                updated_at=excluded.updated_at
+            """,
+            tuple(item.get(field) for field in fields),
+        )
+    return item
+
+
+def initialize_processing_document_items(
+    items: list[dict[str, Any]], *, db_path: Path | str = DATABASE_PATH
+) -> None:
+    if not items:
+        return
+    initialize_database(db_path)
+    fields = tuple(items[0])
+    with get_connection(db_path) as connection:
+        connection.executemany(
+            f"INSERT OR IGNORE INTO processing_document_items ({', '.join(fields)}) "
+            f"VALUES ({', '.join('?' for _ in fields)})",
+            [tuple(item[field] for field in fields) for item in items],
+        )
+
+
+def list_processing_document_items(
+    processing_run_id: str, *, db_path: Path | str = DATABASE_PATH
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM processing_document_items WHERE processing_run_id = ? ORDER BY version_document_id",
+            (processing_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def commit_processed_document(
+    *,
+    result: dict[str, Any],
+    item: dict[str, Any],
+    pages: list[dict[str, Any]],
+    sheets: list[dict[str, Any]],
+    chunks: list[dict[str, Any]],
+    evidence: list[dict[str, Any]],
+    verifications: list[dict[str, Any]],
+    db_path: Path | str = DATABASE_PATH,
+) -> None:
+    """Replace one run/document's derived rows in a single serialized transaction."""
+    initialize_database(db_path)
+    run_id = str(item["processing_run_id"])
+    document_id = str(item["version_document_id"])
+    with get_connection(db_path) as connection:
+        connection.execute("BEGIN IMMEDIATE")
+        evidence_ids = [
+            row["evidence_id"]
+            for row in connection.execute(
+                "SELECT evidence_id FROM evidence_records WHERE processing_run_id = ? AND version_document_id = ?",
+                (run_id, document_id),
+            ).fetchall()
+        ]
+        if evidence_ids:
+            placeholders = ", ".join("?" for _ in evidence_ids)
+            connection.execute(f"DELETE FROM citation_verifications WHERE evidence_id IN ({placeholders})", evidence_ids)
+            connection.execute(
+                f"DELETE FROM claim_conflicts WHERE evidence_id_a IN ({placeholders}) OR evidence_id_b IN ({placeholders})",
+                (*evidence_ids, *evidence_ids),
+            )
+        connection.execute(
+            "DELETE FROM evidence_records WHERE processing_run_id = ? AND version_document_id = ?",
+            (run_id, document_id),
+        )
+        for table in ("document_chunks", "document_pages", "document_sheets", "document_processing_results"):
+            connection.execute(
+                f"DELETE FROM {table} WHERE processing_run_id = ? AND version_document_id = ?",
+                (run_id, document_id),
+            )
+        connection.execute(
+            "UPDATE document_chunks SET duplicate_group_id = NULL WHERE processing_run_id = ?", (run_id,)
+        )
+        connection.execute(
+            "DELETE FROM content_duplicate_groups WHERE processing_run_id = ?", (run_id,)
+        )
+        _connection_insert(connection, "document_processing_results", result)
+        for table, rows in (
+            ("document_pages", pages),
+            ("document_sheets", sheets),
+            ("document_chunks", chunks),
+            ("evidence_records", evidence),
+            ("citation_verifications", verifications),
+        ):
+            _connection_insert_many(connection, table, rows)
+        if evidence:
+            connection.executemany(
+                "UPDATE evidence_records SET verification_status = ? WHERE evidence_id = ?",
+                [(verification["support_status"], verification["evidence_id"]) for verification in verifications],
+            )
+        fields = (
+            "processing_run_id", "version_id", "version_document_id", "processing_fingerprint",
+            "status", "attempt_count", "reuse_status", "parse_started_at", "parse_completed_at",
+            "parse_duration_seconds", "file_size_bytes", "document_type", "extracted_character_count",
+            "page_count", "chunk_count", "evidence_count", "warning_count", "error_message", "updated_at",
+        )
+        connection.execute(
+            f"""
+            INSERT INTO processing_document_items ({', '.join(fields)})
+            VALUES ({', '.join('?' for _ in fields)})
+            ON CONFLICT(processing_run_id, version_document_id) DO UPDATE SET
+                processing_fingerprint=excluded.processing_fingerprint, status=excluded.status,
+                attempt_count=excluded.attempt_count, reuse_status=excluded.reuse_status,
+                parse_started_at=excluded.parse_started_at, parse_completed_at=excluded.parse_completed_at,
+                parse_duration_seconds=excluded.parse_duration_seconds, file_size_bytes=excluded.file_size_bytes,
+                document_type=excluded.document_type, extracted_character_count=excluded.extracted_character_count,
+                page_count=excluded.page_count, chunk_count=excluded.chunk_count,
+                evidence_count=excluded.evidence_count, warning_count=excluded.warning_count,
+                error_message=excluded.error_message, updated_at=excluded.updated_at
+            """,
+            tuple(item.get(field) for field in fields),
+        )
+
+
+def _connection_insert(connection: sqlite3.Connection, table: str, record: dict[str, Any]) -> None:
+    clean = {key: value for key, value in record.items() if key != "id"}
+    connection.execute(
+        f"INSERT INTO {table} ({', '.join(clean)}) VALUES ({', '.join('?' for _ in clean)})",
+        tuple(clean.values()),
+    )
+
+
+def _connection_insert_many(connection: sqlite3.Connection, table: str, records: list[dict[str, Any]]) -> None:
+    if not records:
+        return
+    clean = [{key: value for key, value in record.items() if key != "id"} for record in records]
+    keys = list(clean[0])
+    if any(list(record) != keys for record in clean):
+        raise ValueError("Batch records must use the same ordered fields.")
+    connection.executemany(
+        f"INSERT INTO {table} ({', '.join(keys)}) VALUES ({', '.join('?' for _ in keys)})",
+        [tuple(record[key] for key in keys) for record in clean],
+    )
+
+
+def create_processing_stage_timing(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("processing_stage_timings", record, db_path=db_path)
+
+
+def list_processing_stage_timings(processing_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM processing_stage_timings WHERE processing_run_id = ? ORDER BY duration_seconds DESC, timing_id",
+            (processing_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def upsert_conflict_analysis_summary(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    initialize_database(db_path)
+    fields = tuple(record)
+    updates = ", ".join(f"{field}=excluded.{field}" for field in fields if field != "processing_run_id")
+    with get_connection(db_path) as connection:
+        connection.execute(
+            f"INSERT INTO conflict_analysis_summaries ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)}) "
+            f"ON CONFLICT(processing_run_id) DO UPDATE SET {updates}",
+            tuple(record[field] for field in fields),
+        )
+    return record
+
+
+def get_conflict_analysis_summary(processing_run_id: str, *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM conflict_analysis_summaries WHERE processing_run_id = ?", (processing_run_id,)
+        ).fetchone()
+    return row_to_dict(row)
 
 
 def list_document_processing_results(

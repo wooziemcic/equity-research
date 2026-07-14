@@ -4,7 +4,7 @@ Cutler Research AI is an internal Streamlit research product for searching a tic
 
 ## Current Status
 
-Implemented through Phase 7:
+Implemented through the final Phase 4 stabilization pass:
 
 - Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
@@ -13,6 +13,7 @@ Implemented through Phase 7:
 - Phase 5: closed-corpus document processing, native extraction, optional local OCR, spreadsheet-safe parsing, citation-preserving chunks, keyword retrieval, deterministic evidence extraction, citation verification, duplicate grouping, conflict detection, analyst evidence review, and exports.
 - Phase 6: deterministic financial metrics, evidence-backed scorecards, bull/base/bear scenarios, OpenAI-validated evidence interpretation and narrative generation, Buy/Hold/Sell/Insufficient Evidence/Analyst Review Required recommendations, analyst review, PM approval, DOCX/PDF reports, citation audits, report versioning, and report hashes.
 - Phase 7: polished three-screen workflow, SEC-backed ticker search, consolidated Research Workspace, simplified Investment Result page, resumable workflow orchestration, recent research history, Advanced Workbench navigation, and a combined research-package plus AI-report ZIP export.
+- Final stabilization: one-page PM memo, readable citations, collapsed audit details, document-level processing checkpoints and timings, bounded parsing concurrency, incremental OpenAI extraction, comparable-only conflict analysis, flexible year/month research windows, and deployment storage notices.
 
 Not implemented: authentication, cloud deployment, continuous monitoring, or trading integration. The system does not execute trades.
 
@@ -21,8 +22,8 @@ Not implemented: authentication, cloud deployment, continuous monitoring, or tra
 The default application experience is now:
 
 1. `Search` - `app/Home.py` is a minimal ticker-search landing page. It strips spaces, uppercases the ticker, validates symbol format, and verifies an exact match through the supported SEC company database. It does not use general web search or unsupported lookup services. After the analyst confirms the SEC company record, the app reuses the newest editable package for that ticker or creates a new Common Equity package.
-2. `Research` - `app/pages/0_Research_Workspace.py` consolidates package settings, automated public collection, optional licensed uploads, package coverage, checklist acknowledgement, and the primary `Build Package and Generate Analysis` action. Filing-year selection now lives in the Automated Research card and updates the working package's `filing_history_years`.
-3. `Result` - `app/pages/6_Investment_Result.py` shows the preliminary, analyst-reviewed, or PM-approved signal; separates recommendation confidence, evidence coverage, and package coverage; renders report sections with citations; and exposes governance details through an Advanced Review drawer.
+2. `Research` - `app/pages/0_Research_Workspace.py` consolidates package settings, automated public collection, optional licensed uploads, package coverage, checklist acknowledgement, and the primary `Build Package and Generate Analysis` action. The Research Time Window accepts one or more calendar years and month selection for a single year.
+3. `Result` - `app/pages/6_Investment_Result.py` renders the same compact memo model used by the one-page PDF and DOCX. Package identifiers, diagnostics, filtered conflict counts, and performance data remain in the collapsed `Audit Details` section.
 
 Secondary navigation includes `Dashboard / History` for previous packages and `Advanced Workbench` for the detailed Phase 1-6 pages: package setup, public collection, licensed uploads, package review, evidence exploration, analyst review, PM approval, generated reports, and audit history.
 
@@ -30,7 +31,7 @@ Secondary navigation includes `Dashboard / History` for previous packages and `A
 
 Automated Research supports:
 
-- Filing history options: 1, 2, 3, and 5 years.
+- One or more calendar years, with one or more months when exactly one year is selected.
 - Research cutoff date, blocked from future dates by default.
 - SEC form selection: 10-K, 10-Q, 8-K, DEF 14A, 20-F, and 6-K.
 - Public company material preferences and an optional investor-relations URL.
@@ -189,19 +190,7 @@ Final reports require PM approval. Approval does not execute trades.
 
 Phase 6 generates both DOCX and PDF reports. DOCX uses `python-docx`; PDF uses ReportLab and does not require Microsoft Word.
 
-Reports include:
-
-- Package version, processing run, analysis run, research cutoff
-- Closed-corpus limitation and no-trade disclaimer
-- Recommendation status and PM approval status
-- Investment conclusion and why-not explanations
-- Financial metrics and formulas
-- Scorecard
-- Bull/base/bear scenarios
-- Thesis, catalysts, and risks
-- Evidence coverage and citation audit
-- Source inventory
-- Analyst and PM review sections
+The primary memo contains the company and ticker, cutoff date, recommendation, confidence, investment view, three to five supporting facts, key risks, missing information, a conclusion, and readable source citations. Technical identifiers and detailed ledgers remain in the audit ZIP.
 
 Reports are written under:
 
@@ -249,6 +238,10 @@ Key Phase 6 and Phase 7 settings:
 - `SESSION_ACTIVE_PROCESSING_RUN_ID`
 - `SESSION_ACTIVE_ANALYSIS_RUN_ID`
 - `SESSION_ACTIVE_REPORT_ID`
+- `PROCESSING_MAX_WORKERS` (defaults to `2`, bounded to `1` through `4`)
+- `PROCESSING_CONCURRENCY_ENABLED`
+- `PROCESSING_EXTRACTION_CONFIG_VERSION`
+- `DURABLE_STORAGE_APPROVED`
 
 Arithmetic, ratios, formulas, hashes, database writes, package integrity, citation checks, and score thresholds remain deterministic. With `OPENAI_REQUIRED=true`, analysis and narrative generation stop safely until the configured model passes an explicit OpenAI preflight check. OpenAI requests use the Responses API at `/v1/responses`, with no web or external tools, and only selected locked-package evidence.
 
@@ -281,6 +274,10 @@ Launch the app from the repository root:
 python -m streamlit run app\Home.py --server.port 8505
 ```
 
+The Streamlit Community Cloud entrypoint remains `app/Home.py`. Application paths are derived from the project root with `pathlib`, so the same entrypoint supports Windows and Linux. Root-level Streamlit Secrets are exposed to the app as environment settings; service-level OpenAI secret access is lazy and no secret value is logged.
+
+By default, the app displays `Demo environment: stored packages and reports may not be permanent.` Set `DURABLE_STORAGE_APPROVED=true` only when the deployment uses approved durable storage. Runtime databases and generated data directories are ignored by Git, so a new deployment starts with a clean database unless a migration or seed is supplied explicitly.
+
 Or from any current directory:
 
 ```powershell
@@ -291,4 +288,4 @@ Direct page navigation is supported for the primary workflow and the Advanced Wo
 
 ## Known Limitations
 
-Phase 7 is a UX and workflow consolidation over the Phase 1-6 backend. It does not add Bloomberg, FactSet, Morningstar, browser automation, live market data, portfolio allocation, trade execution, or a new frontend framework. SEC public collection still requires a configured SEC user agent. Investor-relations discovery remains conservative and requires an analyst-supplied public IR URL. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations and recommendation rules depend on the quality and structure of Phase 5 evidence extraction.
+The final stabilization pass does not add Bloomberg, FactSet, Morningstar, mandatory browser automation, live market data, portfolio allocation, trade execution, or a new frontend framework. JavaScript-only official IR pages remain available for analyst manual review. SEC public collection still requires a configured SEC user agent. Investor-relations discovery remains conservative and may require an analyst-supplied public IR URL. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations and recommendation rules depend on the quality and structure of evidence extraction.

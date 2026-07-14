@@ -20,6 +20,7 @@ import requests
 from app import config
 from app.services.company_resolver import sec_headers
 from app.services.http_client import HttpClientError, request_with_retries, response_bytes_with_limit, validate_public_http_url
+from app.services.research_window import window_from_package
 from app.services.workspace_service import atomic_write_bytes, safe_document_path, sanitize_filename
 from app.utils import database
 
@@ -626,16 +627,17 @@ def discover_official_ir_materials(
 def _material(package: dict[str, Any], title: str, url: str, discovery_page: str, method: str, mime_type: str, domain: str) -> OfficialIrMaterial:
     category, confidence = classify_ir_material(title, url)
     apparent = _date_from_text(f"{title} {url}")
-    cutoff = str(package.get("research_cutoff_date") or "")
-    eligible = not apparent or len(apparent) < 10 or apparent <= cutoff
+    eligible = window_from_package(package).contains(apparent or None)
     return OfficialIrMaterial(
         title=title or "Official company material", source_url=url, canonical_url=canonicalize_url(url),
         official_domain=domain, category=category, publication_date=apparent, document_date=apparent,
         mime_type=mime_type.split(";", 1)[0] or "application/octet-stream",
         file_extension=Path(urlparse(url).path).suffix.lower() or (".html" if "html" in mime_type else ""),
         discovery_page=discovery_page, discovery_method=method, confidence=confidence,
-        cutoff_eligibility="ELIGIBLE" if eligible else "AFTER_CUTOFF", download_status="DISCOVERED" if eligible else "EXCLUDED_CUTOFF",
-        selected=eligible and confidence == "HIGH", rejection_reason="" if eligible else "Publication date is after research cutoff.",
+        cutoff_eligibility="ELIGIBLE" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW,
+        download_status="DISCOVERED" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW,
+        selected=eligible and confidence == "HIGH",
+        rejection_reason="" if eligible else "Publication date is outside the selected research time window.",
     )
 
 
@@ -705,7 +707,8 @@ def download_official_ir_materials(
             database.update_document_metadata(
                 created["document_id"], {"canonical_url": canonical, "official_domain": item["official_domain"],
                                          "discovery_page": item.get("discovery_page"), "discovery_method": item.get("discovery_method"),
-                                         "discovery_confidence": item.get("confidence")}, db_path=db_path,
+                                         "discovery_confidence": item.get("confidence"),
+                                         "selected_window_status": "ELIGIBLE"}, db_path=db_path,
             )
             if item.get("candidate_id"):
                 database.update_ir_material_candidate(item["candidate_id"], {"download_status": "DOWNLOADED"}, db_path=db_path)

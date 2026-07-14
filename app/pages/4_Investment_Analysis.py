@@ -18,7 +18,13 @@ from app.services.analysis.scenario_analysis import set_scenario_probabilities
 from app.services.analysis_pipeline import create_analysis_run, validate_analysis_eligibility
 from app.services.evidence_service import create_analyst_evidence_from_chunk, verify_evidence_record
 from app.services.evidence_taxonomy import evidence_type_options
-from app.services.processing_pipeline import run_processing_pipeline, validate_processing_eligibility
+from app.services.processing_pipeline import (
+    processing_performance_summary,
+    resume_processing_run,
+    retry_failed_documents,
+    run_processing_pipeline,
+    validate_processing_eligibility,
+)
 from app.services.openai_service import preflight_openai
 from app.services.recommendation_engine import complete_analyst_review, override_scorecard_item, pm_decision
 from app.services.reporting.investment_report import generate_investment_report
@@ -98,7 +104,26 @@ def _processing_controls(version: dict[str, Any]) -> None:
         st.metric("Pipeline", config.PROCESSING_PIPELINE_VERSION)
     if st.button("Start Processing Run", type="primary", disabled=bool(eligibility.errors)):
         try:
-            run = run_processing_pipeline(version["version_id"], ocr_enabled=ocr_enabled, retrieval_mode=retrieval_mode)
+            progress = st.progress(0.0)
+            detail = st.empty()
+
+            def update_progress(payload: dict[str, Any]) -> None:
+                total = max(int(payload.get("total") or 0), 1)
+                completed = int(payload.get("completed") or 0)
+                progress.progress(min(completed / total, 1.0))
+                eta = payload.get("estimated_remaining")
+                suffix = f"; about {eta:.0f} seconds of work remaining" if eta is not None and completed else ""
+                detail.write(
+                    f"{payload.get('stage')}; reused {payload.get('reused', 0)}; failed {payload.get('failed', 0)}; "
+                    f"elapsed {float(payload.get('elapsed') or 0):.1f} seconds{suffix}"
+                )
+
+            run = run_processing_pipeline(
+                version["version_id"],
+                ocr_enabled=ocr_enabled,
+                retrieval_mode=retrieval_mode,
+                progress_callback=update_progress,
+            )
             st.success(f"Processing run {run['processing_run_id']} finished with status {run['status']}.")
             st.rerun()
         except Exception as exc:
@@ -134,6 +159,44 @@ def _run_history(version: dict[str, Any]) -> dict[str, Any] | None:
     labels = {run["processing_run_id"]: run for run in runs}
     selected = st.selectbox("Selected processing run", options=list(labels.keys()))
     return labels[selected]
+
+
+def _resume_controls(run: dict[str, Any]) -> None:
+    items = database.list_processing_document_items(run["processing_run_id"])
+    pending = sum(item.get("status") in {config.PROCESSING_STATUS_PENDING, config.PROCESSING_STATUS_RUNNING} for item in items)
+    failed = sum(item.get("status") == "FAILED" for item in items)
+    cols = st.columns(3)
+    if cols[0].button("Resume Processing", disabled=not pending, use_container_width=True):
+        resume_processing_run(run["processing_run_id"])
+        st.rerun()
+    if cols[1].button("Retry Failed Documents", disabled=not failed, use_container_width=True):
+        retry_failed_documents(run["processing_run_id"])
+        st.rerun()
+    if cols[2].button("View Slowest Documents", disabled=not items, use_container_width=True):
+        st.session_state[f"show_slowest_{run['processing_run_id']}"] = True
+    if st.session_state.get(f"show_slowest_{run['processing_run_id']}"):
+        summary = processing_performance_summary(run["processing_run_id"])
+        st.caption(f"Slowest parser type: {summary['slowest_parser_type']}")
+        st.dataframe(
+            [
+                {
+                    "Document": item.get("version_document_id"),
+                    "Parser": item.get("parser_used"),
+                    "Seconds": item.get("parse_duration_seconds") or 0,
+                    "Size": item.get("file_size_bytes") or 0,
+                    "Characters": item.get("extracted_character_count") or 0,
+                    "Pages": item.get("page_count") or 0,
+                    "Chunks": item.get("chunk_count") or 0,
+                    "Evidence": item.get("evidence_count") or 0,
+                    "Warnings": item.get("warning_count") or 0,
+                    "Error": item.get("error_message") or "",
+                    "Reuse": item.get("reuse_status") or "",
+                }
+                for item in summary["slowest_documents"]
+            ],
+            hide_index=True,
+            use_container_width=True,
+        )
 
 
 def _summary(run: dict[str, Any]) -> None:
@@ -805,6 +868,7 @@ def main() -> None:
     if not run:
         return
     _summary(run)
+    _resume_controls(run)
     st.divider()
     analysis_run = _analysis_controls(version, run)
     tabs = st.tabs(

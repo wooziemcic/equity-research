@@ -6,7 +6,7 @@ import math
 import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from pydantic import BaseModel, Field
 
@@ -195,6 +195,7 @@ def run_openai_evidence_extraction(
     processing_run_id: str,
     db_path: Path | str = config.DATABASE_PATH,
     client: Any | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
 ) -> OpenAIEvidenceExtractionResult:
     """Extract evidence in bounded batches from one locked version and processing run."""
     result = OpenAIEvidenceExtractionResult()
@@ -229,6 +230,7 @@ def run_openai_evidence_extraction(
     if not pending:
         return result
     batch_size = config.OPENAI_EXTRACTION_BATCH_SIZE
+    total_batches = math.ceil(len(pending) / batch_size)
     system_prompt = (
         "Extract evidence only from the supplied locked-package chunks. Return the exact chunk_id and an exact verbatim_quote. "
         "Do not invent locators, evidence IDs, arithmetic, facts, or values. Abstain when a claim is unsupported. "
@@ -236,6 +238,9 @@ def run_openai_evidence_extraction(
     )
     for start in range(0, len(pending), batch_size):
         batch = pending[start : start + batch_size]
+        batch_number = start // batch_size + 1
+        if progress_callback:
+            progress_callback(f"OpenAI evidence batch {batch_number} of {total_batches}", "Running")
         payload = {
             "chunks": [
                 {
@@ -302,6 +307,8 @@ def run_openai_evidence_extraction(
                 evidence_counts[str(chunk["chunk_id"])],
                 db_path=db_path,
             )
+        if progress_callback:
+            progress_callback(f"OpenAI evidence batch {batch_number} of {total_batches}", "Completed")
     if result.evidence_created + result.evidence_reused == 0:
         result.warnings.append("OpenAI completed extraction but found no supported evidence in the selected chunks.")
     result.warnings = sorted(set(result.warnings))

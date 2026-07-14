@@ -27,11 +27,23 @@ def ensure_inside(base: Path, target: Path) -> Path:
     """Resolve and validate that target stays within base."""
     resolved_base = base.resolve()
     resolved_target = target.resolve()
+    comparison_base = _without_windows_namespace(resolved_base)
+    comparison_target = _without_windows_namespace(resolved_target)
     try:
-        resolved_target.relative_to(resolved_base)
+        comparison_target.relative_to(comparison_base)
     except ValueError as exc:
         raise WorkspaceError("Refusing to write outside the configured data directory.") from exc
     return resolved_target
+
+
+def _without_windows_namespace(path: Path) -> Path:
+    """Normalize the optional extended-length prefix used by Windows APIs."""
+    value = str(path)
+    if value.startswith("\\\\?\\UNC\\"):
+        value = "\\\\" + value[8:]
+    elif value.startswith("\\\\?\\"):
+        value = value[4:]
+    return Path(value)
 
 
 def package_workspace(package_id: str) -> Path:

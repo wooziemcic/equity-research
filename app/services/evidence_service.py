@@ -68,7 +68,13 @@ def _match_rule(sentence: str) -> tuple[str, str] | None:
 
 
 def _extract_value(sentence: str) -> tuple[float | None, str | None, str | None]:
-    match = VALUE_PATTERN.search(sentence)
+    financial_text = re.sub(r"\b\d{4}-\d{2}-\d{2}\b", " ", sentence)
+    financial_text = re.sub(r"\b\d{1,2}/\d{1,2}/\d{2,4}\b", " ", financial_text)
+    financial_text = re.sub(r"\b(?:FY|Q[1-4])\s*20\d{2}\b", " ", financial_text, flags=re.IGNORECASE)
+    financial_text = re.sub(r"\b20\d{2}\b", " ", financial_text)
+    financial_text = re.sub(r"\b\d{10}-\d{2}-\d{6}\b", " ", financial_text)
+    financial_text = re.sub(r"\bpages?\s+\d+(?:\s*[-\u2013]\s*\d+)?\b", " ", financial_text, flags=re.IGNORECASE)
+    match = VALUE_PATTERN.search(financial_text)
     if not match:
         return None, None, None
     raw_value = match.group("value").replace(",", "")
@@ -88,6 +94,8 @@ def _extract_value(sentence: str) -> tuple[float | None, str | None, str | None]
             unit = "billion"
         elif unit == "m":
             unit = "million"
+    if unit == "%" and currency:
+        currency = None
     return value, unit, currency
 
 
@@ -116,9 +124,9 @@ def evidence_from_chunk(chunk: dict[str, Any], *, max_records: int = 5) -> list[
     for sentence in split_sentences(chunk["chunk_text"]):
         rule = _match_rule(sentence)
         value, unit, currency = _extract_value(sentence)
-        if not rule and value is None:
+        if not rule:
             continue
-        evidence_type, metric_name = rule or ("OTHER_FACT", "numeric_fact")
+        evidence_type, metric_name = rule
         if evidence_type == "PRICE_TARGET" and currency is None:
             continue
         source_locator = dict(locator)
@@ -262,6 +270,38 @@ def verify_evidence_records_batch(
     """Apply the single-record citation rules in one database transaction."""
     if not evidence_records:
         return []
+    verifications, updates = prepare_evidence_verifications(evidence_records, chunks_by_id)
+    database.initialize_database(db_path)
+    with database.get_connection(db_path) as connection:
+        connection.executemany(
+            """
+            INSERT INTO citation_verifications (
+                verification_id, evidence_id, citation_locator_json, verification_method,
+                support_status, support_score, verifier_note, created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    item["verification_id"],
+                    item["evidence_id"],
+                    item["citation_locator_json"],
+                    item["verification_method"],
+                    item["support_status"],
+                    item["support_score"],
+                    item["verifier_note"],
+                    item["created_at"],
+                )
+                for item in verifications
+            ],
+        )
+        connection.executemany("UPDATE evidence_records SET verification_status = ? WHERE evidence_id = ?", updates)
+    return verifications
+
+
+def prepare_evidence_verifications(
+    evidence_records: list[dict[str, Any]], chunks_by_id: dict[str, dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[tuple[str, str]]]:
+    """Prepare deterministic citation rows without opening a database connection."""
     verifications: list[dict[str, Any]] = []
     updates: list[tuple[str, str]] = []
     for evidence in evidence_records:
@@ -304,31 +344,7 @@ def verify_evidence_records_batch(
             }
         )
         updates.append((status, evidence["evidence_id"]))
-    database.initialize_database(db_path)
-    with database.get_connection(db_path) as connection:
-        connection.executemany(
-            """
-            INSERT INTO citation_verifications (
-                verification_id, evidence_id, citation_locator_json, verification_method,
-                support_status, support_score, verifier_note, created_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-            """,
-            [
-                (
-                    item["verification_id"],
-                    item["evidence_id"],
-                    item["citation_locator_json"],
-                    item["verification_method"],
-                    item["support_status"],
-                    item["support_score"],
-                    item["verifier_note"],
-                    item["created_at"],
-                )
-                for item in verifications
-            ],
-        )
-        connection.executemany("UPDATE evidence_records SET verification_status = ? WHERE evidence_id = ?", updates)
-    return verifications
+    return verifications, updates
 
 
 def _get_cited_chunk(
@@ -486,6 +502,14 @@ def detect_claim_conflicts(
 ) -> list[dict[str, Any]]:
     evidence = database.list_evidence_records(processing_run_id, db_path=db_path)
     conflicts: list[dict[str, Any]] = []
+    exclusions = {
+        "SAME_SOURCE_DOCUMENT": 0,
+        "INCOMPATIBLE_UNIT": 0,
+        "INCOMPATIBLE_CURRENCY": 0,
+        "DIFFERENT_PERIOD": 0,
+        "DUPLICATE_EVIDENCE": 0,
+    }
+    pairs_examined = 0
     existing = database.list_claim_conflicts(processing_run_id, db_path=db_path)
     existing_keys = {
         (
@@ -496,7 +520,7 @@ def detect_claim_conflicts(
     }
     if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
         return []
-    grouped: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
+    grouped: dict[tuple[str, str], list[dict[str, Any]]] = {}
     for record in evidence:
         metric = record.get("metric_name")
         if not metric:
@@ -504,15 +528,18 @@ def detect_claim_conflicts(
         key = (
             record.get("normalized_subject") or "",
             normalize_claim_family(metric),
-            normalize_period(record.get("period")),
         )
         grouped.setdefault(key, []).append(record)
-    for (subject, metric, period), records in grouped.items():
+    for (subject, metric), records in grouped.items():
         for index, left in enumerate(records):
             for right in records[index + 1 :]:
+                pairs_examined += 1
                 comparable, comparability_status = evidence_comparable(left, right)
                 if not comparable:
+                    if comparability_status in exclusions:
+                        exclusions[comparability_status] += 1
                     continue
+                period = normalize_period(left.get("period") or right.get("period"))
                 conflict_type = _conflict_type(left, right)
                 if not conflict_type:
                     continue
@@ -541,7 +568,33 @@ def detect_claim_conflicts(
                 conflicts.append(conflict)
                 existing_keys.add(conflict_key)
                 if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
-                    return conflicts
+                    break
+            if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
+                break
+        if len(existing_keys) >= config.MAX_DETECTED_CLAIM_CONFLICTS:
+            break
+    all_conflicts = database.list_claim_conflicts(processing_run_id, db_path=db_path)
+    valid_unresolved = 0
+    evidence_by_id = {item["evidence_id"]: item for item in evidence}
+    for conflict in all_conflicts:
+        left = evidence_by_id.get(str(conflict.get("evidence_id_a") or ""))
+        right = evidence_by_id.get(str(conflict.get("evidence_id_b") or ""))
+        if left and right and evidence_comparable(left, right)[0] and conflict.get("analyst_status") != "RESOLVED":
+            valid_unresolved += 1
+    database.upsert_conflict_analysis_summary(
+        {
+            "processing_run_id": processing_run_id,
+            "valid_unresolved_conflicts": valid_unresolved,
+            "excluded_same_source": exclusions["SAME_SOURCE_DOCUMENT"],
+            "excluded_unit_mismatches": exclusions["INCOMPATIBLE_UNIT"],
+            "excluded_currency_mismatches": exclusions["INCOMPATIBLE_CURRENCY"],
+            "excluded_period_mismatches": exclusions["DIFFERENT_PERIOD"],
+            "excluded_duplicate_evidence": exclusions["DUPLICATE_EVIDENCE"],
+            "pairs_examined": pairs_examined,
+            "created_at": database.utc_now_iso(),
+        },
+        db_path=db_path,
+    )
     return conflicts
 
 

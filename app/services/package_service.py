@@ -9,6 +9,7 @@ import json
 
 from app import config
 from app.services.collection_profile import default_profile_for_security_type
+from app.services.research_window import normalize_window
 from app.utils import database
 from app.utils.validation import (
     ValidationResult,
@@ -27,6 +28,8 @@ class PackageInput:
     research_cutoff_date: date
     filing_history_years: int
     analyst_notes: str = ""
+    selected_years: tuple[int, ...] | None = None
+    selected_months: tuple[int, ...] | None = None
 
 
 def generate_package_id(ticker: str) -> str:
@@ -45,12 +48,21 @@ def validate_package_input(package_input: PackageInput) -> list[str]:
         errors.append(ticker_result.error)
     if package_input.security_type not in config.SUPPORTED_SECURITY_TYPES:
         errors.append("Select a supported security type.")
-    if package_input.filing_history_years not in config.FILING_HISTORY_OPTIONS.values():
+    if package_input.selected_years is None and package_input.filing_history_years not in config.FILING_HISTORY_OPTIONS.values():
         errors.append("Select a supported filing history period.")
     if not cutoff_result.is_valid:
         errors.append(cutoff_result.error)
     if not notes_result.is_valid:
         errors.append(notes_result.error)
+    if cutoff_result.is_valid and package_input.selected_years is not None:
+        try:
+            normalize_window(
+                selected_years=package_input.selected_years,
+                selected_months=package_input.selected_months,
+                cutoff=cutoff_result.value,
+            )
+        except ValueError as exc:
+            errors.append(str(exc))
     return errors
 
 
@@ -67,6 +79,7 @@ def create_package(
     ticker = validate_ticker(package_input.ticker).value
     notes = sanitize_analyst_notes(package_input.analyst_notes).value
     cutoff = validate_cutoff_date(package_input.research_cutoff_date).value
+    cutoff_date = date.fromisoformat(cutoff)
 
     database.initialize_database(db_path)
     package_id = generate_package_id(ticker)
@@ -74,6 +87,14 @@ def create_package(
         package_id = generate_package_id(ticker)
 
     profile = default_profile_for_security_type(package_input.security_type)
+    selected_years = package_input.selected_years or tuple(
+        range(cutoff_date.year - package_input.filing_history_years + 1, cutoff_date.year + 1)
+    )
+    window = normalize_window(
+        selected_years=selected_years,
+        selected_months=package_input.selected_months,
+        cutoff=cutoff,
+    )
 
     return database.create_package_record(
         package_id=package_id,
@@ -82,10 +103,13 @@ def create_package(
         security_type=package_input.security_type,
         status=config.STATUS_DRAFT,
         research_cutoff_date=cutoff,
-        filing_history_years=package_input.filing_history_years,
+        filing_history_years=len(window.years),
         analyst_notes=notes,
         collection_profile_name=profile.name if profile else None,
         collection_profile_snapshot_json=json.dumps(profile.snapshot(), sort_keys=True) if profile else None,
+        selected_years_json=json.dumps(list(window.years)),
+        selected_months_json=json.dumps(list(window.months)),
+        research_window_fingerprint=window.fingerprint(),
         db_path=db_path,
     )
 

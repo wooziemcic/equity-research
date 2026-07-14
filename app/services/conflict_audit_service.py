@@ -41,7 +41,7 @@ def conflict_fingerprint(
 def evidence_comparable(left: dict[str, Any], right: dict[str, Any]) -> tuple[bool, str]:
     if normalize_claim_family(left.get("metric_name")) != normalize_claim_family(right.get("metric_name")):
         return False, "DIFFERENT_METRIC"
-    if normalize_period(left.get("period")) != normalize_period(right.get("period")):
+    if not periods_overlap(left.get("period"), right.get("period")):
         return False, "DIFFERENT_PERIOD"
     left_unit = str(left.get("unit") or "").strip().lower()
     right_unit = str(right.get("unit") or "").strip().lower()
@@ -56,6 +56,22 @@ def evidence_comparable(left: dict[str, Any], right: dict[str, Any]) -> tuple[bo
     if left.get("version_document_id") == right.get("version_document_id"):
         return False, "SAME_SOURCE_DOCUMENT"
     return True, "COMPARABLE"
+
+
+def periods_overlap(left: str | None, right: str | None) -> bool:
+    left_value = normalize_period(left)
+    right_value = normalize_period(right)
+    if not left_value or not right_value:
+        return left_value == right_value
+    if left_value == right_value:
+        return True
+    left_years = set(re.findall(r"20\d{2}", left_value))
+    right_years = set(re.findall(r"20\d{2}", right_value))
+    if not left_years or not right_years or left_years.isdisjoint(right_years):
+        return False
+    left_quarters = set(re.findall(r"\bq[1-4]\b", left_value))
+    right_quarters = set(re.findall(r"\bq[1-4]\b", right_value))
+    return not left_quarters or not right_quarters or bool(left_quarters & right_quarters)
 
 
 def audit_historical_conflicts(

@@ -14,8 +14,9 @@ from app.components.layout import bootstrap_page
 from app.services.analysis_pipeline import load_analysis_diagnostics
 from app.services.combined_export_service import create_combined_export
 from app.services.conflict_audit_service import audit_historical_conflicts
+from app.services.processing_pipeline import processing_performance_summary
 from app.services.research_workflow_service import package_coverage_summary
-from app.services.reporting.investment_report import build_compact_memo
+from app.services.reporting.investment_report import build_compact_memo, generate_investment_report
 from app.utils import database
 
 
@@ -47,7 +48,8 @@ def _load_result_context() -> dict[str, Any] | None:
         labels = {f"{run['analysis_run_id']} - {run['package_id']} - {run.get('preliminary_recommendation') or 'Pending'}": run for run in runs}
         selected = st.selectbox("Open analysis run", options=list(labels.keys()))
         if st.button("Open Result", type="primary"):
-            analysis = labels[selected]
+            st.session_state[config.SESSION_ACTIVE_ANALYSIS_RUN_ID] = labels[selected]["analysis_run_id"]
+            st.rerun()
         else:
             return None
 
@@ -56,7 +58,20 @@ def _load_result_context() -> dict[str, Any] | None:
     processing_run = database.get_processing_run(analysis["processing_run_id"]) or {}
     decision = database.get_recommendation_decision(analysis["analysis_run_id"]) or {}
     reports = database.list_generated_reports(analysis["analysis_run_id"])
-    report = next((item for item in reports if item.get("report_mode") == config.REPORT_MODE), {})
+    report = next(
+        (
+            item
+            for item in reports
+            if item.get("report_mode") == config.REPORT_MODE
+            and item.get("template_version") == config.REPORT_TEMPLATE_VERSION
+        ),
+        {},
+    )
+    if not report:
+        try:
+            report = generate_investment_report(analysis["analysis_run_id"])
+        except Exception:
+            report = next((item for item in reports if item.get("report_mode") == config.REPORT_MODE), {})
     st.session_state[config.SESSION_ACTIVE_PACKAGE_ID] = analysis["package_id"]
     st.session_state[config.SESSION_ACTIVE_VERSION_ID] = analysis["version_id"]
     st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = analysis["processing_run_id"]
@@ -280,41 +295,49 @@ def _thesis_section(title: str, thesis: list[dict[str, Any]], evidence_by_id: di
 def _advanced_review(context: dict[str, Any]) -> None:
     analysis = context["analysis"]
     processing_run = context["processing_run"]
-    with st.expander("Advanced Review", expanded=False):
-        cols = st.columns(5)
-        with cols[0]:
-            _safe_page_link("pages/4_Investment_Analysis.py", "Evidence ledger")
-        with cols[1]:
-            _safe_page_link("pages/4_Investment_Analysis.py", "Citation verification")
-        with cols[2]:
-            _safe_page_link("pages/4_Investment_Analysis.py", "Conflicts")
-        with cols[3]:
-            _safe_page_link("pages/4_Investment_Analysis.py", "Analyst / PM review")
-        with cols[4]:
-            _safe_page_link("pages/5_Generated_Reports.py", "Reports")
-
+    report = context["report"]
+    with st.expander("Audit Details", expanded=False):
         if not processing_run:
             st.info("No processing run is available for this analysis record.")
             return
-
-        st.markdown("**Evidence ledger**")
-        _evidence_table(database.list_evidence_records(processing_run["processing_run_id"], version_id=analysis["version_id"]))
-        st.markdown("**Citation verification**")
-        st.dataframe(database.list_citation_verifications(processing_run_id=processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Conflicts**")
-        conflict_audit = audit_historical_conflicts(processing_run["processing_run_id"])
-        st.dataframe([{"Measure": key.replace("_", " ").title(), "Count": value} for key, value in conflict_audit.items()], hide_index=True, use_container_width=True)
-        st.dataframe(database.list_claim_conflicts(processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Duplicate lineage**")
-        st.dataframe(database.list_duplicate_groups(processing_run["processing_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Financial metrics**")
-        st.dataframe(database.list_analysis_metrics(analysis["analysis_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Scorecard**")
-        st.dataframe(database.list_scorecard_items(analysis["analysis_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Bull/base/bear scenarios**")
-        st.dataframe(database.list_analysis_scenarios(analysis["analysis_run_id"]), hide_index=True, use_container_width=True)
-        st.markdown("**Audit history**")
-        st.dataframe(database.list_package_version_events(analysis["package_id"]), hide_index=True, use_container_width=True)
+        st.write(f"Package version: `{analysis.get('version_id') or ''}`")
+        st.write(f"Processing run: `{processing_run.get('processing_run_id') or ''}`")
+        st.write(f"Analysis run: `{analysis.get('analysis_run_id') or ''}`")
+        counts = st.columns(4)
+        counts[0].metric("Documents", processing_run.get("total_documents") or 0)
+        counts[1].metric("Reused", processing_run.get("reused_documents") or 0)
+        counts[2].metric("Chunks", processing_run.get("chunks_created") or 0)
+        counts[3].metric("Evidence", processing_run.get("evidence_records_created") or 0)
+        st.write(f"Citation audit: {report.get('citation_audit_status') or 'Not available'}")
+        st.write(f"Evidence coverage: {_percent(analysis.get('evidence_coverage'))}")
+        st.write(f"Model / endpoint: {analysis.get('ai_model') or 'Not available'} / {analysis.get('ai_endpoint') or 'Not available'}")
+        st.write(f"Workflow duration: {processing_run.get('duration_seconds') or 0:.2f} seconds")
+        conflict_summary = database.get_conflict_analysis_summary(processing_run["processing_run_id"])
+        if not conflict_summary:
+            historical = audit_historical_conflicts(processing_run["processing_run_id"])
+            conflict_summary = {
+                "valid_unresolved_conflicts": historical.get("valid_unresolved_conflicts", 0),
+                "excluded_incomparable_records": historical.get("excluded_incomparable_records", 0),
+            }
+        st.markdown("**Filtered conflict summary**")
+        st.dataframe(
+            [{"Measure": key.replace("_", " ").title(), "Count": value} for key, value in conflict_summary.items() if key not in {"processing_run_id", "created_at", "pairs_examined"}],
+            hide_index=True,
+            use_container_width=True,
+        )
+        performance = processing_performance_summary(processing_run["processing_run_id"])
+        st.markdown("**Processing performance**")
+        st.dataframe(
+            [{"Stage": key.replace("_", " ").title(), "Seconds": round(value, 3)} for key, value in performance["stage_seconds"].items()],
+            hide_index=True,
+            use_container_width=True,
+        )
+        st.write(f"Slowest parser type: {performance['slowest_parser_type']}")
+        nav = st.columns(2)
+        with nav[0]:
+            _safe_page_link("pages/4_Investment_Analysis.py", "Open evidence and review workspace")
+        with nav[1]:
+            _safe_page_link("pages/5_Generated_Reports.py", "Open report history")
 
 
 def _download(context: dict[str, Any]) -> None:
@@ -348,20 +371,21 @@ def _download(context: dict[str, Any]) -> None:
 
 
 def _compact_memo_result(context: dict[str, Any]) -> None:
-    memo = build_compact_memo(context["analysis"]["analysis_run_id"])
-    st.title(f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary")
-    cols = st.columns(3)
-    cols[0].metric("Recommendation", memo["recommendation"])
-    cols[1].metric("Confidence", memo["confidence"])
-    cols[2].metric("Research cutoff", memo["research_cutoff"])
+    memo = _memo_model(context)
+    st.title(f"{memo['ticker']} - Equity Research Summary")
+    st.caption(memo["company_name"])
+    st.markdown(
+        f'<span class="result-status-badge">{html.escape(memo["recommendation"])}</span>',
+        unsafe_allow_html=True,
+    )
+    st.write(f"**Confidence:** {memo['confidence']}")
+    st.write(f"**Research cutoff:** {memo['research_cutoff']}")
     st.subheader("Investment View")
     st.write(memo["investment_view"])
-    _memo_items("Key Supporting Evidence", memo["supporting_evidence"])
-    if memo.get("catalysts"):
-        _memo_items("Catalysts", memo["catalysts"])
+    _memo_items("Key Supporting Facts", memo.get("supporting_facts", memo.get("supporting_evidence", [])))
     _memo_items("Key Risks", memo["risks"])
     st.subheader("Important Missing Information")
-    for limitation in memo["limitations"]:
+    for limitation in memo.get("missing_information", memo.get("limitations", [])):
         st.write(limitation)
     st.subheader("Conclusion")
     st.write(memo["conclusion"])
@@ -383,22 +407,37 @@ def _memo_downloads(context: dict[str, Any]) -> None:
     if not report:
         st.info("Generate the investment memo before downloading result files.")
         return
-    st.subheader("Downloads")
-    cols = st.columns(2)
+    st.subheader("Investment Memo")
+    cols = st.columns([1.25, 1, 1])
     pdf_path = Path(report.get("pdf_path") or "")
     docx_path = Path(report.get("docx_path") or "")
     if pdf_path.exists():
         cols[0].download_button("Download Investment Memo PDF", pdf_path.read_bytes(), file_name=pdf_path.name, mime="application/pdf", type="primary", use_container_width=True)
     if docx_path.exists():
         cols[1].download_button("Download Investment Memo DOCX", docx_path.read_bytes(), file_name=docx_path.name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
-    exports = database.list_combined_exports(analysis["analysis_run_id"], limit=1)
-    if st.button("Prepare Full Audit Package ZIP", use_container_width=True):
-        export = create_combined_export(analysis["analysis_run_id"], report_id=report.get("report_id"))
-        exports = [export]
+    exports = [
+        export
+        for export in database.list_combined_exports(analysis["analysis_run_id"], limit=25)
+        if export.get("report_id") == report.get("report_id")
+    ][:1]
+    if not exports:
+        try:
+            exports = [create_combined_export(analysis["analysis_run_id"], report_id=report.get("report_id"))]
+        except Exception as exc:
+            st.caption(f"Full audit package is not available: {exc}")
     if exports:
         zip_path = Path(exports[0]["zip_path"])
         if zip_path.exists():
-            st.download_button("Download Full Audit Package ZIP", zip_path.read_bytes(), file_name=zip_path.name, mime="application/zip", use_container_width=True)
+            cols[2].download_button("Download Full Audit Package ZIP", zip_path.read_bytes(), file_name=zip_path.name, mime="application/zip", use_container_width=True)
+
+
+def _memo_model(context: dict[str, Any]) -> dict[str, Any]:
+    report = context.get("report") or {}
+    try:
+        stored = json.loads(report.get("memo_json") or "{}")
+    except (TypeError, ValueError, json.JSONDecodeError):
+        stored = {}
+    return stored or build_compact_memo(context["analysis"]["analysis_run_id"])
 
 
 def _evidence_table(evidence: list[dict[str, Any]]) -> None:

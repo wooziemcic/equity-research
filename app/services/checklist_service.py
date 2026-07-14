@@ -8,6 +8,7 @@ from typing import Any
 
 from app import config
 from app.services.taxonomy import CHECKLIST_PROFILES
+from app.services.research_window import window_from_package
 from app.utils import database
 
 
@@ -65,10 +66,12 @@ def ensure_package_checklist(
 ) -> list[dict[str, Any]]:
     """Create checklist rows for a package and recalculate automatic statuses."""
     profile = CHECKLIST_PROFILES.get(package.get("security_type"), CHECKLIST_PROFILES["Other"])
+    window = window_from_package(package)
     documents = [
         doc
         for doc in database.list_documents_by_package(package["package_id"], db_path=db_path)
         if doc.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED
+        and window.contains(doc.get("publication_date") or doc.get("document_date"))
     ]
     docs_by_category: dict[str, list[dict[str, Any]]] = defaultdict(list)
     for document in documents:
@@ -79,7 +82,7 @@ def ensure_package_checklist(
     inventory_families = {
         row.get("normalized_form_family")
         for row in inventory
-        if row.get("inventory_status") != "EXCLUDED_BY_PROFILE"
+        if row.get("inventory_status") not in {"EXCLUDED_BY_PROFILE", config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW}
     }
     links: list[dict[str, str]] = []
     for item in profile:
