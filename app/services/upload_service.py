@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import json
 import mimetypes
+import re
 import secrets
 import zipfile
 from dataclasses import dataclass
@@ -12,6 +13,7 @@ from typing import Any
 
 from app import config
 from app.services.document_classifier import ClassificationSuggestion, classify_document
+from app.services.collection_profile import normalize_sec_form
 from app.services.taxonomy import CATEGORIES, category_display
 from app.services.workspace_service import (
     atomic_write_bytes,
@@ -105,7 +107,7 @@ def validate_upload_candidate(
     return FileValidationResult(True, **base, classification=classification, warning=warning)
 
 
-def validate_upload_batch(candidates: list[UploadCandidate], *, source_type: str) -> list[FileValidationResult]:
+def validate_upload_batch(candidates: list[UploadCandidate], *, source_type: str = "other") -> list[FileValidationResult]:
     """Validate a batch and apply total batch-size limits."""
     results = [validate_upload_candidate(candidate, source_type=source_type) for candidate in candidates]
     total = sum(result.file_size_bytes for result in results)
@@ -125,6 +127,343 @@ def validate_upload_batch(candidates: list[UploadCandidate], *, source_type: str
             for result in results
         ]
     return results
+
+
+UNKNOWN_SOURCE = "UNKNOWN_SOURCE"
+
+SOURCE_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("Bloomberg", ("bloomberg",)),
+    ("Morningstar", ("morningstar",)),
+    ("FactSet", ("factset",)),
+    ("Raymond James", ("raymond james", "raymond_james", "raymond-james", "rj equity")),
+    ("Piper Sandler", ("piper sandler", "piper_sandler", "piper-sandler")),
+    ("Gimme Credit", ("gimme credit", "gimme_credit", "gimme-credit")),
+    ("Hovde Group", ("hovde group", "hovde_group", "hovde-group")),
+    ("Janney", ("janney",)),
+    ("Arctic Securities", ("arctic securities", "arctic_securities", "arctic-securities", "arctic")),
+    ("Cutler Internal", ("cutler", "internal research", "internal_research")),
+    ("Earnings Call Transcript", ("seeking alpha", "earnings call transcript", "earnings_transcript", "transcript provider")),
+)
+
+DOCUMENT_TYPE_OPTIONS = {
+    "sell_side_research": "Sell-Side Equity Research",
+    "credit_research": "Credit Research",
+    "analyst_data_sheet": "Analyst Data Sheet",
+    "earnings_transcript": "Earnings Transcript",
+    "financial_model": "Financial Model",
+    "internal_research": "Internal Research",
+    "industry_research": "Industry Research",
+    "activist_research": "Activist Material",
+    "dividend_announcement": "Dividend Announcement",
+    "y15_regulatory_report": "Y-15 Regulatory Report",
+    "annual_filing": "10-K Public Filing",
+    "quarterly_filing": "10-Q Public Filing",
+    "current_report": "8-K Public Filing",
+    "registration_s3": "S-3 Public Filing",
+    "registration_s4": "S-4 Public Filing",
+    "proxy_statement": "DEF 14A Public Filing",
+    "other_research": "Other Research",
+}
+
+PUBLIC_FORM_CATEGORIES = {
+    "10-K": "annual_filing",
+    "10-Q": "quarterly_filing",
+    "8-K": "current_report",
+    "S-3": "registration_s3",
+    "S-4": "registration_s4",
+    "DEF 14A": "proxy_statement",
+    "144": "form_144",
+}
+
+
+def _inspection_text(candidate: UploadCandidate) -> str:
+    """Return safe, bounded metadata/first-page text for deterministic local inference."""
+    parts = [Path(candidate.original_filename).stem]
+    if Path(candidate.original_filename).suffix.lower() in TEXT_EXTENSIONS:
+        parts.append(candidate.content[:12000].decode("utf-8", errors="replace"))
+    elif Path(candidate.original_filename).suffix.lower() == ".pdf":
+        try:
+            from io import BytesIO
+            from pypdf import PdfReader
+
+            reader = PdfReader(BytesIO(candidate.content))
+            parts.extend(str(value) for value in (reader.metadata or {}).values() if value)
+            if reader.pages:
+                parts.append((reader.pages[0].extract_text() or "")[:12000])
+        except Exception:
+            pass
+    return " ".join(parts)
+
+
+def infer_research_source(candidate: UploadCandidate) -> tuple[str, str, str]:
+    text = _inspection_text(candidate).lower()
+    for source, aliases in SOURCE_ALIASES:
+        matched = next((alias for alias in aliases if alias in text), None)
+        if matched:
+            location = "filename" if matched in candidate.original_filename.lower() else "metadata or first-page text"
+            return source, "HIGH", f"Matched {matched!r} in {location}."
+    return UNKNOWN_SOURCE, "LOW", "No reliable known-source alias was found."
+
+
+def _detect_public_form(text: str) -> str | None:
+    upper = text.upper().replace("_", " ").replace("-", "-")
+    patterns = (
+        r"\b10-K(?:/A)?\b", r"\b10-Q(?:/A)?\b", r"\b8-K(?:/A)?\b",
+        r"\bS-3ASR\b", r"\bS-3(?:/A)?\b", r"\bS-4(?:/A)?\b", r"\bDEF\s+14A\b",
+    )
+    for pattern in patterns:
+        match = re.search(pattern, upper)
+        if match:
+            return normalize_sec_form(match.group(0).replace("  ", " "))
+    return None
+
+
+def infer_document_type(candidate: UploadCandidate) -> tuple[str, str, str, str | None]:
+    text = _inspection_text(candidate)
+    lowered = text.lower()
+    normalized_lowered = re.sub(r"[_-]+", " ", lowered)
+    normalized_filename = re.sub(r"[_-]+", " ", candidate.original_filename.lower())
+    public_family = _detect_public_form(text)
+    if public_family:
+        code = PUBLIC_FORM_CATEGORIES[public_family]
+        return code, "HIGH", f"Recognized public filing family {public_family}.", public_family
+    if re.search(r"\by\s*15\b", normalized_lowered):
+        return "y15_regulatory_report", "HIGH", "Recognized Y-15 regulatory-report language.", "Y-15"
+    rules = (
+        ("dividend_announcement", ("dividend declaration", "quarterly dividend", "cash dividend")),
+        ("earnings_transcript", ("earnings transcript", "earnings call transcript", "transcript")),
+        ("financial_model", ("financial model", ".xlsx", ".xlsm")),
+        ("analyst_data_sheet", ("data sheet", "datasheet")),
+        ("credit_research", ("credit research", "credit update", "bond research", "gimme credit")),
+        ("industry_research", ("industry research", "industry outlook")),
+        ("activist_research", ("activist", "short seller", "short-seller")),
+        ("internal_research", ("internal research", "cutler")),
+        ("sell_side_research", ("initiation", "price target", "equity research", "raymond james", "piper sandler", "hovde", "janney", "arctic")),
+    )
+    for code, terms in rules:
+        matched = next(
+            (
+                term
+                for term in terms
+                if term in lowered or term in normalized_lowered or term in normalized_filename
+            ),
+            None,
+        )
+        if matched:
+            return code, "HIGH" if matched in normalized_filename else "MEDIUM", f"Matched {matched!r}.", None
+    return "other_research", "LOW", "No reliable document-type rule matched.", None
+
+
+def _detected_date(text: str) -> str:
+    match = re.search(r"(?<!\d)(20\d{2})[-_]?([01]\d)[-_]?([0-3]\d)(?!\d)", text)
+    return f"{match.group(1)}-{match.group(2)}-{match.group(3)}" if match else ""
+
+
+def _normalized_filename(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", Path(value).stem.lower()) + Path(value).suffix.lower()
+
+
+def standardized_upload_filename(
+    ticker: str,
+    source: str,
+    document_date: str,
+    original_filename: str,
+    *,
+    sha256_hash: str = "",
+    destination_exists: bool = False,
+) -> str:
+    extension = Path(original_filename).suffix.lower()
+    source_part = source if source != UNKNOWN_SOURCE else "UNKNOWN-SOURCE"
+    date_part = document_date or "UNKNOWN-DATE"
+    title = re.sub(r"\b20\d{2}[-_]?\d{2}[-_]?\d{2}\b", "", Path(original_filename).stem, flags=re.I)
+    title = sanitize_filename(title).strip("_- ")[:80] or "Document"
+    filename = sanitize_filename(f"{ticker}_{source_part}_{date_part}_{title}{extension}")
+    if destination_exists and sha256_hash:
+        filename = f"{Path(filename).stem}_{sha256_hash[:8]}{extension}"
+    return filename
+
+
+def prepare_batch_review(
+    package: dict[str, Any],
+    candidates: list[UploadCandidate],
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    validations = validate_upload_batch(candidates)
+    existing = database.list_documents_by_package(package["package_id"], db_path=db_path)
+    existing_names = {
+        _normalized_filename(value)
+        for doc in existing
+        for value in (doc.get("original_filename"), doc.get("managed_filename"), doc.get("stored_filename"), doc.get("local_filename"))
+        if value
+    }
+    seen_hashes: set[str] = set()
+    rows: list[dict[str, Any]] = []
+    for index, (candidate, validation) in enumerate(zip(candidates, validations, strict=False)):
+        source, source_confidence, source_reason = infer_research_source(candidate)
+        category, category_confidence, category_reason, form_family = infer_document_type(candidate)
+        duplicate_reasons: list[str] = []
+        if validation.sha256_hash in seen_hashes or database.get_document_by_hash(package["package_id"], validation.sha256_hash, db_path=db_path):
+            duplicate_reasons.append("SHA-256")
+        if _normalized_filename(validation.sanitized_filename) in existing_names:
+            duplicate_reasons.append("normalized filename")
+        seen_hashes.add(validation.sha256_hash)
+        date_value = _detected_date(candidate.original_filename + " " + _inspection_text(candidate)[:1000])
+        is_public = bool(form_family)
+        duplicate = ", ".join(dict.fromkeys(duplicate_reasons))
+        rows.append(
+            {
+                "Include": validation.is_valid and not duplicate,
+                "Original filename": candidate.original_filename,
+                "Detected ticker": package["ticker"] if package["ticker"].lower() in candidate.original_filename.lower() else "",
+                "Inferred source": "SEC EDGAR" if is_public else source,
+                "Final source": "SEC EDGAR" if is_public else source,
+                "Inferred document type": DOCUMENT_TYPE_OPTIONS[category],
+                "Final document type": DOCUMENT_TYPE_OPTIONS[category],
+                "Document date": date_value,
+                "File size": validation.file_size_bytes,
+                "Duplicate status": duplicate or "Unique",
+                "Validation status": "Valid" if validation.is_valid else validation.error,
+                "Needs review": source_confidence == "LOW" or category_confidence == "LOW",
+                "Notes": "",
+                "_index": index,
+                "_sha256": validation.sha256_hash,
+                "_source_confidence": source_confidence,
+                "_source_reason": source_reason,
+                "_category_code": category,
+                "_category_confidence": category_confidence,
+                "_category_reason": category_reason,
+                "_normalized_form_family": form_family,
+                "_is_public": is_public,
+            }
+        )
+    return rows
+
+
+def store_reviewed_upload_batch(
+    package: dict[str, Any],
+    candidates: list[UploadCandidate],
+    review_rows: list[dict[str, Any]],
+    *,
+    authorization_confirmed: bool,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, int]:
+    """Persist an analyst-reviewed batch; each row succeeds or fails independently."""
+    if not authorization_confirmed:
+        raise ValueError("Authorization acknowledgement is required before upload.")
+    validations = validate_upload_batch(candidates)
+    run_id = f"RUN-UPLOAD-{secrets.token_hex(8).upper()}"
+    database.create_upload_run(
+        run_id=run_id,
+        package_id=package["package_id"],
+        number_selected=len(candidates),
+        status=config.UPLOAD_STATUS_STARTED,
+        db_path=db_path,
+    )
+    display_to_code = {display: code for code, display in DOCUMENT_TYPE_OPTIONS.items()}
+    summary = {"accepted": 0, "uploaded": 0, "duplicates": 0, "excluded": 0, "failed": 0, "bytes": 0}
+    rows_by_index = {int(row.get("_index", index)): row for index, row in enumerate(review_rows)}
+    for index, (candidate, validation) in enumerate(zip(candidates, validations, strict=False)):
+        row = rows_by_index.get(index, {})
+        if not validation.is_valid:
+            summary["failed"] += 1
+            _audit(package["package_id"], "UPLOAD_FAILED", {"filename": candidate.original_filename, "error": validation.error, "upload_batch_id": run_id}, db_path=db_path)
+            continue
+        if not bool(row.get("Include")):
+            summary["excluded"] += 1
+            _audit(package["package_id"], "UPLOAD_EXCLUDED", {"filename": candidate.original_filename, "upload_batch_id": run_id}, db_path=db_path)
+            continue
+        summary["accepted"] += 1
+        existing = database.get_document_by_hash(package["package_id"], validation.sha256_hash, db_path=db_path)
+        if existing and existing.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED:
+            summary["duplicates"] += 1
+            _audit(package["package_id"], "DUPLICATE_DETECTED", {"filename": candidate.original_filename, "existing_document_id": existing["document_id"], "upload_batch_id": run_id}, existing["document_id"], db_path=db_path)
+            continue
+        inferred_source = str(row.get("Inferred source") or UNKNOWN_SOURCE)
+        final_source = str(row.get("Final source") or inferred_source)
+        inferred_code = str(row.get("_category_code") or "other_research")
+        final_code = display_to_code.get(str(row.get("Final document type")), inferred_code)
+        document_date = str(row.get("Document date") or "")
+        first_filename = standardized_upload_filename(
+            package["ticker"], final_source, document_date, candidate.original_filename, sha256_hash=validation.sha256_hash
+        )
+        first_path = safe_licensed_document_path(package["package_id"], "other", first_filename)
+        managed_filename = standardized_upload_filename(
+            package["ticker"], final_source, document_date, candidate.original_filename,
+            sha256_hash=validation.sha256_hash, destination_exists=first_path.exists(),
+        )
+        path = _unique_path(package["package_id"], "other", managed_filename)
+        details = {
+            "final_category_code": final_code,
+            "title": Path(candidate.original_filename).stem,
+            "document_date": document_date or None,
+            "publication_date": document_date or None,
+            "source_institution": final_source,
+            "analyst_notes": row.get("Notes") or None,
+            "is_public": bool(row.get("_is_public")),
+            "final_source": final_source,
+            "managed_filename": path.name,
+        }
+        try:
+            atomic_write_bytes(path, candidate.content)
+            created = database.create_document_record(
+                _document_record(
+                    package, validation, database.generate_document_id("DOC-UPLOAD"), "other",
+                    config.DOCUMENT_STATUS_DOWNLOADED, details=details, local_path=path, content=candidate.content,
+                ),
+                db_path=db_path,
+            )
+            corrected_source = final_source if final_source != inferred_source else None
+            corrected_category = final_code if final_code != inferred_code else None
+            database.update_document_metadata(
+                created["document_id"],
+                {
+                    "source_name": final_source,
+                    "source_type": final_source,
+                    "document_type": DOCUMENT_TYPE_OPTIONS.get(final_code, "Other Research"),
+                    "category": category_display(final_code),
+                    "final_category_code": final_code,
+                    "normalized_form_family": row.get("_normalized_form_family"),
+                    "inferred_source": inferred_source,
+                    "source_confidence": row.get("_source_confidence"),
+                    "source_inference_reason": row.get("_source_reason"),
+                    "analyst_corrected_source": corrected_source,
+                    "final_source": final_source,
+                    "inferred_category_code": inferred_code,
+                    "category_confidence": row.get("_category_confidence"),
+                    "category_inference_reason": row.get("_category_reason"),
+                    "analyst_corrected_category_code": corrected_category,
+                    "upload_batch_id": run_id,
+                    "managed_filename": path.name,
+                    "is_public": bool(row.get("_is_public")),
+                },
+                db_path=db_path,
+            )
+            _audit(package["package_id"], "BATCH_FILE_UPLOADED", {"filename": candidate.original_filename, "managed_filename": path.name, "upload_batch_id": run_id}, created["document_id"], db_path=db_path)
+            summary["uploaded"] += 1
+            summary["bytes"] += validation.file_size_bytes
+        except Exception as exc:
+            if path.exists():
+                path.unlink()
+            summary["failed"] += 1
+            _audit(package["package_id"], "UPLOAD_FAILED", {"filename": candidate.original_filename, "error": str(exc), "upload_batch_id": run_id}, db_path=db_path)
+    status = config.UPLOAD_STATUS_COMPLETED if not summary["failed"] else config.UPLOAD_STATUS_COMPLETED_WITH_ERRORS if summary["uploaded"] else config.UPLOAD_STATUS_FAILED
+    database.update_upload_run(
+        run_id,
+        status=status,
+        number_uploaded=summary["uploaded"],
+        number_duplicated=summary["duplicates"],
+        number_skipped=summary["excluded"],
+        number_failed=summary["failed"],
+        total_bytes_uploaded=summary["bytes"],
+        db_path=db_path,
+    )
+    database.update_package_collection_state(package["package_id"], config.STATUS_LICENSED_UPLOADS, db_path=db_path)
+    from app.services.checklist_service import ensure_package_checklist
+
+    refreshed = database.get_package_by_package_id(package["package_id"], db_path=db_path) or package
+    ensure_package_checklist(refreshed, db_path=db_path)
+    return summary
 
 
 def inspect_zip_upload(content: bytes) -> list[ZipEntryInspection]:
@@ -329,7 +668,7 @@ def _document_record(
         "category": category_display(final_category_code),
         "document_type": result.detected_file_type,
         "title": title,
-        "source_name": config.LICENSED_SOURCE_TYPES.get(source_type, "Licensed Upload"),
+        "source_name": details.get("final_source") or config.LICENSED_SOURCE_TYPES.get(source_type, "Licensed Upload"),
         "source_url": f"local-upload://{result.sanitized_filename}",
         "source_domain": "local",
         "publication_date": details.get("publication_date"),
@@ -338,9 +677,9 @@ def _document_record(
         "mime_type": mimetypes.guess_type(result.sanitized_filename)[0] or "application/octet-stream",
         "file_size_bytes": result.file_size_bytes,
         "sha256_hash": result.sha256_hash,
-        "collection_method": "LICENSED_UPLOAD",
+        "collection_method": "BATCH_UPLOAD",
         "collection_status": status,
-        "is_public": False,
+        "is_public": bool(details.get("is_public", False)),
         "error_message": error,
         "original_filename": result.original_filename,
         "stored_filename": local_path.name if local_path else result.sanitized_filename,

@@ -5,8 +5,10 @@ from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
 from typing import Any
+import json
 
 from app import config
+from app.services.collection_profile import default_profile_for_security_type
 from app.utils import database
 from app.utils.validation import (
     ValidationResult,
@@ -71,6 +73,8 @@ def create_package(
     while database.get_package_by_package_id(package_id, db_path=db_path) is not None:
         package_id = generate_package_id(ticker)
 
+    profile = default_profile_for_security_type(package_input.security_type)
+
     return database.create_package_record(
         package_id=package_id,
         ticker=ticker,
@@ -80,6 +84,8 @@ def create_package(
         research_cutoff_date=cutoff,
         filing_history_years=package_input.filing_history_years,
         analyst_notes=notes,
+        collection_profile_name=profile.name if profile else None,
+        collection_profile_snapshot_json=json.dumps(profile.snapshot(), sort_keys=True) if profile else None,
         db_path=db_path,
     )
 

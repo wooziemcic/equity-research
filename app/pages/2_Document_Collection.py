@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import replace
 from pathlib import Path
 
 import streamlit as st
@@ -17,17 +18,20 @@ from app.services.collectors.ir_collector import (
 )
 from app.services.collectors.sec_collector import (
     FilingCandidate,
-    download_selected_filings,
-    preview_filings,
+    discover_dividend_exhibits,
+    download_dividend_exhibits,
+    download_profile_inventory,
+    preview_cutler_profile,
+    store_official_y15,
 )
 from app.services.company_resolver import resolve_package_company
 from app.services.document_download_service import DocumentDownloadError, create_public_documents_zip, get_document_download
-from app.services.taxonomy import category_options
 from app.services.upload_service import (
+    DOCUMENT_TYPE_OPTIONS,
+    SOURCE_ALIASES,
     UploadCandidate,
-    inspect_zip_upload,
-    store_uploaded_files,
-    validate_upload_batch,
+    prepare_batch_review,
+    store_reviewed_upload_batch,
 )
 from app.utils import database
 from app.utils.database import DatabaseError
@@ -92,15 +96,20 @@ def _company_identity(package: dict) -> dict:
     cols[1].metric("CIK", package.get("cik") or "Unresolved")
     cols[2].metric("Security", package.get("security_type", ""))
     cols[3].metric("Cutoff", package.get("research_cutoff_date", ""))
-    st.write(
-        {
-            "Company": package.get("company_name") or "Company resolution pending",
-            "Exchange": package.get("exchange") or "",
-            "Industry": package.get("industry_description") or "",
-            "Fiscal Year End": package.get("fiscal_year_end") or "",
-            "Resolution": package.get("resolution_status") or "UNRESOLVED",
-        }
-    )
+    identity_cols = st.columns(5)
+    for column, (label, value) in zip(
+        identity_cols,
+        (
+            ("Company", package.get("company_name") or "Pending"),
+            ("Exchange", package.get("exchange") or "Not available"),
+            ("Industry", package.get("industry_description") or "Not available"),
+            ("Fiscal year end", package.get("fiscal_year_end") or "Not available"),
+            ("Resolution", package.get("resolution_status") or "UNRESOLVED"),
+        ),
+        strict=False,
+    ):
+        column.caption(label)
+        column.write(value)
     action_cols = st.columns(3)
     with action_cols[0]:
         if st.button("Resolve Company", disabled=not config.sec_user_agent_is_configured()):
@@ -149,21 +158,35 @@ def _company_identity(package: dict) -> dict:
 
 
 def _sec_collection(package: dict) -> None:
-    st.subheader("SEC Collection")
+    st.subheader("Cutler collection scope")
+    st.caption(package.get("collection_profile_name") or "CUTLER_EQUITY_INTERN_GUIDE")
+    scope_cols = st.columns(2)
+    scope_cols[0].markdown("**Required**  \n10-K · 10-Q · 8-K · S-3 · S-4 · DEF 14A")
+    scope_cols[1].markdown("**Conditional**  \nSelected Form 144 · Dividend announcements · Y-15 when discovered")
     if not package.get("cik"):
         st.info("Resolve the company before previewing SEC filings.")
         return
-    forms = st.multiselect(
-        "Filing types",
-        options=list(config.SEC_SUPPORTED_FORMS),
-        default=["10-K", "10-Q", "8-K"],
-    )
+    enabled = {"10-K", "10-Q", "8-K", "S-3", "S-4", "DEF 14A", "144"}
+    with st.expander("Advanced"):
+        adjusted = st.multiselect(
+            "Included form families",
+            options=list(config.SEC_SUPPORTED_FORMS),
+            default=list(config.SEC_SUPPORTED_FORMS),
+        )
+        enabled = set(adjusted)
+        y15_url = st.text_input("Official Y-15 direct link", placeholder="https://www.federalreserve.gov/...")
+        if st.button("Store Official Y-15", disabled=not y15_url):
+            try:
+                store_official_y15(package, y15_url)
+                st.success("Y-15 regulatory report stored from the official source.")
+            except Exception as exc:
+                st.error(f"Y-15 could not be stored: {exc}")
     st.caption(
         f"Allowed date range is derived from the package: {package['filing_history_years']} year(s) through {package['research_cutoff_date']}."
     )
-    if st.button("Preview Available SEC Filings", disabled=not forms):
+    if st.button("Retrieve Filing Inventory", disabled=not enabled):
         try:
-            st.session_state["sec_preview"] = preview_filings(package, forms)
+            st.session_state["sec_preview"] = preview_cutler_profile(package, enabled_families=enabled)
         except Exception as exc:
             logger.exception("SEC preview failed")
             st.error(f"SEC filings could not be previewed: {exc}")
@@ -171,23 +194,73 @@ def _sec_collection(package: dict) -> None:
     candidates: list[FilingCandidate] = st.session_state.get("sec_preview", [])
     if not candidates:
         return
+    regular = [item for item in candidates if item.normalized_form_family != "144" and item.inventory_status != "EXCLUDED_BY_PROFILE"]
+    excluded = [item for item in candidates if item.inventory_status == "EXCLUDED_BY_PROFILE"]
+    form_144 = [item for item in candidates if item.normalized_form_family == "144"]
+    metric_cols = st.columns(4)
+    metric_cols[0].metric("Discovered", len(candidates))
+    metric_cols[1].metric("Eligible", len(regular) + len(form_144))
+    metric_cols[2].metric("Already collected", sum(item.inventory_status == "ALREADY_COLLECTED" for item in candidates))
+    metric_cols[3].metric("Excluded by profile", len(excluded))
     rows = [
         {
-            "Accession": item.accession_number,
-            "Form": item.form_type,
+            "Selected": item.selected,
+            "Form family": item.normalized_form_family,
+            "Original form": item.form_type,
             "Filing Date": item.filing_date,
-            "Report Period": item.report_period,
-            "Primary Document": item.primary_document,
+            "Collection source": "SEC EDGAR",
+            "Conditional rule": "Included by profile",
+            "Already collected": item.inventory_status == "ALREADY_COLLECTED",
+            "Newly discoverable": item.inventory_status == "ELIGIBLE",
         }
+        for item in regular
+    ]
+    edited_regular = st.data_editor(rows, hide_index=True, use_container_width=True, disabled=[key for key in rows[0] if key != "Selected"] if rows else True)
+    selected_regular = edited_regular.to_dict("records") if hasattr(edited_regular, "to_dict") else edited_regular
+    selection_by_identity = {
+        (item.accession_number, item.primary_document): bool(row["Selected"])
+        for item, row in zip(regular, selected_regular, strict=False)
+    }
+    if form_144:
+        st.markdown("**Form 144 selection**")
+        rows_144 = [
+            {"Selected": item.selected, "Filing date": item.filing_date, "Reporting person": item.reporting_person,
+             "Security": item.security, "Shares": item.shares, "Aggregate market value": item.aggregate_market_value,
+             "Issuer": item.issuer, "Source link": item.primary_document_url}
+            for item in form_144
+        ]
+        edited_144 = st.data_editor(rows_144, hide_index=True, use_container_width=True, disabled=[key for key in rows_144[0] if key != "Selected"])
+        selected_144 = edited_144.to_dict("records") if hasattr(edited_144, "to_dict") else edited_144
+        selection_by_identity.update(
+            {
+                (item.accession_number, item.primary_document): bool(row["Selected"])
+                for item, row in zip(form_144, selected_144, strict=False)
+            }
+        )
+    if excluded:
+        with st.expander(f"Inventory diagnostics · {len(excluded)} excluded"):
+            st.dataframe(
+                [{"Original form": item.form_type, "Filing date": item.filing_date, "Status": "Excluded by profile", "Accession": item.accession_number} for item in excluded],
+                hide_index=True, use_container_width=True,
+            )
+    candidates = [
+        replace(item, selected=selection_by_identity.get((item.accession_number, item.primary_document), item.selected))
         for item in candidates
     ]
-    st.dataframe(rows, hide_index=True, use_container_width=True)
-    labels = {f"{item.form_type} {item.filing_date} {item.accession_number}": item for item in candidates}
-    selected = st.multiselect("Select filings to download", options=list(labels.keys()))
-    if st.button("Download Selected SEC Filings", disabled=not selected):
-        summary = download_selected_filings(package, [labels[label] for label in selected])
+    selected_count = sum(item.selected for item in candidates)
+    if st.button("Download Selected SEC Filings", disabled=not selected_count):
+        summary = download_profile_inventory(package, candidates)
+        dividend_summary = {"downloaded_now": 0}
+        for filing in candidates:
+            if filing.selected and filing.normalized_form_family == "8-K":
+                exhibits = discover_dividend_exhibits(package, filing)
+                result = download_dividend_exhibits(package, exhibits)
+                dividend_summary["downloaded_now"] += result["downloaded_now"]
         st.success(
-            f"SEC run complete: {summary['downloaded_now']} downloaded now, {summary['already_collected']} already collected, {summary['duplicate']} duplicate, {summary['failed']} failed, {summary['not_found']} not found."
+            f"SEC run: {summary['downloaded_now']} downloaded now, {summary['already_collected']} already collected, "
+            f"{summary['excluded_by_profile']} excluded by profile, {summary['awaiting_form_144_selection']} awaiting Form 144 selection, "
+            f"{summary['duplicate']} duplicate, {summary['failed']} failed, {summary['not_found']} not found; "
+            f"{dividend_summary['downloaded_now']} dividend exhibit(s)."
         )
         _refresh_active_package(package["package_id"])
 
@@ -250,15 +323,7 @@ def _ir_collection(package: dict) -> None:
 
 
 def _licensed_uploads(package: dict) -> None:
-    st.subheader("Licensed File Uploads")
-    st.info(
-        "Uploaded licensed materials remain within this local research workspace and are not analyzed by an external model in Phase 3."
-    )
-    source_type = st.selectbox(
-        "Source type",
-        options=list(config.LICENSED_SOURCE_TYPES.keys()),
-        format_func=lambda value: config.LICENSED_SOURCE_TYPES[value],
-    )
+    st.subheader("Additional Research")
     files = st.file_uploader(
         "Upload authorized files",
         accept_multiple_files=True,
@@ -270,83 +335,68 @@ def _licensed_uploads(package: dict) -> None:
         UploadCandidate(file.name, file.getvalue(), getattr(file, "type", ""))
         for file in files
     ]
-    validations = validate_upload_batch(candidates, source_type=source_type)
-    category_lookup = dict(category_options())
-    st.write("Upload preview")
-    st.dataframe(
-        [
-            {
-                "File": result.original_filename,
-                "Size": result.file_size_bytes,
-                "Valid": result.is_valid,
-                "Detected": result.detected_file_type,
-                "Suggested": result.classification.category_display if result.classification else "",
-                "Confidence": result.classification.confidence if result.classification else "",
-                "Error": result.error,
-            }
-            for result in validations
-        ],
+    signature = tuple((item.original_filename, len(item.content)) for item in candidates)
+    if st.session_state.get("batch_review_signature") != signature:
+        st.session_state["batch_review_signature"] = signature
+        st.session_state["batch_review_rows"] = prepare_batch_review(package, candidates)
+    reviews = st.session_state["batch_review_rows"]
+    valid_count = sum(row["Validation status"] == "Valid" for row in reviews)
+    st.caption(f"{len(reviews)} selected · {valid_count} valid · {len(reviews) - valid_count} invalid")
+    bulk = st.columns(5)
+    if bulk[0].button("Include valid"):
+        for row in reviews:
+            row["Include"] = row["Validation status"] == "Valid"
+    if bulk[1].button("Exclude duplicates"):
+        for row in reviews:
+            if row["Duplicate status"] != "Unique":
+                row["Include"] = False
+    source_values = [source for source, _ in SOURCE_ALIASES] + ["UNKNOWN_SOURCE"]
+    bulk_source = bulk[2].selectbox("Source", source_values, label_visibility="collapsed")
+    if bulk[2].button("Apply source"):
+        for row in reviews:
+            if row["Include"]:
+                row["Final source"] = bulk_source
+    type_values = list(DOCUMENT_TYPE_OPTIONS.values())
+    bulk_type = bulk[3].selectbox("Type", type_values, label_visibility="collapsed")
+    if bulk[3].button("Apply type"):
+        for row in reviews:
+            if row["Include"]:
+                row["Final document type"] = bulk_type
+    if bulk[4].button("Clear corrections"):
+        for row in reviews:
+            row["Final source"] = row["Inferred source"]
+            row["Final document type"] = row["Inferred document type"]
+            row["Document date"] = ""
+            row["Notes"] = ""
+    visible_columns = [key for key in reviews[0] if not key.startswith("_")]
+    visible_rows = [{key: row[key] for key in visible_columns} for row in reviews]
+    editable = {"Include", "Final source", "Final document type", "Document date", "Notes"}
+    edited = st.data_editor(
+        visible_rows,
         hide_index=True,
         use_container_width=True,
+        disabled=[column for column in visible_columns if column not in editable],
+        column_config={
+            "Final source": st.column_config.SelectboxColumn(options=source_values),
+            "Final document type": st.column_config.SelectboxColumn(options=type_values),
+        },
     )
-    metadata_by_name: dict[str, dict] = {}
-    for result in validations:
-        if not result.is_valid:
-            continue
-        st.markdown(f"**{result.original_filename}**")
-        default_category = result.classification.category_code if result.classification else "other"
-        category_codes = list(category_lookup.keys())
-        selected_code = st.selectbox(
-            "Final category",
-            options=category_codes,
-            index=category_codes.index(default_category) if default_category in category_codes else 0,
-            format_func=lambda code: category_lookup[code],
-            key=f"upload_category_{result.sha256_hash}",
-        )
-        col1, col2 = st.columns(2)
-        with col1:
-            title = st.text_input("Document title", value=Path(result.original_filename).stem, key=f"title_{result.sha256_hash}")
-            publication_date = st.date_input("Publication date", value=None, key=f"pub_{result.sha256_hash}")
-        with col2:
-            source_institution = st.text_input("Source institution", value=config.LICENSED_SOURCE_TYPES[source_type], key=f"source_inst_{result.sha256_hash}")
-            document_date = st.date_input("Document as-of date", value=None, key=f"docdate_{result.sha256_hash}")
-        notes = st.text_area("Analyst notes", key=f"notes_{result.sha256_hash}")
-        metadata_by_name[result.original_filename] = {
-            "final_category_code": selected_code,
-            "title": title,
-            "publication_date": publication_date.isoformat() if publication_date else None,
-            "source_institution": source_institution,
-            "document_date": document_date.isoformat() if document_date else None,
-            "analyst_notes": notes,
-        }
-        if result.extension == ".zip":
-            try:
-                st.caption("ZIP inspection")
-                st.dataframe(
-                    [entry.__dict__ for entry in inspect_zip_upload(candidates[[c.original_filename for c in candidates].index(result.original_filename)].content)],
-                    hide_index=True,
-                    use_container_width=True,
-                )
-                st.caption("Phase 3 stores ZIP files archive-only after inspection. Automatic extraction is not enabled.")
-            except Exception as exc:
-                st.warning(f"ZIP inspection failed: {exc}")
+    edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
+    merged_reviews = [{**reviews[index], **row} for index, row in enumerate(edited_rows)]
     authorized = st.checkbox(
         "I confirm that these files are authorized for internal use and that their storage complies with Cutler Capital's vendor entitlements."
     )
     if st.button("Upload Accepted Research Files", type="primary", disabled=not authorized):
-        summary = store_uploaded_files(
+        summary = store_reviewed_upload_batch(
             package,
             candidates,
-            source_type=source_type,
+            merged_reviews,
             authorization_confirmed=authorized,
-            metadata_by_name=metadata_by_name,
         )
         st.success(
-            f"Upload run complete: {summary['uploaded']} uploaded, {summary['duplicated']} duplicate, {summary['failed']} failed."
+            f"Batch complete: {summary['accepted']} accepted, {summary['uploaded']} uploaded, {summary['duplicates']} duplicates, "
+            f"{summary['excluded']} excluded, {summary['failed']} failed, {summary['bytes']} bytes."
         )
-        from app.services.checklist_service import ensure_package_checklist
-
-        ensure_package_checklist(_refresh_active_package(package["package_id"]))
 
 
 def _collected_documents(package: dict) -> None:
@@ -458,8 +508,11 @@ def _collection_history(package: dict) -> None:
                 "Completed": run.get("completed_at") or "",
                 "Status": run["status"],
                 "Discovered": run["documents_discovered"],
+                "Eligible": run.get("documents_eligible", 0),
                 "Downloaded now": run["documents_downloaded"],
                 "Already collected": run.get("documents_already_collected", 0),
+                "Excluded by profile": run.get("documents_excluded_profile", 0),
+                "Awaiting Form 144": run.get("documents_awaiting_selection", 0),
                 "Duplicate": run.get("documents_duplicated", 0),
                 "Not found": run.get("documents_not_found", 0),
                 "Failed": run["documents_failed"],
@@ -486,8 +539,6 @@ def main() -> None:
         package = _company_identity(package)
         st.divider()
         _sec_collection(package)
-        st.divider()
-        _ir_collection(package)
         st.divider()
         _licensed_uploads(package)
         st.divider()

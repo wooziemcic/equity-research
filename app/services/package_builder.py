@@ -284,6 +284,8 @@ def build_package_version(
             "created_by": "analyst",
             "created_at": _now(),
             "notes": notes,
+            "collection_profile_name": package.get("collection_profile_name"),
+            "collection_profile_snapshot_json": package.get("collection_profile_snapshot_json"),
         },
         db_path=db_path,
     )

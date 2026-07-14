@@ -166,6 +166,9 @@ CHECKLIST_STATUS_NOT_AVAILABLE = "NOT_AVAILABLE"
 CHECKLIST_STATUS_NOT_APPLICABLE = "NOT_APPLICABLE"
 CHECKLIST_STATUS_NEEDS_REVIEW = "NEEDS_REVIEW"
 CHECKLIST_STATUS_STALE = "STALE"
+CHECKLIST_STATUS_NOT_FILED_IN_PERIOD = "NOT_FILED_IN_PERIOD"
+CHECKLIST_STATUS_OPTIONAL_NOT_DISCOVERED = "OPTIONAL_NOT_DISCOVERED"
+CHECKLIST_STATUS_AWAITING_SELECTION = "AWAITING_SELECTION"
 
 READINESS_NOT_READY = "NOT_READY"
 READINESS_READY_WITH_WARNINGS = "READY_WITH_WARNINGS"
@@ -303,7 +306,17 @@ LICENSED_SOURCE_TYPES = {
     "other": "Other",
 }
 
-SEC_SUPPORTED_FORMS = ("10-K", "10-Q", "8-K", "DEF 14A", "20-F", "6-K")
+SEC_SUPPORTED_FORMS = ("10-K", "10-Q", "8-K", "S-3", "S-4", "DEF 14A", "144")
+FORM_144_AUTO_SELECT_ENABLED = os.getenv("FORM_144_AUTO_SELECT_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _optional_float(name: str) -> float | None:
+    value = os.getenv(name, "").strip()
+    return float(value) if value else None
+
+
+FORM_144_MIN_SHARES = _optional_float("FORM_144_MIN_SHARES")
+FORM_144_MIN_MARKET_VALUE = _optional_float("FORM_144_MIN_MARKET_VALUE")
 SEC_TICKER_MAPPING_URL = "https://www.sec.gov/files/company_tickers_exchange.json"
 SEC_SUBMISSIONS_URL_TEMPLATE = "https://data.sec.gov/submissions/CIK{cik}.json"
 SEC_ARCHIVES_BASE_URL = "https://www.sec.gov/Archives/edgar/data"

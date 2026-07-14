@@ -78,6 +78,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _ensure_phase4_package_columns(connection)
         _create_phase4_tables(connection)
         _ensure_phase4_version_columns(connection)
+        _create_phase2_stabilization_schema(connection)
         _create_phase5_tables(connection)
         _create_phase6_tables(connection)
         _create_phase7_tables(connection)
@@ -431,6 +432,66 @@ def _ensure_phase4_version_columns(connection: sqlite3.Connection) -> None:
     connection.execute(
         "CREATE UNIQUE INDEX IF NOT EXISTS idx_package_versions_parent_number ON package_versions (parent_package_id, version_number)"
     )
+
+
+def _create_phase2_stabilization_schema(connection: sqlite3.Connection) -> None:
+    """Add the intern-guide profile and batch metadata without rewriting history."""
+    package_columns = _table_columns(connection, "packages")
+    for column in ("collection_profile_name", "collection_profile_snapshot_json"):
+        if column not in package_columns:
+            connection.execute(f"ALTER TABLE packages ADD COLUMN {column} TEXT")
+
+    version_columns = _table_columns(connection, "package_versions")
+    for column in ("collection_profile_name", "collection_profile_snapshot_json"):
+        if column not in version_columns:
+            connection.execute(f"ALTER TABLE package_versions ADD COLUMN {column} TEXT")
+
+    document_columns = _table_columns(connection, "documents")
+    document_additions = {
+        "normalized_form_family": "TEXT",
+        "parent_accession_number": "TEXT",
+        "inferred_source": "TEXT",
+        "source_confidence": "TEXT",
+        "source_inference_reason": "TEXT",
+        "analyst_corrected_source": "TEXT",
+        "final_source": "TEXT",
+        "inferred_category_code": "TEXT",
+        "category_confidence": "TEXT",
+        "category_inference_reason": "TEXT",
+        "analyst_corrected_category_code": "TEXT",
+        "upload_batch_id": "TEXT",
+        "managed_filename": "TEXT",
+    }
+    for column, definition in document_additions.items():
+        if column not in document_columns:
+            connection.execute(f"ALTER TABLE documents ADD COLUMN {column} {definition}")
+
+    run_columns = _table_columns(connection, "collection_runs")
+    for column in ("documents_eligible", "documents_excluded_profile", "documents_awaiting_selection"):
+        if column not in run_columns:
+            connection.execute(f"ALTER TABLE collection_runs ADD COLUMN {column} INTEGER NOT NULL DEFAULT 0")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS sec_filing_inventory (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            package_id TEXT NOT NULL,
+            accession_number TEXT NOT NULL,
+            primary_document TEXT NOT NULL,
+            original_form_type TEXT NOT NULL,
+            normalized_form_family TEXT,
+            filing_date TEXT,
+            source_url TEXT,
+            inventory_status TEXT NOT NULL,
+            conditional_rule TEXT,
+            selected INTEGER NOT NULL DEFAULT 0,
+            metadata_json TEXT,
+            discovered_at TEXT NOT NULL,
+            UNIQUE(package_id, accession_number, primary_document)
+        )
+        """
+    )
+    connection.execute("CREATE INDEX IF NOT EXISTS idx_sec_inventory_package ON sec_filing_inventory(package_id)")
 
 
 def _create_phase5_tables(connection: sqlite3.Connection) -> None:
@@ -958,6 +1019,8 @@ def create_package_record(
     research_cutoff_date: str,
     filing_history_years: int,
     analyst_notes: str,
+    collection_profile_name: str | None = None,
+    collection_profile_snapshot_json: str | None = None,
     db_path: Path | str = DATABASE_PATH,
 ) -> dict[str, Any]:
     """Insert and return a package record."""
@@ -968,9 +1031,10 @@ def create_package_record(
             INSERT INTO packages (
                 package_id, ticker, company_name, security_type, status,
                 research_cutoff_date, filing_history_years, analyst_notes,
+                collection_profile_name, collection_profile_snapshot_json,
                 created_at, updated_at
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 package_id,
@@ -981,6 +1045,8 @@ def create_package_record(
                 research_cutoff_date,
                 filing_history_years,
                 analyst_notes,
+                collection_profile_name,
+                collection_profile_snapshot_json,
                 now,
                 now,
             ),
@@ -1193,6 +1259,9 @@ def update_collection_run(
     documents_duplicated: int = 0,
     documents_not_found: int = 0,
     documents_failed: int = 0,
+    documents_eligible: int = 0,
+    documents_excluded_profile: int = 0,
+    documents_awaiting_selection: int = 0,
     error_summary: str | None = None,
     completed: bool = True,
     db_path: Path | str = DATABASE_PATH,
@@ -1207,6 +1276,7 @@ def update_collection_run(
             SET completed_at = ?, status = ?, documents_discovered = ?,
                 documents_downloaded = ?, documents_skipped = ?, documents_already_collected = ?,
                 documents_duplicated = ?, documents_not_found = ?, documents_failed = ?,
+                documents_eligible = ?, documents_excluded_profile = ?, documents_awaiting_selection = ?,
                 error_summary = ?
             WHERE run_id = ?
             """,
@@ -1220,6 +1290,9 @@ def update_collection_run(
                 documents_duplicated,
                 documents_not_found,
                 documents_failed,
+                documents_eligible,
+                documents_excluded_profile,
+                documents_awaiting_selection,
                 error_summary,
                 run_id,
             ),
@@ -1235,6 +1308,59 @@ def get_collection_run(run_id: str, *, db_path: Path | str = DATABASE_PATH) -> d
             (run_id,),
         ).fetchone()
     return row_to_dict(row)
+
+
+def replace_sec_filing_inventory(
+    package_id: str,
+    rows: list[dict[str, Any]],
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> None:
+    """Replace the current editable package inventory; locked version snapshots are untouched."""
+    initialize_database(db_path)
+    now = utc_now_iso()
+    with get_connection(db_path) as connection:
+        connection.execute("DELETE FROM sec_filing_inventory WHERE package_id = ?", (package_id,))
+        connection.executemany(
+            """
+            INSERT INTO sec_filing_inventory (
+                package_id, accession_number, primary_document, original_form_type,
+                normalized_form_family, filing_date, source_url, inventory_status,
+                conditional_rule, selected, metadata_json, discovered_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (
+                    package_id,
+                    row["accession_number"],
+                    row["primary_document"],
+                    row["original_form_type"],
+                    row.get("normalized_form_family"),
+                    row.get("filing_date"),
+                    row.get("source_url"),
+                    row["inventory_status"],
+                    row.get("conditional_rule"),
+                    int(bool(row.get("selected"))),
+                    row.get("metadata_json"),
+                    now,
+                )
+                for row in rows
+            ],
+        )
+
+
+def list_sec_filing_inventory(
+    package_id: str,
+    *,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM sec_filing_inventory WHERE package_id = ? ORDER BY filing_date DESC, accession_number",
+            (package_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
 
 
 def list_recent_collection_runs(
@@ -1404,6 +1530,7 @@ def _update_existing_document_from_insert(
     safe_fields = (
         "category",
         "document_type",
+        "is_public",
         "title",
         "source_name",
         "source_url",
@@ -2201,6 +2328,22 @@ def update_document_metadata(
         "analyst_notes",
         "final_category_code",
         "document_title",
+        "normalized_form_family",
+        "parent_accession_number",
+        "inferred_source",
+        "source_confidence",
+        "source_inference_reason",
+        "analyst_corrected_source",
+        "final_source",
+        "inferred_category_code",
+        "category_confidence",
+        "category_inference_reason",
+        "analyst_corrected_category_code",
+        "upload_batch_id",
+        "managed_filename",
+        "source_name",
+        "source_type",
+        "document_type",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -2390,9 +2533,10 @@ def allocate_package_version(
                         version_id, display_version, parent_package_id, version_number, previous_version_id,
                         ticker, company_name, security_type, research_cutoff_date, status,
                         document_count, public_document_count, licensed_document_count, total_size_bytes,
-                        checklist_snapshot_json, created_by, created_at, notes, error_message
+                        checklist_snapshot_json, collection_profile_name, collection_profile_snapshot_json,
+                        created_by, created_at, notes, error_message
                     )
-                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
                     (
                         record["version_id"],
@@ -2410,6 +2554,8 @@ def allocate_package_version(
                         record.get("licensed_document_count", 0),
                         record.get("total_size_bytes", 0),
                         record.get("checklist_snapshot_json"),
+                        record.get("collection_profile_name"),
+                        record.get("collection_profile_snapshot_json"),
                         record.get("created_by", "analyst"),
                         record["created_at"],
                         record.get("notes"),
@@ -2459,10 +2605,11 @@ def create_package_version(
                 version_id, display_version, parent_package_id, version_number, previous_version_id,
                 ticker, company_name, security_type, research_cutoff_date, status,
                 document_count, public_document_count, licensed_document_count,
-                total_size_bytes, checklist_snapshot_json, created_by, created_at,
+                total_size_bytes, checklist_snapshot_json, collection_profile_name,
+                collection_profile_snapshot_json, created_by, created_at,
                 notes, error_message
             )
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
             (
                 version_id,
@@ -2480,6 +2627,8 @@ def create_package_version(
                 version.get("licensed_document_count", 0),
                 version.get("total_size_bytes", 0),
                 version.get("checklist_snapshot_json"),
+                version.get("collection_profile_name"),
+                version.get("collection_profile_snapshot_json"),
                 version.get("created_by", "analyst"),
                 version.get("created_at", utc_now_iso()),
                 version.get("notes"),

@@ -18,6 +18,11 @@ PUBLIC_FORM_CATEGORY_MAP = {
     "8-K": "current_report",
     "6-K": "current_report",
     "DEF 14A": "proxy_statement",
+    "S-3": "registration_s3",
+    "S-4": "registration_s4",
+    "144": "form_144",
+    "DIVIDEND_ANNOUNCEMENT": "dividend_announcement",
+    "Y-15": "y15_regulatory_report",
 }
 
 MISSING_COVERAGE_STATUSES = {
@@ -40,8 +45,9 @@ def normalize_checklist_status(value: Any) -> str:
 def _document_category_code(document: dict[str, Any]) -> str:
     if document.get("final_category_code"):
         return document["final_category_code"]
-    if document.get("form_type") in PUBLIC_FORM_CATEGORY_MAP:
-        return PUBLIC_FORM_CATEGORY_MAP[document["form_type"]]
+    family = document.get("normalized_form_family") or document.get("form_type")
+    if family in PUBLIC_FORM_CATEGORY_MAP:
+        return PUBLIC_FORM_CATEGORY_MAP[family]
     category = (document.get("category") or "").lower()
     if "earnings release" in category:
         return "earnings_release"
@@ -69,14 +75,27 @@ def ensure_package_checklist(
         code = _document_category_code(document)
         if code:
             docs_by_category[code].append(document)
+    inventory = database.list_sec_filing_inventory(package["package_id"], db_path=db_path)
+    inventory_families = {
+        row.get("normalized_form_family")
+        for row in inventory
+        if row.get("inventory_status") != "EXCLUDED_BY_PROFILE"
+    }
     links: list[dict[str, str]] = []
     for item in profile:
         matches = docs_by_category.get(item["category_code"], [])
-        automatic = (
-            config.CHECKLIST_STATUS_AVAILABLE
-            if matches
-            else config.CHECKLIST_STATUS_MISSING
-        )
+        if matches:
+            automatic = config.CHECKLIST_STATUS_AVAILABLE
+        elif item["id"] == "registration_s3" and "S-3" not in inventory_families:
+            automatic = config.CHECKLIST_STATUS_NOT_FILED_IN_PERIOD
+        elif item["id"] == "registration_s4" and "S-4" not in inventory_families:
+            automatic = config.CHECKLIST_STATUS_NOT_FILED_IN_PERIOD
+        elif item["id"] == "selected_form_144" and "144" in inventory_families:
+            automatic = config.CHECKLIST_STATUS_AWAITING_SELECTION
+        elif item["id"] in {"selected_form_144", "dividend_announcement", "y15_report"}:
+            automatic = config.CHECKLIST_STATUS_OPTIONAL_NOT_DISCOVERED
+        else:
+            automatic = config.CHECKLIST_STATUS_MISSING
         latest = max(
             [
                 value
@@ -169,6 +188,9 @@ def coverage_summary(items: list[dict[str, Any]]) -> dict[str, int]:
         "stale": 0,
         "not_available": 0,
         "not_applicable": 0,
+        "not_filed_in_period": 0,
+        "optional_not_discovered": 0,
+        "awaiting_selection": 0,
         "available_required": 0,
         "missing_required": 0,
         "missing_recommended": 0,
@@ -202,6 +224,12 @@ def coverage_summary(items: list[dict[str, Any]]) -> dict[str, int]:
             summary["not_available"] += 1
         if status == config.CHECKLIST_STATUS_NOT_APPLICABLE:
             summary["not_applicable"] += 1
+        if status == config.CHECKLIST_STATUS_NOT_FILED_IN_PERIOD:
+            summary["not_filed_in_period"] += 1
+        if status == config.CHECKLIST_STATUS_OPTIONAL_NOT_DISCOVERED:
+            summary["optional_not_discovered"] += 1
+        if status == config.CHECKLIST_STATUS_AWAITING_SELECTION:
+            summary["awaiting_selection"] += 1
     return summary
 
 

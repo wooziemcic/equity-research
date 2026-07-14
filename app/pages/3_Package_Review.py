@@ -293,6 +293,7 @@ def _version_history(package: dict) -> None:
             {
                 "Version ID": version["version_id"],
                 "Display Version": version.get("display_version") or "",
+                "Collection Profile": version.get("collection_profile_name") or "Legacy / not recorded",
                 "Status": version["status"],
                 "Created": version["created_at"],
                 "Locked": version.get("locked_at") or "",
