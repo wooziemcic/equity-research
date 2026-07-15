@@ -6,6 +6,8 @@ Cutler Research AI is an internal Streamlit research product for searching a tic
 
 Implemented through the Phase 5 analyst-readiness pass:
 
+- Phase 6A stabilization: versioned workbook-derived common-equity recipes, explicit administrator approval and activation, immutable per-package recipe snapshots, ordered package slots, deterministic upload suggestions and completion, the responsive Package Assembly Board, checklist XLSX export, safe JSON snapshot portability, legacy-package cloning, test-database classification, and guarded development migrations. Phase 6A makes no Brave requests and does not alter the analysis corpus or pipeline.
+
 - Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
 - Phase 3: licensed-file uploads, classification suggestions, analyst category correction, upload history, audit events, ZIP inspection, document inventory editing, controlled deletion, and checklist review.
@@ -22,11 +24,13 @@ Not implemented: authentication, cloud deployment, continuous monitoring, or tra
 
 The default application experience is now:
 
-1. `Search` - `app/Home.py` is a minimal ticker-search landing page. It strips spaces, uppercases the ticker, validates symbol format, and verifies an exact match through the supported SEC company database. It does not use general web search or unsupported lookup services. After the analyst confirms the SEC company record, the app reuses the newest editable package for that ticker or creates a new Common Equity package.
-2. `Research` - `app/pages/0_Research_Workspace.py` consolidates package settings, automated public collection, optional licensed uploads, package coverage, checklist acknowledgement, and the primary `Build Package and Generate Analysis` action. The Research Time Window accepts one or more calendar years and month selection for a single year.
+1. `Search` - `app/Home.py` verifies an exact ticker match through the supported SEC company database. After confirmation, a new Common Equity package is created from the active approved Cutler recipe and receives an immutable recipe snapshot.
+2. `Package Assembly` - `app/pages/8_Package_Assembly.py` is the default analyst workspace for recipe-backed packages. It preserves workbook order and numbering gaps, supports reviewed uploads and existing-document assignments, distinguishes missing/unavailable/not-applicable items, and exports the current database-backed checklist.
 3. `Result` - `app/pages/6_Investment_Result.py` renders the same compact memo model used by the one-page PDF and DOCX. Package identifiers, diagnostics, filtered conflict counts, and performance data remain in the collapsed `Audit Details` section.
 
 Secondary navigation includes `Dashboard / History` for previous packages and `Advanced Workbench` for the detailed Phase 1-6 pages: package setup, public collection, licensed uploads, package review, evidence exploration, analyst review, PM approval, generated reports, and audit history.
+
+`Recipe Administration` is under Advanced Workbench. Import `reference/Equity Research Package.xlsx` (or set `CUTLER_RECIPE_WORKBOOK_PATH`), review `Template`, `Instructions`, and `MDT` differences, then explicitly approve and activate a recipe. The source workbook is ignored by Git and is not reopened during normal package sessions.
 
 ## Research Workspace Details
 
@@ -251,6 +255,13 @@ Key Phase 6 and Phase 7 settings:
 - `PROCESSING_CONCURRENCY_ENABLED`
 - `PROCESSING_EXTRACTION_CONFIG_VERSION`
 - `DURABLE_STORAGE_APPROVED`
+- `CUTLER_RECIPE_WORKBOOK_PATH`
+- `DATABASE_ENVIRONMENT` (`DEVELOPMENT`, `TEST`, `STREAMLIT_CLOUD`, or `UNKNOWN`)
+- `BRAVE_SEARCH_API_KEY`
+- `BRAVE_SEARCH_ENDPOINT`
+- `BRAVE_SEARCH_MAX_RESULTS`
+- `BRAVE_MAX_QUERIES_PER_PACKAGE`
+- `BRAVE_MAX_QUERIES_PER_SLOT`
 
 Arithmetic, ratios, formulas, hashes, database writes, package integrity, citation checks, and score thresholds remain deterministic. With `OPENAI_REQUIRED=true`, analysis and narrative generation stop safely until the configured model passes an explicit OpenAI preflight check. OpenAI requests use the Responses API at `/v1/responses`, with no web or external tools, and only selected locked-package evidence.
 
@@ -293,7 +304,7 @@ Or from any current directory:
 & "C:\path\to\cutler-equity-research-blueprint\scripts\run_app.ps1"
 ```
 
-Direct page navigation is supported for the primary workflow and the Advanced Workbench pages. If you open the Research or Result page directly without an active package, the app offers a persisted package or analysis selection instead of crashing.
+Direct page navigation is supported for the primary workflow and the Advanced Workbench pages. If you open Package Assembly, Research, or Result directly without an active package, the app offers a persisted package or analysis selection instead of crashing.
 
 ## Known Limitations
 

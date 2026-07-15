@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import secrets
+import shutil
 import sqlite3
 import uuid
 from contextlib import contextmanager
@@ -11,6 +12,7 @@ from pathlib import Path
 from typing import Any, Iterator
 from urllib.parse import parse_qsl, quote, unquote, urlencode, urlparse, urlunparse
 
+from app import config
 from app.config import DATABASE_PATH, ensure_directories
 
 logger = logging.getLogger(__name__)
@@ -49,6 +51,7 @@ def get_connection(db_path: Path | str = DATABASE_PATH) -> Iterator[sqlite3.Conn
 def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
     """Create and safely upgrade the application database schema."""
     ensure_directories()
+    _backup_before_phase6a_migration(db_path)
     with get_connection(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -85,6 +88,33 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase3_official_ir_schema(connection)
         _create_phase4_final_schema(connection)
         _create_phase5_memo_schema(connection)
+        _create_phase51_stabilization_schema(connection)
+        _create_phase6a_recipe_schema(connection)
+
+
+def _backup_before_phase6a_migration(db_path: Path | str) -> Path | None:
+    """Back up the configured development database once before the Phase 6A migration."""
+    path = Path(db_path).resolve()
+    configured = Path(DATABASE_PATH).resolve()
+    if path != configured or config.DATABASE_ENVIRONMENT != "DEVELOPMENT" or not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(path) as probe:
+            exists = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='package_recipes'"
+            ).fetchone()
+        if exists:
+            return None
+    except sqlite3.Error:
+        pass
+    backup_dir = config.MIGRATION_BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    recent = sorted(backup_dir.glob("cutler_research_pre_phase6a_*.db"), key=lambda item: item.stat().st_mtime)
+    if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
+        return recent[-1]
+    destination = backup_dir / f"cutler_research_pre_phase6a_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
+    shutil.copy2(path, destination)
+    return destination
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -1329,6 +1359,371 @@ def _create_phase5_memo_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_memo_audits_analysis ON memo_quality_audits(analysis_run_id, created_at)",
     ):
         connection.execute(sql)
+
+
+def _create_phase51_stabilization_schema(connection: sqlite3.Connection) -> None:
+    """Add recommendation-resume, safe usage, and IR approval audit records."""
+    ir_columns = _table_columns(connection, "ir_material_candidates")
+    for column, definition in {
+        "analyst_approved": "INTEGER NOT NULL DEFAULT 0",
+        "approval_timestamp": "TEXT",
+        "original_confidence": "TEXT",
+        "final_download_result": "TEXT",
+    }.items():
+        if column not in ir_columns:
+            connection.execute(f"ALTER TABLE ir_material_candidates ADD COLUMN {column} {definition}")
+    exclusion_patterns = (
+        "%new account%", "%new_account%", "%account application%", "%account_application%",
+        "%credit application%", "%credit_application%", "%customer application%", "%customer_application%",
+        "%customer form%", "%customer_form%", "%vendor form%", "%vendor_form%",
+        "%supplier form%", "%supplier_form%", "%employment application%", "%employment_application%",
+        "%w-9%", "%w_9%", "%banking instructions%", "%banking_instructions%",
+        "%order form%", "%order_form%",
+    )
+    candidate_text = "LOWER(COALESCE(title, '') || ' ' || COALESCE(source_url, ''))"
+    matches = " OR ".join(f"{candidate_text} LIKE ?" for _ in exclusion_patterns)
+    connection.execute(
+        f"""
+        UPDATE ir_material_candidates
+        SET download_status = 'NON_INVESTOR_MATERIAL',
+            category = 'Non-Investor Material',
+            selected = 0,
+            rejection_reason = 'Excluded non-investor material signal found during Phase 5.1 relevance migration.'
+        WHERE {matches}
+        """,
+        exclusion_patterns,
+    )
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            analysis_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            model TEXT,
+            endpoint TEXT,
+            original_evidence_count INTEGER NOT NULL DEFAULT 0,
+            eligible_candidate_count INTEGER NOT NULL DEFAULT 0,
+            supporting_candidate_count INTEGER NOT NULL DEFAULT 0,
+            risk_candidate_count INTEGER NOT NULL DEFAULT 0,
+            metric_count INTEGER NOT NULL DEFAULT 0,
+            conflict_count INTEGER NOT NULL DEFAULT 0,
+            openai_call_count INTEGER NOT NULL DEFAULT 0,
+            failure_category TEXT,
+            diagnostics_json TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS narrative_candidates (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id TEXT NOT NULL,
+            candidate_id TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            candidate_fingerprint TEXT NOT NULL,
+            candidate_kind TEXT,
+            claim_family TEXT,
+            eligible INTEGER NOT NULL DEFAULT 0,
+            selected INTEGER NOT NULL DEFAULT 0,
+            exclusion_reason TEXT,
+            rank_score REAL NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            UNIQUE(attempt_id, evidence_id)
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS recommendation_stage_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            attempt_id TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL,
+            stage_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            detail_json TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS openai_usage_ledger (
+            usage_id TEXT PRIMARY KEY,
+            analysis_run_id TEXT,
+            processing_run_id TEXT,
+            workflow_run_id TEXT,
+            attempt_id TEXT,
+            pipeline_stage TEXT NOT NULL,
+            attempt_number INTEGER NOT NULL,
+            model TEXT NOT NULL,
+            endpoint TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            cached_input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            estimated_cost_usd REAL NOT NULL DEFAULT 0,
+            output_status TEXT,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_attempts_analysis ON recommendation_attempts(analysis_run_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_narrative_candidates_attempt ON narrative_candidates(attempt_id, selected)",
+        "CREATE INDEX IF NOT EXISTS idx_recommendation_stage_attempt ON recommendation_stage_events(attempt_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_openai_usage_analysis ON openai_usage_ledger(analysis_run_id, pipeline_stage)",
+    ):
+        connection.execute(sql)
+
+
+def _create_phase6a_recipe_schema(connection: sqlite3.Connection) -> None:
+    """Create the additive Phase 6A recipe and package-assembly schema."""
+    package_columns = _table_columns(connection, "packages")
+    for column, definition in {
+        "compilation_date": "TEXT",
+        "compiled_by": "TEXT",
+        "source_legacy_package_id": "TEXT",
+    }.items():
+        if column not in package_columns:
+            connection.execute(f"ALTER TABLE packages ADD COLUMN {column} {definition}")
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS schema_metadata (
+            schema_key TEXT PRIMARY KEY,
+            schema_value TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS recipe_imports (
+            import_id TEXT PRIMARY KEY,
+            workbook_filename TEXT NOT NULL,
+            workbook_sha256 TEXT NOT NULL,
+            available_sheets_json TEXT NOT NULL,
+            selected_sheets_json TEXT NOT NULL,
+            importer_version TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            imported_by TEXT NOT NULL,
+            import_report_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS package_recipes (
+            recipe_id TEXT PRIMARY KEY,
+            recipe_name TEXT NOT NULL,
+            recipe_type TEXT NOT NULL,
+            security_type TEXT NOT NULL,
+            version INTEGER NOT NULL,
+            description TEXT,
+            source_workbook_name TEXT NOT NULL,
+            source_workbook_hash TEXT NOT NULL,
+            source_sheet TEXT NOT NULL,
+            importer_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            superseded_at TEXT,
+            superseded_by_recipe_id TEXT,
+            notes TEXT,
+            import_id TEXT,
+            UNIQUE(recipe_name, version),
+            FOREIGN KEY (import_id) REFERENCES recipe_imports(import_id)
+        );
+        CREATE TABLE IF NOT EXISTS recipe_import_rows (
+            import_row_id TEXT PRIMARY KEY,
+            import_id TEXT NOT NULL,
+            recipe_id TEXT,
+            sheet_name TEXT NOT NULL,
+            row_number INTEGER NOT NULL,
+            source_coordinates_json TEXT NOT NULL,
+            raw_values_json TEXT NOT NULL,
+            normalized_values_json TEXT,
+            warnings_json TEXT,
+            include_in_recipe INTEGER NOT NULL DEFAULT 0,
+            FOREIGN KEY (import_id) REFERENCES recipe_imports(import_id),
+            FOREIGN KEY (recipe_id) REFERENCES package_recipes(recipe_id)
+        );
+        CREATE TABLE IF NOT EXISTS research_slots (
+            slot_id TEXT PRIMARY KEY,
+            recipe_id TEXT NOT NULL,
+            order_number INTEGER,
+            suborder INTEGER NOT NULL DEFAULT 0,
+            display_name TEXT NOT NULL,
+            normalized_slot_type TEXT NOT NULL,
+            section_code TEXT NOT NULL,
+            section_name TEXT NOT NULL,
+            required_level TEXT NOT NULL,
+            long_applicable INTEGER,
+            short_applicable INTEGER,
+            conditional_rule TEXT,
+            preferred_sources_json TEXT NOT NULL,
+            fallback_sources_json TEXT NOT NULL,
+            instructions TEXT,
+            minimum_documents INTEGER NOT NULL DEFAULT 1,
+            maximum_documents INTEGER NOT NULL DEFAULT 1,
+            freshness_rule TEXT,
+            anchor_rule TEXT,
+            allowed_document_types_json TEXT NOT NULL,
+            expected_output_format TEXT,
+            auto_search_enabled INTEGER NOT NULL DEFAULT 0,
+            manual_upload_allowed INTEGER NOT NULL DEFAULT 1,
+            analyst_review_required INTEGER NOT NULL DEFAULT 1,
+            default_status TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            source_sheet TEXT NOT NULL,
+            source_row INTEGER NOT NULL,
+            source_coordinates_json TEXT NOT NULL,
+            raw_import_json TEXT NOT NULL,
+            import_warning TEXT,
+            created_at TEXT NOT NULL,
+            FOREIGN KEY (recipe_id) REFERENCES package_recipes(recipe_id)
+        );
+        CREATE TABLE IF NOT EXISTS recipe_approvals (
+            approval_id TEXT PRIMARY KEY,
+            recipe_id TEXT NOT NULL,
+            approver TEXT NOT NULL,
+            approved_at TEXT NOT NULL,
+            workbook_sha256 TEXT NOT NULL,
+            recipe_version INTEGER NOT NULL,
+            normalized_recipe_snapshot_json TEXT NOT NULL,
+            FOREIGN KEY (recipe_id) REFERENCES package_recipes(recipe_id)
+        );
+        CREATE TABLE IF NOT EXISTS package_recipe_instances (
+            package_recipe_instance_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL UNIQUE,
+            recipe_id TEXT NOT NULL,
+            recipe_version INTEGER NOT NULL,
+            recipe_snapshot_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            status TEXT NOT NULL,
+            locked_at TEXT,
+            locked_by TEXT,
+            FOREIGN KEY (package_id) REFERENCES packages(package_id),
+            FOREIGN KEY (recipe_id) REFERENCES package_recipes(recipe_id)
+        );
+        CREATE TABLE IF NOT EXISTS package_slot_instances (
+            package_slot_instance_id TEXT PRIMARY KEY,
+            package_recipe_instance_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            slot_id TEXT NOT NULL,
+            order_number INTEGER,
+            suborder INTEGER NOT NULL DEFAULT 0,
+            display_name_snapshot TEXT NOT NULL,
+            section_snapshot TEXT NOT NULL,
+            requirement_snapshot TEXT NOT NULL,
+            instructions_snapshot TEXT,
+            preferred_sources_snapshot_json TEXT NOT NULL,
+            minimum_documents INTEGER NOT NULL,
+            maximum_documents INTEGER NOT NULL,
+            applicability_status TEXT NOT NULL,
+            completion_status TEXT NOT NULL,
+            analyst_acknowledged INTEGER NOT NULL DEFAULT 0,
+            analyst_notes TEXT,
+            selected_document_count INTEGER NOT NULL DEFAULT 0,
+            latest_selected_document_date TEXT,
+            cap_override_approved INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY (package_recipe_instance_id) REFERENCES package_recipe_instances(package_recipe_instance_id),
+            FOREIGN KEY (package_id) REFERENCES packages(package_id),
+            FOREIGN KEY (slot_id) REFERENCES research_slots(slot_id)
+        );
+        CREATE TABLE IF NOT EXISTS slot_document_assignments (
+            assignment_id TEXT PRIMARY KEY,
+            package_slot_instance_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            document_id TEXT NOT NULL,
+            assignment_source TEXT NOT NULL,
+            suggested_slot_id TEXT,
+            final_slot_id TEXT,
+            suggestion_confidence REAL,
+            suggestion_reason TEXT,
+            matched_tokens_json TEXT NOT NULL DEFAULT '[]',
+            assignment_status TEXT NOT NULL,
+            selected_for_package INTEGER NOT NULL DEFAULT 0,
+            highlighted_research INTEGER NOT NULL DEFAULT 0,
+            display_order INTEGER NOT NULL DEFAULT 0,
+            analyst_notes TEXT,
+            assigned_at TEXT NOT NULL,
+            assigned_by TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT,
+            replaced_assignment_id TEXT,
+            FOREIGN KEY (package_slot_instance_id) REFERENCES package_slot_instances(package_slot_instance_id),
+            FOREIGN KEY (package_id) REFERENCES packages(package_id),
+            FOREIGN KEY (document_id) REFERENCES documents(document_id)
+        );
+        CREATE TABLE IF NOT EXISTS recipe_corrections (
+            correction_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT,
+            document_id TEXT,
+            correction_type TEXT NOT NULL,
+            original_value TEXT,
+            corrected_value TEXT,
+            reason TEXT NOT NULL,
+            corrected_at TEXT NOT NULL,
+            corrected_by TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS phase6a_audit_events (
+            event_id TEXT PRIMARY KEY,
+            package_id TEXT,
+            recipe_id TEXT,
+            package_slot_instance_id TEXT,
+            document_id TEXT,
+            event_type TEXT NOT NULL,
+            event_details_json TEXT NOT NULL,
+            actor TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS package_snapshot_imports (
+            snapshot_import_id TEXT PRIMARY KEY,
+            source_package_id TEXT NOT NULL,
+            new_package_id TEXT NOT NULL,
+            snapshot_sha256 TEXT NOT NULL,
+            imported_at TEXT NOT NULL,
+            imported_by TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_recipe_status ON package_recipes(status, security_type);
+        CREATE INDEX IF NOT EXISTS idx_slots_recipe_order ON research_slots(recipe_id, order_number, suborder);
+        CREATE INDEX IF NOT EXISTS idx_slot_instances_package ON package_slot_instances(package_id, order_number, suborder);
+        CREATE INDEX IF NOT EXISTS idx_assignments_slot ON slot_document_assignments(package_slot_instance_id, assignment_status);
+        CREATE INDEX IF NOT EXISTS idx_assignments_package ON slot_document_assignments(package_id, selected_for_package);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_active_slot_document_assignment
+        ON slot_document_assignments(package_slot_instance_id, document_id)
+        WHERE assignment_status NOT IN ('REJECTED', 'REPLACED', 'REMOVED');
+        CREATE TRIGGER IF NOT EXISTS immutable_approved_recipe_slots_update
+        BEFORE UPDATE ON research_slots
+        WHEN (SELECT status FROM package_recipes WHERE recipe_id = OLD.recipe_id)
+             IN ('APPROVED', 'ACTIVE', 'SUPERSEDED', 'ARCHIVED')
+        BEGIN
+            SELECT RAISE(ABORT, 'Approved recipe slots are immutable');
+        END;
+        CREATE TRIGGER IF NOT EXISTS immutable_approved_recipe_slots_delete
+        BEFORE DELETE ON research_slots
+        WHEN (SELECT status FROM package_recipes WHERE recipe_id = OLD.recipe_id)
+             IN ('APPROVED', 'ACTIVE', 'SUPERSEDED', 'ARCHIVED')
+        BEGIN
+            SELECT RAISE(ABORT, 'Approved recipe slots are immutable');
+        END;
+        """
+    )
+    connection.execute(
+        """
+        INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
+        VALUES ('database_schema_version', '6A.0', ?)
+        ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at
+        """,
+        (utc_now_iso(),),
+    )
 
 
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -4098,7 +4493,10 @@ def list_ir_material_candidates(package_id: str, *, db_path: Path | str = DATABA
 
 
 def update_ir_material_candidate(candidate_id: str, updates: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any] | None:
-    allowed = {"selected", "download_status", "rejection_reason", "confidence", "category"}
+    allowed = {
+        "selected", "download_status", "rejection_reason", "confidence", "category",
+        "analyst_approved", "approval_timestamp", "original_confidence", "final_download_result",
+    }
     selected = {key: value for key, value in updates.items() if key in allowed}
     initialize_database(db_path)
     with get_connection(db_path) as connection:
@@ -4107,6 +4505,93 @@ def update_ir_material_candidate(candidate_id: str, updates: dict[str, Any], *, 
             connection.execute(f"UPDATE ir_material_candidates SET {sql} WHERE candidate_id = ?", (*selected.values(), candidate_id))
         row = connection.execute("SELECT * FROM ir_material_candidates WHERE candidate_id = ?", (candidate_id,)).fetchone()
     return row_to_dict(row)
+
+
+def create_recommendation_attempt(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("recommendation_attempts", record, db_path=db_path)
+
+
+def update_recommendation_attempt(
+    attempt_id: str, updates: dict[str, Any], *, db_path: Path | str = DATABASE_PATH
+) -> dict[str, Any] | None:
+    allowed = {
+        "status", "model", "endpoint", "original_evidence_count", "eligible_candidate_count",
+        "supporting_candidate_count", "risk_candidate_count", "metric_count", "conflict_count",
+        "openai_call_count", "failure_category", "diagnostics_json", "completed_at",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        if selected:
+            sql = ", ".join(f"{key} = ?" for key in selected)
+            connection.execute(f"UPDATE recommendation_attempts SET {sql} WHERE attempt_id = ?", (*selected.values(), attempt_id))
+        row = connection.execute("SELECT * FROM recommendation_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def list_recommendation_attempts(
+    analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM recommendation_attempts WHERE analysis_run_id = ? ORDER BY created_at DESC",
+            (analysis_run_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_narrative_candidate(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("narrative_candidates", record, db_path=db_path)
+
+
+def list_narrative_candidates(attempt_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM narrative_candidates WHERE attempt_id = ? ORDER BY selected DESC, rank_score DESC, candidate_id",
+            (attempt_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_recommendation_stage_event(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("recommendation_stage_events", record, db_path=db_path)
+
+
+def list_recommendation_stage_events(attempt_id: str, *, db_path: Path | str = DATABASE_PATH) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM recommendation_stage_events WHERE attempt_id = ? ORDER BY id", (attempt_id,)
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_openai_usage_record(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("openai_usage_ledger", record, db_path=db_path)
+
+
+def list_openai_usage(
+    *, analysis_run_id: str | None = None, processing_run_id: str | None = None,
+    db_path: Path | str = DATABASE_PATH,
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    clauses: list[str] = []
+    values: list[Any] = []
+    if analysis_run_id:
+        clauses.append("analysis_run_id = ?")
+        values.append(analysis_run_id)
+    if processing_run_id:
+        clauses.append("processing_run_id = ?")
+        values.append(processing_run_id)
+    sql = "SELECT * FROM openai_usage_ledger"
+    if clauses:
+        sql += " WHERE " + " AND ".join(clauses)
+    sql += " ORDER BY created_at"
+    with get_connection(db_path) as connection:
+        rows = connection.execute(sql, tuple(values)).fetchall()
+    return [dict(row) for row in rows]
 
 
 def create_workflow_stage_performance(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:

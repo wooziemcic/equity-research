@@ -291,6 +291,7 @@ def generate_recommendation(
     db_path: str | None = None,
 ) -> dict[str, Any]:
     db_target = db_path or config.DATABASE_PATH
+    model_narrative_supplied = narrative is not None
     if config.OPENAI_REQUIRED and narrative is None:
         raise ValueError("OpenAI is required for recommendation narrative generation.")
     coverage = evidence_coverage(evidence)
@@ -317,10 +318,10 @@ def generate_recommendation(
         rating = config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED
         abstention_reason = "Unresolved conflicts exceed the configured threshold."
     elif reference_price is None and not price_targets:
-        rating = config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+        rating = config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED if model_narrative_supplied else config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
         abstention_reason = "No package-contained valuation evidence or reference price is available."
     elif reference_price is None:
-        rating = config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
+        rating = config.RECOMMENDATION_ANALYST_REVIEW_REQUIRED if model_narrative_supplied else config.RECOMMENDATION_INSUFFICIENT_EVIDENCE
         abstention_reason = "No package-contained reference price is available for upside/downside."
     elif score >= config.BUY_SCORE_THRESHOLD and upside is not None and upside >= config.MIN_BUY_UPSIDE:
         rating = config.RECOMMENDATION_BUY

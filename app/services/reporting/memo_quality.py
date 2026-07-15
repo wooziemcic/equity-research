@@ -287,6 +287,12 @@ def synthesize_memo(
                 client=client,
                 max_output_tokens=config.MEMO_MAX_OUTPUT_TOKENS,
                 pipeline_stage="investment_memo_synthesis",
+                usage_context={
+                    "analysis_run_id": analysis_run_id,
+                    "processing_run_id": run["processing_run_id"],
+                    "attempt_id": attempt_id,
+                },
+                db_path=str(db_path),
             )
             draft = result.parsed
             endpoint = result.endpoint

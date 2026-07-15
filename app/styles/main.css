@@ -914,3 +914,260 @@ hr {
         font-size: 2.3rem;
     }
 }
+
+/* Phase 6A package assembly */
+.assembly-header {
+    align-items: flex-end;
+    border-bottom: 1px solid var(--border);
+    display: flex;
+    gap: 1rem;
+    justify-content: space-between;
+    padding-bottom: 0.85rem;
+}
+
+.assembly-header h1 {
+    font-size: 2rem;
+    line-height: 1.15;
+    margin: 0;
+}
+
+.assembly-ticker {
+    color: var(--cutler-red);
+    font-size: 1.05rem;
+    font-weight: 850;
+    margin-top: 0.25rem;
+}
+
+.assembly-status {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    color: var(--text);
+    font-size: 0.76rem;
+    font-weight: 800;
+    padding: 0.42rem 0.62rem;
+    text-transform: uppercase;
+}
+
+.assembly-meta {
+    border-bottom: 1px solid var(--border);
+    display: grid;
+    gap: 0;
+    grid-template-columns: repeat(4, minmax(0, 1fr));
+    margin-bottom: 1rem;
+}
+
+.assembly-meta div {
+    border-right: 1px solid var(--border);
+    border-top: 1px solid var(--border);
+    min-width: 0;
+    padding: 0.65rem 0.75rem;
+}
+
+.assembly-meta div:nth-child(4n) {
+    border-right: 0;
+}
+
+.assembly-meta span,
+.assembly-meta strong {
+    display: block;
+    overflow-wrap: anywhere;
+}
+
+.assembly-meta span {
+    color: var(--muted-2);
+    font-size: 0.7rem;
+    font-weight: 750;
+    text-transform: uppercase;
+}
+
+.assembly-meta strong {
+    color: var(--text);
+    font-size: 0.84rem;
+    margin-top: 0.16rem;
+}
+
+.guidance-panel {
+    align-items: center;
+    background: var(--panel);
+    border-left: 3px solid var(--blue);
+    display: flex;
+    gap: 1rem;
+    margin: 0.8rem 0 0.35rem;
+    padding: 0.8rem 1rem;
+}
+
+.guidance-panel strong {
+    color: var(--text);
+    flex: 0 0 auto;
+    font-size: 0.82rem;
+}
+
+.guidance-panel span {
+    color: var(--muted);
+    font-size: 0.86rem;
+}
+
+.assembly-table-wrap {
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    margin: 1rem 0;
+    max-width: 100%;
+    overflow-x: auto;
+}
+
+.assembly-table {
+    border-collapse: separate;
+    border-spacing: 0;
+    font-size: 0.72rem;
+    table-layout: fixed;
+    width: 100%;
+}
+
+.assembly-table th,
+.assembly-table td {
+    border-bottom: 1px solid var(--border);
+    border-right: 1px solid var(--border);
+    color: var(--muted);
+    line-height: 1.25;
+    overflow-wrap: anywhere;
+    padding: 0.48rem 0.42rem;
+    text-align: left;
+    vertical-align: top;
+}
+
+.assembly-table thead th {
+    background: #171c21;
+    color: var(--text);
+    font-size: 0.67rem;
+    position: sticky;
+    text-transform: uppercase;
+    top: 0;
+    z-index: 2;
+}
+
+.assembly-table th:nth-child(1),
+.assembly-table td:nth-child(1) {
+    width: 5%;
+}
+
+.assembly-table th:nth-child(2),
+.assembly-table td:nth-child(2) {
+    color: var(--text);
+    font-weight: 750;
+    width: 18%;
+}
+
+.assembly-table th:nth-child(3),
+.assembly-table td:nth-child(3) { width: 9%; }
+.assembly-table th:nth-child(4),
+.assembly-table td:nth-child(4) { width: 10%; }
+.assembly-table th:nth-child(5),
+.assembly-table td:nth-child(5) { width: 12%; }
+.assembly-table th:nth-child(6),
+.assembly-table td:nth-child(6) { width: 16%; }
+.assembly-table th:nth-child(7),
+.assembly-table td:nth-child(7) { width: 8%; }
+.assembly-table th:nth-child(8),
+.assembly-table td:nth-child(8) { width: 13%; }
+.assembly-table th:nth-child(9),
+.assembly-table td:nth-child(9) { width: 9%; }
+
+.assembly-section-row th {
+    background: #242a30;
+    color: #e2c071;
+    font-size: 0.72rem;
+    padding: 0.52rem 0.58rem;
+    text-transform: uppercase;
+}
+
+.status-cell {
+    font-weight: 850;
+}
+
+.status-cell.complete { color: #73c594; }
+.status-cell.needs-analyst-review,
+.status-cell.partial,
+.status-cell.stale { color: #e2bd65; }
+.status-cell.missing,
+.status-cell.failed { color: #ed7b7b; }
+.status-cell.not-applicable { color: #969da4; }
+.status-cell.manual-upload-required { color: #83b9e7; }
+.status-cell.not-available { color: #b5a995; }
+
+.assembly-mobile {
+    display: none;
+}
+
+@media (max-width: 760px) {
+    .assembly-header {
+        align-items: flex-start;
+        flex-direction: column;
+    }
+
+    .assembly-meta {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+    }
+
+    .assembly-meta div,
+    .assembly-meta div:nth-child(4n) {
+        border-right: 1px solid var(--border);
+    }
+
+    .assembly-meta div:nth-child(2n) {
+        border-right: 0;
+    }
+
+    .guidance-panel {
+        align-items: flex-start;
+        flex-direction: column;
+        gap: 0.35rem;
+    }
+
+    .assembly-table-wrap {
+        display: none;
+    }
+
+    .assembly-mobile {
+        display: grid;
+        gap: 0.55rem;
+        margin: 0.8rem 0 1rem;
+    }
+
+    .assembly-slot-card {
+        background: var(--panel);
+        border: 1px solid var(--border);
+        border-radius: 6px;
+        padding: 0.75rem;
+    }
+
+    .slot-card-top {
+        align-items: flex-start;
+        display: flex;
+        gap: 0.6rem;
+        justify-content: space-between;
+    }
+
+    .slot-card-top strong {
+        color: var(--text);
+        font-size: 0.88rem;
+    }
+
+    .slot-card-top span {
+        flex: 0 0 auto;
+        font-size: 0.68rem;
+    }
+
+    .slot-card-meta,
+    .assembly-slot-card small {
+        color: var(--muted-2);
+        display: block;
+        font-size: 0.72rem;
+        margin-top: 0.4rem;
+    }
+
+    .assembly-slot-card > div:not(.slot-card-top):not(.slot-card-meta) {
+        color: var(--muted);
+        font-size: 0.8rem;
+        margin-top: 0.45rem;
+    }
+}

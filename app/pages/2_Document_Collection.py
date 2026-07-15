@@ -29,6 +29,7 @@ from app.services.company_resolver import resolve_package_company
 from app.services.document_download_service import DocumentDownloadError, create_public_documents_zip, get_document_download
 from app.services.official_ir_service import (
     BraveSearchProvider,
+    approve_and_download_ir_material,
     discover_official_ir_materials,
     download_official_ir_materials,
     resolve_official_company_website,
@@ -50,6 +51,14 @@ from app.utils import database
 from app.utils.database import DatabaseError
 
 logger = logging.getLogger(__name__)
+
+
+def _safe_page_link(page: str, label: str) -> None:
+    """Render navigation without allowing page registration to crash collection."""
+    try:
+        st.page_link(page, label=label)
+    except (StreamlitPageNotFoundError, KeyError, ValueError):
+        st.markdown(f'<a href="#add-downloaded-files">{label}</a>', unsafe_allow_html=True)
 
 
 def _load_active_package() -> dict | None:
@@ -376,6 +385,17 @@ def _official_ir_collection(package: dict) -> None:
 
     materials = database.list_ir_material_candidates(package["package_id"])
     if materials:
+        rejected_statuses = {"NON_INVESTOR_MATERIAL", "MIME_MISMATCH", "BLOCKED_DOMAIN", "DUPLICATE"}
+        rejected_materials = [item for item in materials if item.get("download_status") in rejected_statuses]
+        materials = [item for item in materials if item.get("download_status") not in rejected_statuses]
+        if not materials:
+            with st.expander("IR discovery exclusions (Audit Details)", expanded=False):
+                st.dataframe(
+                    [{"Title": item.get("title"), "Status": item.get("download_status"), "Reason": item.get("rejection_reason")} for item in rejected_materials],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+            return
         category_counts = Counter(item.get("category") or "Unclassified" for item in materials)
         st.caption(" · ".join(f"{category}: {count}" for category, count in sorted(category_counts.items())))
         rows = [
@@ -402,7 +422,10 @@ def _official_ir_collection(package: dict) -> None:
                 f"{summary['duplicate']} duplicates, {summary['excluded']} excluded, {summary['failed']} failed."
             )
             st.rerun()
-        manual_review = [item for item in materials if item.get("download_status") == "NEEDS_MANUAL_REVIEW"]
+        manual_review = [
+            item for item in materials
+            if item.get("download_status") in {"NEEDS_MANUAL_REVIEW", "NEEDS_JS_MANUAL_REVIEW", "NEEDS_DATE_REVIEW", "DATE_REVIEW_REQUIRED"}
+        ]
         for item in manual_review:
             with st.expander(item.get("title") or "Official material requiring manual review"):
                 st.write(item.get("category") or "Official company material")
@@ -411,7 +434,22 @@ def _official_ir_collection(package: dict) -> None:
                     or "The official page uses JavaScript-loaded content that the static collector could not safely download."
                 )
                 st.link_button("Open Official Page", item["source_url"])
-                _safe_page_link("pages/2_Document_Collection.py", "Add Downloaded Files")
+                if str(item.get("file_extension") or "").lower() == ".pdf":
+                    if st.button("Approve And Download", type="primary", key=f"approve_ir_{item['candidate_id']}"):
+                        try:
+                            result = approve_and_download_ir_material(refreshed, item["candidate_id"])
+                            st.success(f"IR material result: {result['final_download_result']}.")
+                            st.rerun()
+                        except Exception as exc:
+                            st.error(f"Approved file could not be downloaded safely: {exc}")
+                _safe_page_link("pages/2_Document_Collection.py", "Upload Downloaded File")
+        if rejected_materials:
+            with st.expander("IR discovery exclusions (Audit Details)", expanded=False):
+                st.dataframe(
+                    [{"Title": item.get("title"), "Status": item.get("download_status"), "Reason": item.get("rejection_reason")} for item in rejected_materials],
+                    hide_index=True,
+                    use_container_width=True,
+                )
 
 
 def _ir_collection(package: dict) -> None:
@@ -472,6 +510,7 @@ def _ir_collection(package: dict) -> None:
 
 
 def _licensed_uploads(package: dict) -> None:
+    st.markdown('<span id="add-downloaded-files"></span>', unsafe_allow_html=True)
     st.subheader("Additional Research")
     files = st.file_uploader(
         "Upload authorized files",

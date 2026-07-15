@@ -442,6 +442,11 @@ def create_analysis_run(
                 conflicts=conflicts,
                 db_path=str(db_path),
                 with_endpoint=True,
+                analysis_run_id=run_id,
+                scorecard_result={
+                    "weighted_score": round(sum(float(row.get("weighted_score") or 0) for row in scorecard), 4),
+                    "pillar_count": len(scorecard),
+                },
             )
             if not isinstance(ai_review_result, StructuredParseResult):
                 raise RuntimeError("OpenAI narrative endpoint metadata was unavailable.")
@@ -598,3 +603,191 @@ def analysis_summary(analysis_run_id: str, *, db_path: Path | str = config.DATAB
         "decision": database.get_recommendation_decision(analysis_run_id, db_path=db_path),
         "reports": database.list_generated_reports(analysis_run_id, db_path=db_path),
     }
+
+
+def _recommendation_stage(
+    attempt_id: str,
+    analysis_run_id: str,
+    stage_name: str,
+    status: str,
+    *,
+    db_path: Path | str,
+    detail: dict[str, Any] | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> None:
+    database.create_recommendation_stage_event(
+        {
+            "attempt_id": attempt_id, "analysis_run_id": analysis_run_id,
+            "stage_name": stage_name, "status": status,
+            "detail_json": json.dumps(detail or {}, sort_keys=True), "created_at": database.utc_now_iso(),
+        },
+        db_path=db_path,
+    )
+    if progress_callback:
+        progress_callback(stage_name, status)
+
+
+def retry_recommendation_generation(
+    analysis_run_id: str,
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+    client: Any | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """Resume only narrative, recommendation, memo, and report stages on stored artifacts."""
+    from app.services.reporting.investment_report import generate_investment_report
+
+    run = database.get_analysis_run(analysis_run_id, db_path=db_path)
+    if not run:
+        raise ValueError("The failed analysis run does not exist.")
+    version = database.get_package_version(run["version_id"], db_path=db_path)
+    processing = database.get_processing_run(run["processing_run_id"], db_path=db_path)
+    if not version or version.get("status") != config.VERSION_STATUS_LOCKED:
+        raise ValueError("Recommendation retry requires the original locked package version.")
+    if not processing or processing.get("status") not in {
+        config.PROCESSING_STATUS_COMPLETED, config.PROCESSING_STATUS_COMPLETED_WITH_WARNINGS,
+    }:
+        raise ValueError("Recommendation retry requires the original completed processing run.")
+    evidence = database.list_evidence_records(
+        run["processing_run_id"], version_id=run["version_id"], db_path=db_path,
+    )
+    metrics = database.list_analysis_metrics(analysis_run_id, db_path=db_path)
+    scorecard = database.list_scorecard_items(analysis_run_id, db_path=db_path)
+    conflicts = database.list_claim_conflicts(run["processing_run_id"], db_path=db_path)
+    if not evidence or not metrics or not scorecard:
+        raise ValueError("Recommendation retry cannot rebuild missing evidence, metrics, or scorecard artifacts.")
+
+    attempt_id = f"RECAT-{secrets.token_hex(8).upper()}"
+    original_diagnostics = {}
+    try:
+        original_diagnostics = json.loads(run.get("openai_diagnostics_json") or "{}")
+    except json.JSONDecodeError:
+        original_diagnostics = {}
+    database.create_recommendation_attempt(
+        {
+            "attempt_id": attempt_id, "analysis_run_id": analysis_run_id,
+            "version_id": run["version_id"], "processing_run_id": run["processing_run_id"],
+            "status": "RUNNING", "model": config.OPENAI_MODEL, "endpoint": None,
+            "original_evidence_count": len(evidence), "eligible_candidate_count": 0,
+            "supporting_candidate_count": 0, "risk_candidate_count": 0,
+            "metric_count": len(metrics), "conflict_count": len(conflicts), "openai_call_count": 0,
+            "failure_category": None,
+            "diagnostics_json": json.dumps({"previous_failure": original_diagnostics}, sort_keys=True),
+            "created_at": database.utc_now_iso(), "completed_at": None,
+        },
+        db_path=db_path,
+    )
+    try:
+        _recommendation_stage(attempt_id, analysis_run_id, "Narrative candidates selected", "Running", db_path=db_path, progress_callback=progress_callback)
+        result = run_closed_corpus_ai_review(
+            version=version, processing_run_id=run["processing_run_id"], evidence=evidence,
+            metrics=metrics, conflicts=conflicts, db_path=str(db_path), client=client,
+            with_endpoint=True, analysis_run_id=analysis_run_id, attempt_id=attempt_id,
+            scorecard_result={
+                "weighted_score": round(sum(float(row.get("weighted_score") or 0) for row in scorecard), 4),
+                "pillar_count": len(scorecard),
+            },
+        )
+        if not isinstance(result, StructuredParseResult):
+            raise RuntimeError("OpenAI recommendation endpoint metadata was unavailable.")
+        details = result.diagnostics or {}
+        _recommendation_stage(
+            attempt_id, analysis_run_id, "Narrative candidates selected", "Completed", db_path=db_path,
+            detail={key: details.get(key) for key in (
+                "original_evidence_count", "eligible_candidate_count", "selected_supporting_count",
+                "selected_risk_count", "metric_count", "conflict_count",
+            )}, progress_callback=progress_callback,
+        )
+        _recommendation_stage(attempt_id, analysis_run_id, "Thesis and risks generated", "Completed", db_path=db_path, progress_callback=progress_callback)
+        _recommendation_stage(attempt_id, analysis_run_id, "Thesis output validated", "Completed", db_path=db_path, progress_callback=progress_callback)
+        thesis_items = generate_thesis_items(
+            analysis_run_id, evidence=evidence, ai_review=result.parsed, db_path=str(db_path),
+        )
+        _recommendation_stage(attempt_id, analysis_run_id, "Recommendation generated", "Completed", db_path=db_path, progress_callback=progress_callback)
+        narrative = result.parsed.recommendation.model_dump()
+        decision = generate_recommendation(
+            analysis_run_id, evidence=evidence, metrics=metrics, scorecard_items=scorecard,
+            conflicts=conflicts, narrative=narrative, db_path=str(db_path),
+        )
+        _recommendation_stage(attempt_id, analysis_run_id, "Recommendation output validated", "Completed", db_path=db_path, progress_callback=progress_callback)
+        database.update_analysis_run(
+            analysis_run_id,
+            {
+                "status": config.ANALYSIS_STATUS_NEEDS_ANALYST_REVIEW,
+                "preliminary_recommendation": decision["preliminary_rating"],
+                "confidence": decision["confidence"], "evidence_coverage": evidence_coverage(evidence),
+                "error_message": None, "ai_review_status": config.AI_REVIEW_STATUS_COMPLETED,
+                "ai_endpoint": result.endpoint,
+                "openai_diagnostics_json": json.dumps(
+                    {"pipeline_stage": "recommendation_completed", "safe_attempt": details, "attempt_id": attempt_id},
+                    sort_keys=True,
+                ),
+            },
+            db_path=db_path,
+        )
+        _recommendation_stage(attempt_id, analysis_run_id, "Memo generated", "Running", db_path=db_path, progress_callback=progress_callback)
+        report = generate_investment_report(analysis_run_id, final=False, client=client, db_path=db_path)
+        _recommendation_stage(attempt_id, analysis_run_id, "Memo generated", "Completed", db_path=db_path, progress_callback=progress_callback)
+        _recommendation_stage(attempt_id, analysis_run_id, "Memo QA completed", "Completed", db_path=db_path, progress_callback=progress_callback)
+        _recommendation_stage(
+            attempt_id, analysis_run_id, "PDF and DOCX created", "Completed", db_path=db_path,
+            detail={"report_id": report.get("report_id")}, progress_callback=progress_callback,
+        )
+        database.update_recommendation_attempt(
+            attempt_id,
+            {
+                "status": "COMPLETED", "endpoint": result.endpoint,
+                "eligible_candidate_count": details.get("eligible_candidate_count", 0),
+                "supporting_candidate_count": details.get("selected_supporting_count", 0),
+                "risk_candidate_count": details.get("selected_risk_count", 0),
+                "metric_count": details.get("metric_count", len(metrics)),
+                "conflict_count": details.get("conflict_count", len(conflicts)),
+                "openai_call_count": details.get("openai_call_count", 2),
+                "diagnostics_json": json.dumps(details, sort_keys=True),
+                "completed_at": database.utc_now_iso(),
+            },
+            db_path=db_path,
+        )
+        _record_event(
+            version, "RECOMMENDATION_RETRY_COMPLETED",
+            {"analysis_run_id": analysis_run_id, "attempt_id": attempt_id, "processing_run_id": run["processing_run_id"], "report_id": report.get("report_id")},
+            db_path=db_path,
+        )
+        return {
+            "attempt_id": attempt_id, "analysis_run_id": analysis_run_id,
+            "processing_run_id": run["processing_run_id"], "metrics_reused": len(metrics),
+            "evidence_reused": len(evidence), "report": report, "decision": decision,
+            "candidate_diagnostics": details, "thesis_items": len(thesis_items),
+        }
+    except Exception as exc:
+        code = exc.code if isinstance(exc, OpenAIProviderError) else "RECOMMENDATION_RETRY_FAILED"
+        safe = exc.safe_message if isinstance(exc, OpenAIProviderError) else safe_error_message(exc)
+        provider = exc.diagnostics.to_dict() if isinstance(exc, OpenAIProviderError) and exc.diagnostics else {}
+        database.update_recommendation_attempt(
+            attempt_id,
+            {
+                "status": "FAILED", "failure_category": code,
+                "diagnostics_json": json.dumps({"safe_failure_category": code, "provider": provider}, sort_keys=True),
+                "completed_at": database.utc_now_iso(),
+            },
+            db_path=db_path,
+        )
+        database.update_analysis_run(
+            analysis_run_id,
+            {
+                "status": config.ANALYSIS_STATUS_FAILED, "ai_review_status": code,
+                "openai_diagnostics_json": json.dumps(provider, sort_keys=True) if provider else None,
+                "error_message": json.dumps({"failed_stage": "Generating recommendation", "safe_error_message": safe, "provider_code": code, "metric_diagnostics": metric_stage_diagnostics(evidence, analysis_run_id=analysis_run_id, processing_run_id=run["processing_run_id"], metrics=metrics)}, sort_keys=True),
+            },
+            db_path=db_path,
+        )
+        _recommendation_stage(
+            attempt_id, analysis_run_id, "Recommendation generation", "Failed", db_path=db_path,
+            detail={"safe_failure_category": code}, progress_callback=progress_callback,
+        )
+        _record_event(
+            version, "RECOMMENDATION_RETRY_FAILED",
+            {"analysis_run_id": analysis_run_id, "attempt_id": attempt_id, "processing_run_id": run["processing_run_id"], "safe_failure_category": code},
+            db_path=db_path,
+        )
+        raise AnalysisPipelineError(safe, analysis_run_id=analysis_run_id, diagnostics={"provider_code": code, "openai": provider}) from exc

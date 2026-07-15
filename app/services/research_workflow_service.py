@@ -13,7 +13,13 @@ from typing import Any, Callable
 import requests
 
 from app import config
-from app.services.analysis_pipeline import AnalysisPipelineError, create_analysis_run, load_analysis_diagnostics
+from app.services.analysis_pipeline import (
+    AnalysisPipelineError,
+    create_analysis_run,
+    load_analysis_diagnostics,
+    retry_recommendation_generation,
+    safe_error_message,
+)
 from app.services.checklist_service import coverage_summary, ensure_package_checklist
 from app.services.collectors.sec_collector import download_selected_filings, preview_filings
 from app.services.company_resolver import ResolutionResult, resolve_ticker_metadata
@@ -808,6 +814,75 @@ def workflow_requires_stabilization_retry(
         if diagnostics.get("extraction") is None:
             return True
     return False
+
+
+def recommendation_retry_available(workflow: dict[str, Any] | None) -> bool:
+    if not workflow or not workflow.get("analysis_run_id") or not workflow.get("processing_run_id"):
+        return False
+    statuses = _load_stage_statuses(workflow)
+    return (
+        statuses.get("Calculating metrics") in {TIMELINE_COMPLETED, TIMELINE_WARNINGS}
+        and statuses.get("Generating recommendation") == TIMELINE_FAILED
+    )
+
+
+def retry_recommendation_workflow(
+    workflow_run_id: str,
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+    client: Any | None = None,
+    progress_callback: Callable[[str, str], None] | None = None,
+) -> dict[str, Any]:
+    """Resume a failed recommendation without invoking build, processing, extraction, or metrics."""
+    workflow = database.get_research_workflow_run(workflow_run_id, db_path=db_path)
+    if not recommendation_retry_available(workflow):
+        raise ValueError("This workflow is not eligible for a recommendation-only retry.")
+    assert workflow is not None
+    statuses = _load_stage_statuses(workflow)
+    statuses["Generating recommendation"] = TIMELINE_RUNNING
+    statuses["Creating report"] = TIMELINE_WAITING
+    database.update_research_workflow_run(
+        workflow_run_id,
+        {
+            "status": config.WORKFLOW_STATUS_RUNNING, "current_step": "Generating recommendation",
+            "stage_statuses_json": json.dumps(statuses, sort_keys=True), "errors_json": "[]",
+            "error_message": None, "completed_at": None,
+        },
+        db_path=db_path,
+    )
+    try:
+        result = retry_recommendation_generation(
+            workflow["analysis_run_id"], db_path=db_path, client=client, progress_callback=progress_callback,
+        )
+    except Exception as exc:
+        statuses["Generating recommendation"] = TIMELINE_FAILED
+        statuses["Creating report"] = TIMELINE_WAITING
+        database.update_research_workflow_run(
+            workflow_run_id,
+            {
+                "status": config.WORKFLOW_STATUS_FAILED, "current_step": "Generating recommendation",
+                "stage_statuses_json": json.dumps(statuses, sort_keys=True),
+                "errors_json": json.dumps([safe_error_message(exc)]), "error_message": safe_error_message(exc),
+                "completed_at": database.utc_now_iso(),
+            },
+            db_path=db_path,
+        )
+        raise
+    statuses["Generating recommendation"] = TIMELINE_COMPLETED
+    statuses["Creating report"] = TIMELINE_COMPLETED
+    report = result["report"]
+    return database.update_research_workflow_run(
+        workflow_run_id,
+        {
+            "status": config.WORKFLOW_STATUS_COMPLETED, "current_step": "Completed",
+            "analysis_run_id": workflow["analysis_run_id"],
+            "processing_run_id": workflow["processing_run_id"], "version_id": workflow["version_id"],
+            "report_id": report.get("report_id"), "stage_statuses_json": json.dumps(statuses, sort_keys=True),
+            "warnings_json": "[]", "errors_json": "[]", "error_message": None,
+            "completed_at": database.utc_now_iso(),
+        },
+        db_path=db_path,
+    ) or workflow
 
 
 def reconcile_failed_workflow(

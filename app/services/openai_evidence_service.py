@@ -261,6 +261,9 @@ def run_openai_evidence_extraction(
                 client=client,
                 max_output_tokens=config.OPENAI_EXTRACTION_MAX_OUTPUT_TOKENS,
                 pipeline_stage="evidence_extraction",
+                attempt_number=batch_number,
+                usage_context={"processing_run_id": processing_run_id},
+                db_path=str(db_path),
             )
         except Exception:
             for _, chunk in batch:

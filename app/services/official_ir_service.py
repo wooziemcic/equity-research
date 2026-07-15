@@ -6,7 +6,7 @@ import mimetypes
 import re
 import secrets
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from html.parser import HTMLParser
 from pathlib import Path
@@ -42,6 +42,18 @@ CATEGORY_RULES = (
     ("Annual Report", ("annual report",)),
     ("Official Transcript", ("transcript",)),
     ("Investor Presentation", ("investor presentation", "corporate presentation", "presentation")),
+)
+INVESTOR_POSITIVE_SIGNALS = (
+    "earnings", "quarterly results", "annual results", "financial results", "investor relations", "investor presentation",
+    "earnings presentation", "annual report", "financial supplement", "investor day", "guidance",
+    "transcript", "shareholder", "sustainability", "esg report", "acquisition presentation",
+    "transaction presentation", "10 k", "10 q", "financial statements",
+)
+INVESTOR_EXCLUSION_SIGNALS = (
+    "new account", "account application", "credit application", "customer application", "customer form",
+    "vendor form", "supplier form", "employment application", "w 9", "tax form", "banking instructions",
+    "privacy policy", "terms and conditions", "login", "registration form", "marketing brochure",
+    "product catalogue", "sales form", "order form",
 )
 
 
@@ -588,12 +600,49 @@ def parse_feed(base_url: str, xml_text: str) -> list[tuple[str, str]]:
     return rows
 
 
-def classify_ir_material(title: str, url: str) -> tuple[str, str]:
-    haystack = re.sub(r"[^a-z0-9]+", " ", unquote(f"{title} {url}").lower())
+def investor_relevance(title: str, url: str, *, context: str = "", document_text: str = "") -> tuple[bool, str]:
+    haystack = re.sub(r"[^a-z0-9]+", " ", unquote(f"{title} {url} {context} {document_text[:12000]}").lower())
+    exclusion = next((term for term in INVESTOR_EXCLUSION_SIGNALS if term in haystack), None)
+    if exclusion:
+        return False, f"Excluded non-investor material signal: {exclusion}."
+    positive = next((term for term in INVESTOR_POSITIVE_SIGNALS if term in haystack), None)
+    if not positive:
+        return False, "No strong investor-relevance signal was found."
+    domain = _domain(url)
+    if domain.startswith(("go.", "marketing.", "info.")) and not positive:
+        return False, "Marketing subdomains require strong investor-document evidence."
+    return True, f"Investor-relevance signal: {positive}."
+
+
+def classify_ir_material(title: str, url: str, *, context: str = "", document_text: str = "") -> tuple[str, str]:
+    relevant, _ = investor_relevance(title, url, context=context, document_text=document_text)
+    if not relevant:
+        return "Non-Investor Material", "NONE"
+    haystack = re.sub(r"[^a-z0-9]+", " ", unquote(f"{title} {url} {context} {document_text[:12000]}").lower())
     for category, terms in CATEGORY_RULES:
         if any(term in haystack for term in terms):
             return category, "HIGH"
-    return "Official Company Material", "LOW"
+    if "10 k" in haystack or "10 q" in haystack or "financial statements" in haystack:
+        return "Financial Statements", "HIGH"
+    if "guidance" in haystack or "shareholder" in haystack:
+        return "Investor Update", "HIGH"
+    return "Investor Material", "MEDIUM"
+
+
+def _bounded_prefix_bytes(response: Any, limit: int = 262_144) -> bytes:
+    if hasattr(response, "iter_content"):
+        chunks: list[bytes] = []
+        total = 0
+        for chunk in response.iter_content(chunk_size=16_384):
+            if not chunk:
+                continue
+            remaining = limit - total
+            chunks.append(bytes(chunk[:remaining]))
+            total += min(len(chunk), remaining)
+            if total >= limit:
+                break
+        return b"".join(chunks)
+    return bytes(getattr(response, "content", b"") or b"")[:limit]
 
 
 def _date_from_text(text: str) -> str:
@@ -664,7 +713,23 @@ def discover_official_ir_materials(
         extension = Path(urlparse(url).path).suffix.lower()
         if "pdf" in content_type or extension in {".pdf", ".ppt", ".pptx"}:
             title = Path(urlparse(url).path).name or "Official material"
-            material = _material(package, title, url, url, method, content_type, company_domain)
+            prefix = _bounded_prefix_bytes(response)
+            relevant, relevance_reason = investor_relevance(title, url, document_text=prefix.decode("latin-1", errors="ignore"))
+            if extension == ".pdf" and ("html" in content_type or not prefix.startswith(b"%PDF")):
+                material = _rejected_material(
+                    package, title, url, url, method, content_type, candidate_domain,
+                    "MIME_MISMATCH", "A .pdf URL did not return validated PDF content.",
+                )
+            elif not relevant:
+                material = _rejected_material(
+                    package, title, url, url, method, content_type, candidate_domain,
+                    "NON_INVESTOR_MATERIAL", relevance_reason,
+                )
+            else:
+                material = _material(
+                    package, title, url, url, method, content_type, candidate_domain,
+                    context=relevance_reason, document_text=prefix.decode("latin-1", errors="ignore"),
+                )
             materials[material.canonical_url] = material
             continue
         try:
@@ -679,10 +744,7 @@ def discover_official_ir_materials(
                 queue.append((child, "sitemap"))
             for child, title in feed_rows:
                 category, confidence = classify_ir_material(title, child)
-                if confidence != "LOW":
-                    material = _material(package, title, child, url, "feed", mimetypes.guess_type(child)[0] or "text/html", company_domain)
-                    materials[material.canonical_url] = material
-                else:
+                if confidence != "NONE":
                     queue.append((child, "feed"))
             continue
         parser = HtmlMetadataParser()
@@ -706,13 +768,33 @@ def discover_official_ir_materials(
             category, confidence = classify_ir_material(title, child)
             child_ext = Path(urlparse(child).path).suffix.lower()
             is_file = child_ext in {".pdf", ".ppt", ".pptx"}
-            is_relevant_html = confidence != "LOW" and child_ext in {"", ".htm", ".html", ".xhtml"}
-            if (is_file or is_relevant_html) and ir_domain_allowed(company_domain, child_domain, directly_linked=True):
-                material = _material(package, title or Path(urlparse(child).path).name, child, page_canonical, "html_link", mimetypes.guess_type(child)[0] or "text/html", child_domain)
+            is_relevant_html = confidence != "NONE" and child_ext in {"", ".htm", ".html", ".xhtml"}
+            relevant, relevance_reason = investor_relevance(title, child, context=text[:4000])
+            if is_file and not relevant:
+                material = _rejected_material(
+                    package, title or Path(urlparse(child).path).name, child, page_canonical, "html_link",
+                    mimetypes.guess_type(child)[0] or "application/octet-stream", child_domain,
+                    "NON_INVESTOR_MATERIAL", relevance_reason,
+                )
                 materials[material.canonical_url] = material
+            elif (is_file or is_relevant_html) and relevant and ir_domain_allowed(company_domain, child_domain, directly_linked=True):
+                if is_file and len(visited) >= config.IR_MAX_PAGES:
+                    pending = _material(
+                        package, title or Path(urlparse(child).path).name, child, page_canonical,
+                        "html_link", mimetypes.guess_type(child)[0] or "application/octet-stream", child_domain,
+                        context=text[:4000],
+                    )
+                    pending = replace(
+                        pending, cutoff_eligibility="NEEDS_DATE_REVIEW", download_status="NEEDS_MANUAL_REVIEW",
+                        selected=False,
+                        rejection_reason="The crawl limit was reached before MIME and signature inspection; analyst approval still runs full validation.",
+                    )
+                    materials[pending.canonical_url] = pending
+                else:
+                    queue.appendleft((child, "classified_file" if is_file else "classified_link"))
                 if not ir_url:
                     ir_url = f"https://{child_domain}"
-            elif confidence != "LOW" and child not in visited:
+            elif confidence != "NONE" and child not in visited:
                 queue.appendleft((child, "classified_link"))
         script_shell = any(marker in text.lower() for marker in ("evergreen.q4api", "__next_data__", "window.__data__", "id=\"__next\""))
         if script_shell and method in {"ir_link", "classified_link", "analyst_confirmed"} and len(materials) == material_count_before:
@@ -727,9 +809,8 @@ def discover_official_ir_materials(
         for endpoint in extract_q4_public_endpoints(url, text, company_domain=company_domain):
             category, confidence = classify_ir_material("", endpoint)
             extension = Path(urlparse(endpoint).path).suffix.lower()
-            if confidence != "LOW" and extension in {".pdf", ".ppt", ".pptx"}:
-                material = _material(package, Path(urlparse(endpoint).path).name, endpoint, page_canonical, "q4_public_endpoint", mimetypes.guess_type(endpoint)[0] or "application/octet-stream", _domain(endpoint))
-                materials[material.canonical_url] = material
+            if confidence != "NONE" and extension in {".pdf", ".ppt", ".pptx"}:
+                queue.appendleft((endpoint, "q4_public_endpoint"))
             elif len(visited) + len(queue) < config.IR_MAX_PAGES * 2:
                 queue.append((endpoint, "q4_public_endpoint"))
         for child in _json_ld_urls(url, parser.json_ld):
@@ -737,9 +818,8 @@ def discover_official_ir_materials(
             if not ir_domain_allowed(company_domain, child_domain, directly_linked=child_domain in linked_domains):
                 continue
             category, confidence = classify_ir_material("", child)
-            if confidence != "LOW":
-                material = _material(package, Path(urlparse(child).path).name, child, page_canonical, "json_ld", mimetypes.guess_type(child)[0] or "text/html", child_domain)
-                materials[material.canonical_url] = material
+            if confidence != "NONE":
+                queue.appendleft((child, "json_ld"))
             elif len(visited) + len(queue) < config.IR_MAX_PAGES * 2:
                 queue.append((child, "json_ld"))
         if method == "homepage":
@@ -751,8 +831,8 @@ def discover_official_ir_materials(
             materials[manual.canonical_url] = manual
     for material in materials.values():
         _store_material(package["package_id"], run_id, material, db_path=db_path)
-    needs_review = sum(item.confidence == "LOW" or item.download_status in {"NEEDS_MANUAL_REVIEW", "DATE_REVIEW_REQUIRED"} for item in materials.values())
-    review_only = bool(materials) and all(item.confidence == "LOW" or item.download_status in {"NEEDS_MANUAL_REVIEW", "DATE_REVIEW_REQUIRED"} for item in materials.values())
+    needs_review = sum(item.download_status in {"NEEDS_MANUAL_REVIEW", "NEEDS_JS_MANUAL_REVIEW", "NEEDS_DATE_REVIEW", "DATE_REVIEW_REQUIRED"} for item in materials.values())
+    review_only = bool(materials) and all(item.download_status in {"NEEDS_MANUAL_REVIEW", "NEEDS_JS_MANUAL_REVIEW", "NEEDS_DATE_REVIEW", "DATE_REVIEW_REQUIRED", "NON_INVESTOR_MATERIAL", "MIME_MISMATCH"} for item in materials.values())
     status = "NEEDS_MANUAL_REVIEW" if warnings and (not materials or review_only) else "COMPLETED_WITH_WARNINGS" if warnings or errors else "COMPLETED"
     completed = database.utc_now_iso()
     duration = max(0.0, (datetime.fromisoformat(completed) - datetime.fromisoformat(started)).total_seconds())
@@ -769,11 +849,14 @@ def discover_official_ir_materials(
     return {"run_id": run_id, "status": status, "pages_crawled": len(visited), "materials": list(materials.values()), "warnings": warnings, "errors": errors, "ir_url": ir_url}
 
 
-def _material(package: dict[str, Any], title: str, url: str, discovery_page: str, method: str, mime_type: str, domain: str) -> OfficialIrMaterial:
-    category, confidence = classify_ir_material(title, url)
+def _material(
+    package: dict[str, Any], title: str, url: str, discovery_page: str, method: str,
+    mime_type: str, domain: str, *, context: str = "", document_text: str = "",
+) -> OfficialIrMaterial:
+    category, confidence = classify_ir_material(title, url, context=context, document_text=document_text)
     apparent = _date_from_text(f"{title} {url}")
     eligible = bool(apparent) and window_from_package(package).contains(apparent)
-    status = "DISCOVERED" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "DATE_REVIEW_REQUIRED"
+    status = "INVESTOR_RELEVANT" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "NEEDS_DATE_REVIEW"
     reason = "" if eligible else "Publication date is outside the selected research time window." if apparent else "Publication date could not be verified automatically."
     return OfficialIrMaterial(
         title=title or "Official company material", source_url=url, canonical_url=canonicalize_url(url),
@@ -781,7 +864,7 @@ def _material(package: dict[str, Any], title: str, url: str, discovery_page: str
         mime_type=mime_type.split(";", 1)[0] or "application/octet-stream",
         file_extension=Path(urlparse(url).path).suffix.lower() or (".html" if "html" in mime_type else ""),
         discovery_page=discovery_page, discovery_method=method, confidence=confidence,
-        cutoff_eligibility="ELIGIBLE" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "DATE_REVIEW_REQUIRED",
+        cutoff_eligibility="ELIGIBLE" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "NEEDS_DATE_REVIEW",
         download_status=status,
         selected=eligible and confidence == "HIGH",
         rejection_reason=reason,
@@ -794,7 +877,7 @@ def _manual_review_material(package: dict[str, Any], url: str, discovery_page: s
         source_url=url,
         canonical_url=canonicalize_url(url),
         official_domain=domain,
-        category="Official Company Material",
+        category="Investor Relations Page",
         publication_date="",
         document_date="",
         mime_type="text/html",
@@ -802,10 +885,25 @@ def _manual_review_material(package: dict[str, Any], url: str, discovery_page: s
         discovery_page=discovery_page,
         discovery_method="javascript_manual_review",
         confidence="LOW",
-        cutoff_eligibility="DATE_REVIEW_REQUIRED",
-        download_status="NEEDS_MANUAL_REVIEW",
+        cutoff_eligibility="NEEDS_DATE_REVIEW",
+        download_status="NEEDS_JS_MANUAL_REVIEW",
         selected=False,
         rejection_reason="The official page is JavaScript-loaded and no safe public static material endpoint was available.",
+    )
+
+
+def _rejected_material(
+    package: dict[str, Any], title: str, url: str, discovery_page: str, method: str,
+    mime_type: str, domain: str, status: str, reason: str,
+) -> OfficialIrMaterial:
+    del package
+    return OfficialIrMaterial(
+        title=title or "Rejected corporate material", source_url=url, canonical_url=canonicalize_url(url),
+        official_domain=domain, category="Non-Investor Material", publication_date="", document_date="",
+        mime_type=mime_type.split(";", 1)[0] or "application/octet-stream",
+        file_extension=Path(urlparse(url).path).suffix.lower(), discovery_page=discovery_page,
+        discovery_method=method, confidence="NONE", cutoff_eligibility=status,
+        download_status=status, selected=False, rejection_reason=reason,
     )
 
 
@@ -856,6 +954,8 @@ def download_official_ir_materials(
             content = response_bytes_with_limit(response, max_bytes=config.MAX_DOWNLOAD_BYTES)
             content_type = str(response.headers.get("Content-Type", item.get("mime_type") or "")).lower()
             extension = str(item.get("file_extension") or Path(urlparse(item["source_url"]).path).suffix or (".html" if "html" in content_type else ""))
+            if extension == ".pdf" and "pdf" not in content_type and "octet-stream" not in content_type:
+                raise HttpClientError("Official PDF failed MIME validation.")
             if extension == ".pdf" and not content.startswith(b"%PDF"):
                 raise HttpClientError("Official PDF failed signature validation.")
             if extension in {".html", ".htm", ".xhtml", ""} and "html" not in content_type and b"<html" not in content[:512].lower():
@@ -902,6 +1002,60 @@ def download_official_ir_materials(
                 db_path=db_path,
             )
     return summary
+
+
+def approve_and_download_ir_material(
+    package: dict[str, Any], candidate_id: str, *, analyst_identity: str = "analyst",
+    session: requests.Session | None = None, db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    """Approve a likely investor PDF while retaining every normal download security check."""
+    del analyst_identity  # Identity is intentionally not expanded into a new user directory in Phase 5.1.
+    candidate = next(
+        (row for row in database.list_ir_material_candidates(package["package_id"], db_path=db_path) if row["candidate_id"] == candidate_id),
+        None,
+    )
+    if not candidate:
+        raise ValueError("The selected IR candidate does not exist in this package.")
+    extension = str(candidate.get("file_extension") or Path(urlparse(candidate["source_url"]).path).suffix).lower()
+    if extension != ".pdf":
+        raise ValueError("Approve And Download is available only for a direct PDF file.")
+    validation = validate_public_http_url(candidate["source_url"])
+    if not validation.is_valid:
+        raise ValueError("The selected IR candidate is not a safe public URL.")
+    relevant, reason = investor_relevance(candidate.get("title") or "", candidate["source_url"])
+    if not relevant or candidate.get("download_status") in {"NON_INVESTOR_MATERIAL", "MIME_MISMATCH", "BLOCKED_DOMAIN"}:
+        raise ValueError(reason or "The selected file is not investor-relevant.")
+    source_domain = _domain(candidate["source_url"])
+    company_domain = str(package.get("official_website_domain") or package.get("official_ir_domain") or candidate.get("official_domain") or "")
+    domain_related = bool(company_domain) and (
+        _root_domain(company_domain) == _root_domain(source_domain)
+        or _q4_endpoint_allowed(company_domain, candidate["source_url"])
+    )
+    if not domain_related:
+        database.update_ir_material_candidate(
+            candidate_id, {"download_status": "BLOCKED_DOMAIN", "rejection_reason": "The source domain is not related to the verified official domain."}, db_path=db_path,
+        )
+        raise ValueError("The source domain is not related to the verified official domain.")
+    approved_at = database.utc_now_iso()
+    database.update_ir_material_candidate(
+        candidate_id,
+        {
+            "analyst_approved": 1, "approval_timestamp": approved_at,
+            "original_confidence": candidate.get("original_confidence") or candidate.get("confidence"),
+        },
+        db_path=db_path,
+    )
+    approved = dict(candidate)
+    approved.update({"cutoff_eligibility": "ELIGIBLE", "selected": 1, "analyst_approved": 1})
+    summary = download_official_ir_materials(package, [approved], session=session, db_path=db_path)
+    result = (
+        "DOWNLOADED_NOW" if summary["downloaded_now"] else "ALREADY_COLLECTED" if summary["already_collected"]
+        else "DUPLICATE" if summary["duplicate"] else "FAILED"
+    )
+    database.update_ir_material_candidate(
+        candidate_id, {"final_download_result": result, "download_status": result}, db_path=db_path,
+    )
+    return {"candidate_id": candidate_id, "approval_timestamp": approved_at, "final_download_result": result, **summary}
 
 
 def _set_ir_candidate_status(
@@ -974,12 +1128,14 @@ def resolve_and_collect_official_ir_materials(
         status = str(item.get("download_status") or "")
         reason = str(item.get("rejection_reason") or "")
         selected = False
-        if status == "NEEDS_MANUAL_REVIEW" or item.get("confidence") != "HIGH":
+        if status in {"NON_INVESTOR_MATERIAL", "MIME_MISMATCH", "BLOCKED_DOMAIN", "DUPLICATE"}:
+            pass
+        elif status in {"NEEDS_MANUAL_REVIEW", "NEEDS_JS_MANUAL_REVIEW"}:
             status = "NEEDS_MANUAL_REVIEW"
             reason = reason or "The material requires analyst review before download."
             status_counts["needs_manual_review"] += 1
-        elif item.get("cutoff_eligibility") == "DATE_REVIEW_REQUIRED" or not item.get("publication_date"):
-            status = "DATE_REVIEW_REQUIRED"
+        elif item.get("cutoff_eligibility") in {"DATE_REVIEW_REQUIRED", "NEEDS_DATE_REVIEW"} or not item.get("publication_date"):
+            status = "DATE_REVIEW_REQUIRED" if item.get("cutoff_eligibility") == "DATE_REVIEW_REQUIRED" else "NEEDS_DATE_REVIEW"
             reason = reason or "Publication date could not be verified automatically."
             status_counts["date_review_required"] += 1
         elif item.get("cutoff_eligibility") != "ELIGIBLE":
@@ -991,7 +1147,7 @@ def resolve_and_collect_official_ir_materials(
             reason = "The material category was not selected in the workspace."
             status_counts["not_selected"] += 1
         else:
-            status = "DISCOVERED"
+            status = "DISCOVERED" if item.get("download_status") == "DISCOVERED" else "INVESTOR_RELEVANT"
             selected = True
             downloadable.append(item)
         database.update_ir_material_candidate(

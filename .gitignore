@@ -14,3 +14,7 @@ data/database/
 
 .env
 .streamlit/secrets.toml
+
+# Local recipe sources may contain licensed or confidential material.
+reference/*.xlsx
+reference/MDT Equity Research Package/

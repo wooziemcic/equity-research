@@ -32,17 +32,19 @@ def render_sidebar() -> None:
 
         st.markdown('<div class="sidebar-section-title">Primary Workflow</div>', unsafe_allow_html=True)
         _safe_page_link("Home.py", "Search")
-        _safe_page_link("pages/0_Research_Workspace.py", "Research")
+        _safe_page_link("pages/8_Package_Assembly.py", "Package Assembly")
         _safe_page_link("pages/6_Investment_Result.py", "Result")
 
         st.markdown('<div class="sidebar-section-title">Secondary</div>', unsafe_allow_html=True)
         _safe_page_link("pages/7_Research_History.py", "Dashboard / History")
         with st.expander("Advanced Workbench", expanded=False):
             _safe_page_link("pages/1_New_Research_Package.py", "Package Setup")
+            _safe_page_link("pages/0_Research_Workspace.py", "Automated Research")
             _safe_page_link("pages/2_Document_Collection.py", "Public Collection / Uploads")
             _safe_page_link("pages/3_Package_Review.py", "Package Review")
             _safe_page_link("pages/4_Investment_Analysis.py", "Evidence And Analysis Review")
             _safe_page_link("pages/5_Generated_Reports.py", "Generated Reports")
+            _safe_page_link("pages/9_Recipe_Administration.py", "Recipe Administration")
 
         st.markdown('<div class="sidebar-section-title">Current Package</div>', unsafe_allow_html=True)
         package = st.session_state.get("active_package")

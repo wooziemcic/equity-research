@@ -25,6 +25,8 @@ from app.services.research_workflow_service import (
     package_coverage_summary,
     planned_collection_preview,
     reconcile_failed_workflow,
+    recommendation_retry_available,
+    retry_recommendation_workflow,
     run_research_workflow,
     start_automated_collection,
     update_research_settings,
@@ -565,7 +567,21 @@ def _proceed(package: dict[str, Any]) -> None:
         if errors:
             st.error("; ".join(str(error) for error in errors))
         _metric_diagnostics_expander(workflow)
-        if workflow_requires_stabilization_retry(workflow):
+        if recommendation_retry_available(workflow):
+            if st.button("Retry Recommendation Generation", type="primary", use_container_width=True):
+                try:
+                    with st.spinner("Reusing stored evidence and metrics to resume recommendation generation..."):
+                        retried = retry_recommendation_workflow(workflow["workflow_run_id"])
+                    st.session_state[config.SESSION_WORKFLOW_STATE] = retried
+                    st.session_state[config.SESSION_ACTIVE_VERSION_ID] = retried.get("version_id")
+                    st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = retried.get("processing_run_id")
+                    st.session_state[config.SESSION_ACTIVE_ANALYSIS_RUN_ID] = retried.get("analysis_run_id")
+                    st.session_state[config.SESSION_ACTIVE_REPORT_ID] = retried.get("report_id")
+                    st.rerun()
+                except Exception as exc:
+                    logger.exception("Recommendation-only retry failed")
+                    st.error(f"Recommendation retry failed: {exc}")
+        elif workflow_requires_stabilization_retry(workflow):
             if st.button("Retry From Failed Stage", type="primary", use_container_width=True):
                 try:
                     with st.spinner("Resuming the failed workflow stage..."):
@@ -602,7 +618,7 @@ def _proceed(package: dict[str, Any]) -> None:
                     st.error(f"Failed workflow reconciliation failed: {exc}")
 
     can_proceed = readiness.status in {config.READINESS_READY, config.READINESS_READY_WITH_WARNINGS}
-    if st.button("Build Package and Generate Analysis", type="primary", disabled=not can_proceed, use_container_width=True):
+    if st.button("Build Package And Generate Analysis", type="primary", disabled=not can_proceed, use_container_width=True):
         try:
             progress_bar = st.progress(0.0)
             stage_text = st.empty()
@@ -655,7 +671,13 @@ def _metric_diagnostics_expander(workflow: dict[str, Any]) -> None:
     diagnostics = payload.get("metric_diagnostics") if isinstance(payload, dict) else None
     if not isinstance(diagnostics, dict):
         return
-    with st.expander("Why metric calculation could not complete", expanded=workflow.get("status") == config.WORKFLOW_STATUS_FAILED):
+    failed_stage = str(workflow.get("current_step") or "")
+    heading = (
+        "Why recommendation generation could not complete"
+        if failed_stage == "Generating recommendation"
+        else "Why metric calculation could not complete"
+    )
+    with st.expander(heading, expanded=workflow.get("status") == config.WORKFLOW_STATUS_FAILED):
         if diagnostics.get("exception_type"):
             st.write(f"Exception type: `{diagnostics.get('exception_type')}`")
         if diagnostics.get("safe_error_message"):

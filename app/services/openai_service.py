@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import re
+import secrets
 import time
 from dataclasses import asdict, dataclass
 from typing import Any, Generic, TypeVar
@@ -23,6 +25,9 @@ OPENAI_RATE_LIMITED = "OPENAI_RATE_LIMITED"
 OPENAI_QUOTA_EXCEEDED = "OPENAI_QUOTA_EXCEEDED"
 OPENAI_MODEL_UNAVAILABLE = "OPENAI_MODEL_UNAVAILABLE"
 OPENAI_STRUCTURED_OUTPUT_INVALID = "OPENAI_STRUCTURED_OUTPUT_INVALID"
+OPENAI_OUTPUT_INCOMPLETE = "OPENAI_OUTPUT_INCOMPLETE"
+OPENAI_OUTPUT_REFUSED = "OPENAI_OUTPUT_REFUSED"
+OPENAI_OUTPUT_EMPTY = "OPENAI_OUTPUT_EMPTY"
 OPENAI_CONTEXT_LIMIT = "OPENAI_CONTEXT_LIMIT"
 OPENAI_REQUEST_FAILED = "OPENAI_REQUEST_FAILED"
 
@@ -40,9 +45,25 @@ class SafeOpenAIDiagnostics:
     endpoint: str
     model: str
     pipeline_stage: str
+    response_status: str | None = None
+    incomplete_reason: str | None = None
+    refusal_present: bool = False
+    output_parsed_available: bool = False
+    output_text_available: bool = False
+    output_tokens: int | None = None
+    validation_fields: tuple[str, ...] = ()
+    response_metadata_captured: bool = False
 
     def to_dict(self) -> dict[str, Any]:
-        return asdict(self)
+        values = asdict(self)
+        captured = values.pop("response_metadata_captured")
+        if not captured:
+            for key in (
+                "response_status", "incomplete_reason", "refusal_present", "output_parsed_available",
+                "output_text_available", "output_tokens", "validation_fields",
+            ):
+                values.pop(key)
+        return values
 
 
 class OpenAIProviderError(RuntimeError):
@@ -81,10 +102,10 @@ class ModelThesisItem(BaseModel):
 
 
 class RecommendationNarrative(BaseModel):
-    rationale: str
-    why_not_buy: str
-    why_not_hold: str
-    why_not_sell: str
+    rationale: str = ""
+    why_not_buy: str = ""
+    why_not_hold: str = ""
+    why_not_sell: str = ""
     abstention_reason: str | None = None
     evidence_ids: list[str] = Field(default_factory=list)
     citation_locators: list[str] = Field(default_factory=list)
@@ -95,6 +116,26 @@ class ClosedCorpusAIReview(BaseModel):
     thesis_items: list[ModelThesisItem] = Field(default_factory=list)
     conflict_explanations: list[ExtractedClaim] = Field(default_factory=list)
     recommendation: RecommendationNarrative
+
+
+class ThesisRiskItem(BaseModel):
+    candidate_id: str = Field(min_length=1, max_length=64)
+    concise_claim: str = Field(min_length=1, max_length=600)
+    confidence: str = Field(default="INSUFFICIENT", max_length=32)
+
+
+class ThesisRiskResponse(BaseModel):
+    supporting_items: list[ThesisRiskItem] = Field(default_factory=list, max_length=12)
+    risk_items: list[ThesisRiskItem] = Field(default_factory=list, max_length=12)
+    missing_information: list[str] = Field(default_factory=list, max_length=8)
+
+
+class RecommendationResponse(BaseModel):
+    recommendation_summary: str = Field(min_length=1, max_length=1200)
+    why_provisional: str = Field(default="", max_length=600)
+    primary_positive: str = Field(default="", max_length=600)
+    primary_risk: str = Field(default="", max_length=600)
+    abstention_reason: str = Field(default="", max_length=600)
 
 
 class _StructuredConnectivity(BaseModel):
@@ -108,6 +149,8 @@ T = TypeVar("T", bound=BaseModel)
 class StructuredParseResult(Generic[T]):
     parsed: T
     endpoint: str
+    diagnostics: dict[str, Any] | None = None
+    attempt_number: int = 1
 
 
 @dataclass(frozen=True)
@@ -249,7 +292,105 @@ def _safe_provider_error(
     )
 
 
+def _value(source: Any, name: str, default: Any = None) -> Any:
+    if isinstance(source, dict):
+        return source.get(name, default)
+    return getattr(source, name, default)
+
+
+def _usage_metadata(response: Any) -> dict[str, int]:
+    usage = _value(response, "usage", {}) or {}
+    details = _value(usage, "input_tokens_details", {}) or _value(usage, "prompt_tokens_details", {}) or {}
+    input_tokens = int(_value(usage, "input_tokens", _value(usage, "prompt_tokens", 0)) or 0)
+    output_tokens = int(_value(usage, "output_tokens", _value(usage, "completion_tokens", 0)) or 0)
+    return {
+        "input_tokens": input_tokens,
+        "cached_input_tokens": int(_value(details, "cached_tokens", 0) or 0),
+        "output_tokens": output_tokens,
+        "total_tokens": int(_value(usage, "total_tokens", input_tokens + output_tokens) or input_tokens + output_tokens),
+    }
+
+
+def _output_state(response: Any) -> dict[str, Any]:
+    status = str(_value(response, "status", "") or "") or None
+    incomplete = _value(response, "incomplete_details", {}) or {}
+    reason = str(_value(incomplete, "reason", "") or "") or None
+    parsed = _value(response, "output_parsed")
+    output_text = str(_value(response, "output_text", "") or "")
+    refusal = bool(_value(response, "refusal", None))
+    choices = _value(response, "choices", []) or []
+    if choices:
+        message = _value(choices[0], "message", {}) or {}
+        refusal = refusal or bool(_value(message, "refusal", None))
+        parsed = parsed or _value(message, "parsed")
+        output_text = output_text or str(_value(message, "content", "") or "")
+    return {
+        "response_status": status,
+        "incomplete_reason": reason,
+        "refusal_present": refusal,
+        "output_parsed_available": parsed is not None,
+        "output_text_available": bool(output_text.strip()),
+        "output_tokens": _usage_metadata(response)["output_tokens"],
+    }
+
+
+def _response_error(
+    code: str, message: str, *, response: Any, endpoint: str, stage: str,
+    validation_fields: tuple[str, ...] = (),
+) -> OpenAIProviderError:
+    state = _output_state(response)
+    return OpenAIProviderError(
+        code,
+        message,
+        diagnostics=SafeOpenAIDiagnostics(
+            provider_error_category=code, http_status=_value(response, "status_code", None), openai_error_code=None,
+            rejected_parameter=None, request_id=str(_value(response, "id", "") or "")[:160] or None,
+            endpoint=endpoint, model=config.OPENAI_MODEL, pipeline_stage=stage,
+            validation_fields=validation_fields, response_metadata_captured=True, **state,
+        ),
+    )
+
+
+def _record_usage(
+    response: Any, *, endpoint: str, pipeline_stage: str, attempt_number: int,
+    usage_context: dict[str, Any] | None, db_path: str | None,
+) -> None:
+    if not usage_context or not db_path:
+        return
+    from app.utils import database
+
+    usage = _usage_metadata(response)
+    pricing = config.OPENAI_MODEL_PRICING.get(config.OPENAI_MODEL, {})
+    uncached = max(0, usage["input_tokens"] - usage["cached_input_tokens"])
+    cost = (
+        uncached * float(pricing.get("input", 0))
+        + usage["cached_input_tokens"] * float(pricing.get("cached_input", 0))
+        + usage["output_tokens"] * float(pricing.get("output", 0))
+    ) / 1_000_000
+    state = _output_state(response)
+    database.create_openai_usage_record(
+        {
+            "usage_id": f"OAIU-{secrets.token_hex(8).upper()}",
+            "analysis_run_id": usage_context.get("analysis_run_id"),
+            "processing_run_id": usage_context.get("processing_run_id"),
+            "workflow_run_id": usage_context.get("workflow_run_id"),
+            "attempt_id": usage_context.get("attempt_id"),
+            "pipeline_stage": pipeline_stage, "attempt_number": attempt_number,
+            "model": config.OPENAI_MODEL, "endpoint": endpoint,
+            **usage, "estimated_cost_usd": round(cost, 8),
+            "output_status": state["response_status"] or ("PARSED" if state["output_parsed_available"] else "UNKNOWN"),
+            "created_at": database.utc_now_iso(),
+        },
+        db_path=db_path,
+    )
+
+
 def _parsed_response(response: Any, schema: type[T], *, endpoint: str, stage: str) -> T:
+    state = _output_state(response)
+    if state["refusal_present"]:
+        raise _response_error(OPENAI_OUTPUT_REFUSED, "OpenAI refused the structured-output request.", response=response, endpoint=endpoint, stage=stage)
+    if state["response_status"] == "incomplete" or state["incomplete_reason"]:
+        raise _response_error(OPENAI_OUTPUT_INCOMPLETE, "OpenAI returned an incomplete structured output.", response=response, endpoint=endpoint, stage=stage)
     parsed = getattr(response, "output_parsed", None)
     if endpoint == ENDPOINT_CHAT_COMPLETIONS:
         choices = getattr(response, "choices", [])
@@ -257,10 +398,19 @@ def _parsed_response(response: Any, schema: type[T], *, endpoint: str, stage: st
     if isinstance(parsed, schema):
         return parsed
     output_text = getattr(response, "output_text", "")
+    if endpoint == ENDPOINT_CHAT_COMPLETIONS and not output_text:
+        choices = getattr(response, "choices", [])
+        output_text = getattr(getattr(choices[0], "message", None), "content", "") if choices else ""
+    if not str(output_text or "").strip():
+        raise _response_error(OPENAI_OUTPUT_EMPTY, "OpenAI returned no structured output.", response=response, endpoint=endpoint, stage=stage)
     try:
         return schema.model_validate_json(output_text)
-    except Exception as exc:
-        raise _safe_provider_error(exc, endpoint=endpoint, pipeline_stage=stage) from exc
+    except ValidationError as exc:
+        fields = tuple(sorted({".".join(str(part) for part in error.get("loc", ()))[:120] for error in exc.errors()}))
+        raise _response_error(
+            OPENAI_STRUCTURED_OUTPUT_INVALID, "Structured output validation failed.", response=response,
+            endpoint=endpoint, stage=stage, validation_fields=fields,
+        ) from exc
 
 
 def _responses_request(
@@ -271,6 +421,9 @@ def _responses_request(
     schema: type[T],
     max_output_tokens: int,
     pipeline_stage: str,
+    attempt_number: int = 1,
+    usage_context: dict[str, Any] | None = None,
+    db_path: str | None = None,
 ) -> StructuredParseResult[T]:
     kwargs: dict[str, Any] = {
         "model": config.OPENAI_MODEL,
@@ -286,9 +439,11 @@ def _responses_request(
         kwargs["reasoning"] = {"effort": config.OPENAI_REASONING_EFFORT}
     try:
         response = client.responses.parse(**kwargs)
+        _record_usage(response, endpoint=ENDPOINT_RESPONSES, pipeline_stage=pipeline_stage, attempt_number=attempt_number, usage_context=usage_context, db_path=db_path)
         return StructuredParseResult(
             _parsed_response(response, schema, endpoint=ENDPOINT_RESPONSES, stage=pipeline_stage),
             ENDPOINT_RESPONSES,
+            attempt_number=attempt_number,
         )
     except OpenAIProviderError:
         raise
@@ -303,6 +458,9 @@ def _chat_completions_request(
     user_payload: dict[str, Any],
     schema: type[T],
     pipeline_stage: str,
+    attempt_number: int = 1,
+    usage_context: dict[str, Any] | None = None,
+    db_path: str | None = None,
 ) -> StructuredParseResult[T]:
     try:
         response = client.chat.completions.parse(
@@ -313,9 +471,11 @@ def _chat_completions_request(
             ],
             response_format=schema,
         )
+        _record_usage(response, endpoint=ENDPOINT_CHAT_COMPLETIONS, pipeline_stage=pipeline_stage, attempt_number=attempt_number, usage_context=usage_context, db_path=db_path)
         return StructuredParseResult(
             _parsed_response(response, schema, endpoint=ENDPOINT_CHAT_COMPLETIONS, stage=pipeline_stage),
             ENDPOINT_CHAT_COMPLETIONS,
+            attempt_number=attempt_number,
         )
     except OpenAIProviderError:
         raise
@@ -332,6 +492,9 @@ def structured_parse(
     max_output_tokens: int = 4000,
     api_mode: str | None = None,
     pipeline_stage: str = "structured_generation",
+    attempt_number: int = 1,
+    usage_context: dict[str, Any] | None = None,
+    db_path: str | None = None,
 ) -> StructuredParseResult[T]:
     """Parse Pydantic output through the configured OpenAI compatibility path."""
     active_client = client or _client()
@@ -343,6 +506,9 @@ def structured_parse(
             user_payload=user_payload,
             schema=schema,
             pipeline_stage=pipeline_stage,
+            attempt_number=attempt_number,
+            usage_context=usage_context,
+            db_path=db_path,
         )
     try:
         return _responses_request(
@@ -352,6 +518,9 @@ def structured_parse(
             schema=schema,
             max_output_tokens=max_output_tokens,
             pipeline_stage=pipeline_stage,
+            attempt_number=attempt_number,
+            usage_context=usage_context,
+            db_path=db_path,
         )
     except OpenAIProviderError as responses_error:
         if mode != "auto" or not responses_error.compatibility_failure:
@@ -363,6 +532,9 @@ def structured_parse(
                 user_payload=user_payload,
                 schema=schema,
                 pipeline_stage=pipeline_stage,
+                attempt_number=attempt_number,
+                usage_context=usage_context,
+                db_path=db_path,
             )
         except OpenAIProviderError as chat_error:
             failure = OpenAIProviderError(
@@ -523,70 +695,210 @@ def run_closed_corpus_ai_review(
     db_path: str,
     client: Any | None = None,
     with_endpoint: bool = False,
+    analysis_run_id: str | None = None,
+    attempt_id: str | None = None,
+    scorecard_result: dict[str, Any] | None = None,
 ) -> ClosedCorpusAIReview | StructuredParseResult[ClosedCorpusAIReview]:
-    """Draft narrative only from verified evidence and deterministic metrics."""
-    del db_path
+    """Run bounded thesis and recommendation calls against selected locked-corpus candidates."""
+    from app.services.narrative_candidate_service import CandidateSelection, select_narrative_candidates
+
     if version.get("status") != config.VERSION_STATUS_LOCKED:
         raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "AI analysis requires a locked package version.")
     if any(item.get("version_id") not in {None, version["version_id"]} for item in evidence):
         raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "AI analysis received evidence outside the selected package version.")
-    verified_evidence = [
-        item
-        for item in evidence
-        if item.get("verification_status") in {config.VERIFICATION_SUPPORTS, config.VERIFICATION_PARTIALLY_SUPPORTS}
-    ]
-    verified_evidence.sort(
-        key=lambda item: (
-            item.get("extraction_method") != "OPENAI_STRUCTURED",
-            item.get("value") is None,
-            str(item.get("evidence_id") or ""),
-        )
+    active_attempt = attempt_id or f"RECAT-{secrets.token_hex(8).upper()}"
+    active_analysis = analysis_run_id or f"UNBOUND-{version['version_id']}"
+    selection = select_narrative_candidates(
+        attempt_id=active_attempt, analysis_run_id=active_analysis, version_id=version["version_id"],
+        processing_run_id=processing_run_id, evidence=evidence, metrics=metrics, conflicts=conflicts,
+        db_path=db_path,
     )
-    selected_evidence: list[dict[str, Any]] = []
-    seen_evidence: set[tuple[str, str]] = set()
-    for item in verified_evidence:
-        fingerprint = (str(item.get("claim_text") or "").casefold(), str(item.get("source_locator_json") or ""))
-        if fingerprint in seen_evidence:
-            continue
-        seen_evidence.add(fingerprint)
-        selected_evidence.append(item)
-        if len(selected_evidence) >= config.OPENAI_MAX_NARRATIVE_EVIDENCE:
-            break
-    evidence_payload = [
-        {
-            "evidence_id": item["evidence_id"],
-            "evidence_type": item.get("evidence_type"),
-            "claim_text": item.get("claim_text"),
-            "source_locator_json": item.get("source_locator_json"),
-            "verification_status": item.get("verification_status"),
-            "value": item.get("value"),
-            "unit": item.get("unit"),
-            "currency": item.get("currency"),
-            "period": item.get("period"),
-        }
-        for item in selected_evidence
-    ]
-    payload = {
-        "locked_version_id": version["version_id"],
-        "processing_run_id": processing_run_id,
-        "verified_evidence": evidence_payload,
-        "deterministic_metrics": metrics,
-        "conflicts": conflicts[: config.OPENAI_MAX_NARRATIVE_CONFLICTS],
+    usage_context = {
+        "analysis_run_id": analysis_run_id, "processing_run_id": processing_run_id, "attempt_id": active_attempt,
     }
-    system_prompt = (
-        "You are the closed-corpus research analyst. Use only verified_evidence, deterministic_metrics, and conflicts in the payload. "
-        "Do not extract new evidence, use web search, external tools, model memory, live prices, or facts from another package. "
-        "Leave extracted_claims empty. Every material narrative claim must include evidence_ids from the payload. "
-        "Leave citation_locators empty because the application attaches trusted locators from those evidence IDs. "
-        "Abstain when evidence is insufficient. Do not perform trusted arithmetic or alter deterministic recommendation thresholds."
+
+    def record_model_attempt(stage: str, number: int, candidate_count: int, status: str, endpoint: str | None) -> None:
+        if not analysis_run_id:
+            return
+        from app.utils import database
+
+        database.create_recommendation_stage_event(
+            {
+                "attempt_id": active_attempt, "analysis_run_id": analysis_run_id,
+                "stage_name": f"{stage} provider attempt", "status": status,
+                "detail_json": json.dumps(
+                    {
+                        "attempt_number": number, "endpoint": endpoint or ENDPOINT_RESPONSES,
+                        "model": config.OPENAI_MODEL, "candidate_count": candidate_count,
+                        "output_status": status,
+                    },
+                    sort_keys=True,
+                ),
+                "created_at": database.utc_now_iso(),
+            },
+            db_path=db_path,
+        )
+
+    def thesis_payload(selected: CandidateSelection, *, repair: bool) -> dict[str, Any]:
+        return {
+            "supporting_candidates": [item.model_payload() for item in selected.supporting],
+            "risk_candidates": [item.model_payload() for item in selected.risks],
+            "valid_unresolved_conflicts": list(selected.conflicts),
+            "instruction": "Return only concise fields matching the schema." if repair else "Synthesize only supplied candidate IDs.",
+        }
+
+    retryable = {OPENAI_OUTPUT_INCOMPLETE, OPENAI_STRUCTURED_OUTPUT_INVALID, OPENAI_OUTPUT_EMPTY}
+    thesis_result: StructuredParseResult[ThesisRiskResponse] | None = None
+    active_selection = selection
+    for number in (1, 2):
+        try:
+            thesis_result = structured_parse(
+                system_prompt=(
+                    "Use only the supplied locked-corpus candidates. Every item must reference exactly one supplied candidate_id. "
+                    "Do not add facts, numbers, evidence identifiers, citations, or external information. Abstain through missing_information."
+                ),
+                user_payload=thesis_payload(active_selection, repair=number == 2), schema=ThesisRiskResponse,
+                client=client, max_output_tokens=4000, pipeline_stage="thesis_risk_generation",
+                attempt_number=number, usage_context=usage_context, db_path=db_path,
+            )
+            record_model_attempt(
+                "Thesis", number, len(active_selection.supporting) + len(active_selection.risks),
+                "COMPLETED", thesis_result.endpoint,
+            )
+            break
+        except OpenAIProviderError as exc:
+            record_model_attempt(
+                "Thesis", number, len(active_selection.supporting) + len(active_selection.risks),
+                exc.code, exc.diagnostics.endpoint if exc.diagnostics else None,
+            )
+            if number == 2 or exc.code not in retryable:
+                raise
+            active_selection = selection.smaller()
+    if thesis_result is None:  # pragma: no cover - loop either returns or raises.
+        raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "Thesis generation did not produce a response.")
+
+    candidate_by_id = {item.candidate_id: item for item in (*active_selection.supporting, *active_selection.risks)}
+    thesis = thesis_result.parsed
+    returned_items = [*thesis.supporting_items, *thesis.risk_items]
+    if any(item.candidate_id not in candidate_by_id for item in returned_items):
+        raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "OpenAI returned a thesis item outside the selected candidate set.")
+    for item in returned_items:
+        supplied = candidate_by_id[item.candidate_id]
+        returned_numbers = set(re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", item.concise_claim))
+        supplied_numbers = set(re.findall(r"(?<![A-Za-z])\d+(?:\.\d+)?%?", supplied.concise_claim))
+        if not returned_numbers.issubset(supplied_numbers):
+            raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "OpenAI returned an unsupported number in thesis synthesis.")
+
+    validated_thesis = [
+        {"candidate_id": item.candidate_id, "claim": item.concise_claim, "confidence": item.confidence}
+        for item in thesis.supporting_items
+    ]
+    validated_risks = [
+        {"candidate_id": item.candidate_id, "claim": item.concise_claim, "confidence": item.confidence}
+        for item in thesis.risk_items
+    ]
+    has_valuation = any(row.get("metric_code") in {"PRICE_TARGET", "VALUATION", "IMPLIED_VALUE"} for row in active_selection.metrics)
+    has_reference = any(row.get("metric_code") == "REFERENCE_PRICE" for row in active_selection.metrics)
+
+    def recommendation_payload(selected: CandidateSelection, *, repair: bool) -> dict[str, Any]:
+        keep_ids = {item.candidate_id for item in (*selected.supporting, *selected.risks)}
+        return {
+            "validated_supporting_items": [row for row in validated_thesis if row["candidate_id"] in keep_ids],
+            "validated_risk_items": [row for row in validated_risks if row["candidate_id"] in keep_ids],
+            "latest_metrics": list(selected.metrics), "deterministic_scorecard": scorecard_result or {},
+            "valuation_available": has_valuation, "reference_price_available": has_reference,
+            "instruction": "Return only the five bounded narrative fields." if repair else "Draft a provisional recommendation narrative.",
+        }
+
+    recommendation_result: StructuredParseResult[RecommendationResponse] | None = None
+    recommendation_selection = active_selection
+    for number in (1, 2):
+        try:
+            recommendation_result = structured_parse(
+                system_prompt=(
+                    "Use only validated thesis, risks, compact metrics, and deterministic availability flags. "
+                    "Do not return IDs or citations. Do not invent numbers. A summary is required and at least one of primary_positive "
+                    "or primary_risk must be nonempty. Use abstention_reason when evidence is insufficient."
+                ),
+                user_payload=recommendation_payload(recommendation_selection, repair=number == 2),
+                schema=RecommendationResponse, client=client, max_output_tokens=3000,
+                pipeline_stage="recommendation_generation", attempt_number=number,
+                usage_context=usage_context, db_path=db_path,
+            )
+            if not (recommendation_result.parsed.primary_positive.strip() or recommendation_result.parsed.primary_risk.strip()):
+                raise OpenAIProviderError(OPENAI_STRUCTURED_OUTPUT_INVALID, "Recommendation omitted both its primary positive and primary risk.")
+            allowed_numbers = set(
+                re.findall(
+                    r"(?<![A-Za-z])\d+(?:\.\d+)?%?",
+                    " ".join(row["claim"] for row in (*validated_thesis, *validated_risks)),
+                )
+            )
+            allowed_numbers.update(
+                f"{float(row['value']):g}" for row in recommendation_selection.metrics if row.get("value") is not None
+            )
+            returned_numbers = set(
+                re.findall(
+                    r"(?<![A-Za-z])\d+(?:\.\d+)?%?",
+                    " ".join(
+                        (
+                            recommendation_result.parsed.recommendation_summary,
+                            recommendation_result.parsed.why_provisional,
+                            recommendation_result.parsed.primary_positive,
+                            recommendation_result.parsed.primary_risk,
+                            recommendation_result.parsed.abstention_reason,
+                        )
+                    ),
+                )
+            )
+            if not returned_numbers.issubset(allowed_numbers):
+                raise OpenAIProviderError(OPENAI_STRUCTURED_OUTPUT_INVALID, "Recommendation included an unsupported number.")
+            record_model_attempt(
+                "Recommendation", number,
+                len(recommendation_selection.supporting) + len(recommendation_selection.risks),
+                "COMPLETED", recommendation_result.endpoint,
+            )
+            break
+        except OpenAIProviderError as exc:
+            record_model_attempt(
+                "Recommendation", number,
+                len(recommendation_selection.supporting) + len(recommendation_selection.risks),
+                exc.code, exc.diagnostics.endpoint if exc.diagnostics else None,
+            )
+            if number == 2 or exc.code not in retryable:
+                raise
+            recommendation_selection = active_selection.smaller()
+    if recommendation_result is None:  # pragma: no cover
+        raise OpenAIProviderError(OPENAI_REQUEST_FAILED, "Recommendation generation did not produce a response.")
+
+    response = recommendation_result.parsed
+    evidence_ids = list(dict.fromkeys(candidate_by_id[item.candidate_id].evidence_id for item in returned_items))
+    rationale = response.recommendation_summary
+    abstention = response.abstention_reason or response.why_provisional or None
+    if not has_valuation or not has_reference:
+        rationale = f"ANALYST_REVIEW_REQUIRED: {rationale}"
+        abstention = abstention or "Valuation or package-contained reference price is unavailable."
+    review = ClosedCorpusAIReview(
+        thesis_items=[
+            ModelThesisItem(
+                item_type="BULL_CASE" if item in thesis.supporting_items else "RISK",
+                claim=item.concise_claim, evidence_ids=[candidate_by_id[item.candidate_id].evidence_id],
+                confidence=item.confidence,
+            )
+            for item in returned_items
+        ],
+        recommendation=RecommendationNarrative(
+            rationale=rationale, abstention_reason=abstention, evidence_ids=evidence_ids,
+        ),
     )
-    result = structured_parse(
-        system_prompt=system_prompt,
-        user_payload=payload,
-        schema=ClosedCorpusAIReview,
-        client=client,
-        pipeline_stage="narrative_generation",
-    )
-    _attach_trusted_citation_locators(result.parsed, evidence)
-    _validate_citations(result.parsed, evidence)
+    _attach_trusted_citation_locators(review, evidence)
+    _validate_citations(review, evidence)
+    diagnostics = {
+        "original_evidence_count": selection.considered,
+        "eligible_candidate_count": selection.eligible,
+        "selected_supporting_count": len(selection.supporting),
+        "selected_risk_count": len(selection.risks),
+        "metric_count": len(selection.metrics), "conflict_count": len(selection.conflicts),
+        "openai_call_count": thesis_result.attempt_number + recommendation_result.attempt_number,
+    }
+    result = StructuredParseResult(review, recommendation_result.endpoint, diagnostics=diagnostics)
     return result if with_endpoint else result.parsed

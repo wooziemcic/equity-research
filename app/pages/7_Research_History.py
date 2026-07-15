@@ -8,6 +8,7 @@ from streamlit.errors import StreamlitPageNotFoundError
 from app import config
 from app.components.cards import render_empty_state
 from app.components.layout import bootstrap_page
+from app.services.package_recipe_service import get_package_recipe_instance
 from app.utils import database
 
 
@@ -24,10 +25,12 @@ def _open_result(package: dict[str, Any], analysis: dict[str, Any] | None) -> No
         st.session_state[config.SESSION_ACTIVE_ANALYSIS_RUN_ID] = analysis["analysis_run_id"]
         st.session_state[config.SESSION_ACTIVE_VERSION_ID] = analysis["version_id"]
         st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = analysis["processing_run_id"]
+    recipe_instance = get_package_recipe_instance(package["package_id"])
+    destination = "pages/8_Package_Assembly.py" if recipe_instance else "pages/6_Investment_Result.py" if analysis else "pages/0_Research_Workspace.py"
     try:
-        st.switch_page("pages/6_Investment_Result.py" if analysis else "pages/0_Research_Workspace.py")
+        st.switch_page(destination)
     except (StreamlitPageNotFoundError, AttributeError):
-        st.page_link("pages/6_Investment_Result.py" if analysis else "pages/0_Research_Workspace.py", label="Open selected research")
+        st.page_link(destination, label="Open selected research")
 
 
 def _safe_page_link(page: str, label: str) -> None:

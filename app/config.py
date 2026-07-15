@@ -4,10 +4,11 @@ import os
 import re
 from pathlib import Path
 
-from dotenv import load_dotenv
+from dotenv import dotenv_values, load_dotenv
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
+_PROJECT_DOTENV = dotenv_values(PROJECT_ROOT / ".env")
 load_dotenv(PROJECT_ROOT / ".env", override=False)
 
 
@@ -18,7 +19,11 @@ PAGE_ICON = "📊"
 
 DATA_DIR = PROJECT_ROOT / "data"
 DATABASE_DIR = DATA_DIR / "database"
-DATABASE_PATH = DATABASE_DIR / "cutler_research.db"
+_database_path_override = os.getenv("CUTLER_DATABASE_PATH", "").strip()
+DATABASE_PATH = Path(_database_path_override).expanduser() if _database_path_override else DATABASE_DIR / "cutler_research.db"
+if not DATABASE_PATH.is_absolute():
+    DATABASE_PATH = PROJECT_ROOT / DATABASE_PATH
+MIGRATION_BACKUP_DIR = DATABASE_DIR / "migration_backups"
 UPLOAD_DIR = DATA_DIR / "uploads"
 DOWNLOAD_DIR = DATA_DIR / "downloaded"
 PROCESSED_DIR = DATA_DIR / "processed"
@@ -32,7 +37,39 @@ def _setting(name: str, default: str = "") -> str:
     """Read import-time settings without issuing a Streamlit command."""
     return os.getenv(name, default)
 
+
+def _secret_setting(name: str, default: str = "") -> str:
+    """Read project dotenv, then Streamlit secrets, then process environment."""
+    dotenv_value = _PROJECT_DOTENV.get(name)
+    if dotenv_value not in (None, ""):
+        return str(dotenv_value)
+    try:
+        from streamlit.runtime import exists
+
+        if exists():
+            import streamlit as st
+
+            streamlit_value = st.secrets.get(name, "")
+            if streamlit_value not in (None, ""):
+                return str(streamlit_value)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
 ENVIRONMENT = _setting("CUTLER_ENV", "development")
+_database_environment = _setting("DATABASE_ENVIRONMENT", "").strip().upper()
+if _database_environment not in {"DEVELOPMENT", "TEST", "STREAMLIT_CLOUD", "UNKNOWN"}:
+    _database_environment = "STREAMLIT_CLOUD" if _setting("STREAMLIT_SHARING_MODE") else "DEVELOPMENT"
+DATABASE_ENVIRONMENT = _database_environment
+
+_recipe_workbook_value = _setting("CUTLER_RECIPE_WORKBOOK_PATH", "").strip()
+RECIPE_WORKBOOK_PATH = (
+    Path(_recipe_workbook_value).expanduser()
+    if _recipe_workbook_value
+    else PROJECT_ROOT / "reference" / "Equity Research Package.xlsx"
+)
+if not RECIPE_WORKBOOK_PATH.is_absolute():
+    RECIPE_WORKBOOK_PATH = PROJECT_ROOT / RECIPE_WORKBOOK_PATH
 
 SEC_USER_AGENT = _setting("SEC_USER_AGENT", "")
 SEC_REQUEST_DELAY_SECONDS = float(os.getenv("SEC_REQUEST_DELAY_SECONDS", "0.2"))
@@ -74,6 +111,9 @@ OPENAI_EXTRACTION_MAX_OUTPUT_TOKENS = max(1000, int(os.getenv("OPENAI_EXTRACTION
 MAX_DETECTED_CLAIM_CONFLICTS = max(1, int(os.getenv("MAX_DETECTED_CLAIM_CONFLICTS", "500")))
 OPENAI_MAX_NARRATIVE_EVIDENCE = max(1, int(os.getenv("OPENAI_MAX_NARRATIVE_EVIDENCE", "250")))
 OPENAI_MAX_NARRATIVE_CONFLICTS = max(1, int(os.getenv("OPENAI_MAX_NARRATIVE_CONFLICTS", "100")))
+OPENAI_MODEL_PRICING = {
+    "gpt-4.1-mini": {"input": 0.40, "cached_input": 0.10, "output": 1.60},
+}
 AI_REVIEW_STATUS_NOT_REQUIRED = "NOT_REQUIRED"
 AI_REVIEW_STATUS_RUNNING = "RUNNING"
 AI_REVIEW_STATUS_COMPLETED = "COMPLETED"
@@ -351,6 +391,13 @@ SEC_8K_APPROVED_ITEMS = tuple(
 SEARCH_PROVIDER = os.getenv("SEARCH_PROVIDER", "none").strip().lower()
 SEARCH_API_KEY = os.getenv("SEARCH_API_KEY", "")
 SEARCH_MAX_RESULTS = max(1, int(os.getenv("SEARCH_MAX_RESULTS", "10")))
+BRAVE_SEARCH_API_KEY = str(_PROJECT_DOTENV.get("BRAVE_SEARCH_API_KEY") or os.getenv("BRAVE_SEARCH_API_KEY", ""))
+BRAVE_SEARCH_ENDPOINT = str(_PROJECT_DOTENV.get("BRAVE_SEARCH_ENDPOINT") or os.getenv(
+    "BRAVE_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search"
+)).strip()
+BRAVE_SEARCH_MAX_RESULTS = max(1, int(os.getenv("BRAVE_SEARCH_MAX_RESULTS", "10")))
+BRAVE_MAX_QUERIES_PER_PACKAGE = max(1, int(os.getenv("BRAVE_MAX_QUERIES_PER_PACKAGE", "40")))
+BRAVE_MAX_QUERIES_PER_SLOT = max(1, int(os.getenv("BRAVE_MAX_QUERIES_PER_SLOT", "3")))
 IR_MAX_REDIRECTS = max(0, int(os.getenv("IR_MAX_REDIRECTS", "5")))
 IR_REQUEST_DELAY_SECONDS = float(os.getenv("IR_REQUEST_DELAY_SECONDS", "0.2"))
 OPENAI_EVIDENCE_PROMPT_VERSION = os.getenv("OPENAI_EVIDENCE_PROMPT_VERSION", "1.0")
@@ -415,3 +462,8 @@ def sec_user_agent_is_configured() -> bool:
         return False
     application_name = EMAIL_PATTERN.sub("", raw_value).strip(" \t\r\n()[]{}<>;:-_,")
     return bool(application_name)
+
+
+def brave_search_api_key() -> str:
+    """Resolve the optional Brave key lazily after Streamlit page configuration."""
+    return _secret_setting("BRAVE_SEARCH_API_KEY", "").strip()

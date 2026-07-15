@@ -15,7 +15,11 @@ from app.services.analysis_pipeline import load_analysis_diagnostics
 from app.services.combined_export_service import create_combined_export
 from app.services.conflict_audit_service import audit_historical_conflicts
 from app.services.processing_pipeline import processing_performance_summary
-from app.services.research_workflow_service import package_coverage_summary
+from app.services.research_workflow_service import (
+    package_coverage_summary,
+    recommendation_retry_available,
+    retry_recommendation_workflow,
+)
 from app.services.reporting.investment_report import generate_investment_report
 from app.services.reporting.memo_quality import MemoGenerationError
 from app.utils import database
@@ -270,7 +274,12 @@ def _metric_diagnostics_expander(analysis: dict[str, Any]) -> None:
     diagnostics = payload.get("metric_diagnostics") if isinstance(payload, dict) else None
     if not isinstance(diagnostics, dict):
         return
-    with st.expander("Why metric calculation could not complete", expanded=False):
+    recommendation_failed = (
+        str(analysis.get("status") or "") == config.ANALYSIS_STATUS_FAILED
+        and bool(diagnostics.get("metrics_successfully_calculated"))
+    )
+    heading = "Why recommendation generation could not complete" if recommendation_failed else "Why metric calculation could not complete"
+    with st.expander(heading, expanded=False):
         if diagnostics.get("exception_type"):
             st.write(f"Exception type: `{diagnostics.get('exception_type')}`")
         if diagnostics.get("safe_error_message"):
@@ -315,6 +324,35 @@ def _advanced_review(context: dict[str, Any]) -> None:
         st.write(f"Citation audit: {report.get('citation_audit_status') or 'Not available'}")
         st.write(f"Evidence coverage: {_percent(analysis.get('evidence_coverage'))}")
         st.write(f"Model / endpoint: {analysis.get('ai_model') or 'Not available'} / {analysis.get('ai_endpoint') or 'Not available'}")
+        recommendation_attempts = database.list_recommendation_attempts(analysis["analysis_run_id"])
+        if recommendation_attempts:
+            latest_recommendation = recommendation_attempts[0]
+            st.markdown("**Recommendation generation**")
+            st.write(f"Status: {latest_recommendation.get('status') or 'Not available'}")
+            st.write(f"Safe failure category: {latest_recommendation.get('failure_category') or 'None'}")
+            st.write(f"OpenAI calls: {latest_recommendation.get('openai_call_count') or 0}")
+            st.write(
+                f"Candidates: {latest_recommendation.get('eligible_candidate_count') or 0} eligible; "
+                f"{latest_recommendation.get('supporting_candidate_count') or 0} support; "
+                f"{latest_recommendation.get('risk_candidate_count') or 0} risk."
+            )
+        usage = database.list_openai_usage(processing_run_id=analysis.get("processing_run_id"))
+        if usage:
+            stage_costs: dict[str, float] = {}
+            for row in usage:
+                stage = str(row.get("pipeline_stage") or "unknown")
+                stage_costs[stage] = stage_costs.get(stage, 0.0) + float(row.get("estimated_cost_usd") or 0)
+            st.markdown("**OpenAI usage and estimated cost**")
+            labels = {
+                "evidence_extraction": "Extraction cost", "thesis_risk_generation": "Thesis-generation cost",
+                "recommendation_generation": "Recommendation cost", "investment_memo_synthesis": "Memo-generation cost",
+            }
+            for stage, label in labels.items():
+                st.write(f"{label}: ${stage_costs.get(stage, 0.0):.6f}")
+            st.write(f"Total cost for this workflow: ${sum(stage_costs.values()):.6f}")
+            reused_extraction_cost = stage_costs.get("evidence_extraction", 0.0) if recommendation_attempts else 0.0
+            st.write(f"Total cost saved through reuse: ${reused_extraction_cost:.6f}")
+            st.caption("Reuse savings use recorded provider usage only; no document-count estimate is used.")
         attempt = database.latest_memo_generation_attempt(analysis["analysis_run_id"])
         memo_audit = database.latest_memo_quality_audit(analysis["analysis_run_id"])
         if attempt:
@@ -492,6 +530,18 @@ def _memo_model(context: dict[str, Any]) -> dict[str, Any]:
 def _memo_review_state(context: dict[str, Any]) -> None:
     analysis_run_id = context["analysis"]["analysis_run_id"]
     attempt = database.latest_memo_generation_attempt(analysis_run_id)
+    workflow = database.latest_research_workflow_run(context["analysis"]["package_id"])
+    if recommendation_retry_available(workflow):
+        st.title("Recommendation generation requires retry")
+        st.write("Stored package, processing, evidence, metrics, and conflicts are ready to reuse.")
+        if st.button("Retry Recommendation Generation", type="primary"):
+            try:
+                retry_recommendation_workflow(workflow["workflow_run_id"])
+            except Exception as exc:
+                st.error(f"Recommendation retry failed safely: {exc}")
+            else:
+                st.rerun()
+        return
     st.title("Memo requires review before release")
     if attempt and attempt.get("status") == "MEMO_GENERATION_FAILED":
         st.write("The candidate, synthesis, or quality checks did not produce a releasable one-page memo.")

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import html
 import logging
+from datetime import date
 
 import streamlit as st
 from streamlit.errors import StreamlitPageNotFoundError
@@ -9,12 +10,8 @@ from streamlit.errors import StreamlitPageNotFoundError
 from app import config
 from app.components.layout import bootstrap_page
 from app.services.company_resolver import resolve_ticker_metadata
-from app.services.research_workflow_service import (
-    get_or_create_research_package,
-    normalize_ticker_input,
-    resolve_search_ticker,
-    validate_search_ticker,
-)
+from app.services.package_recipe_service import create_package_from_active_recipe, get_active_recipe
+from app.services.research_workflow_service import normalize_ticker_input, resolve_search_ticker, validate_search_ticker
 from app.utils import database
 
 logger = logging.getLogger(__name__)
@@ -22,9 +19,9 @@ logger = logging.getLogger(__name__)
 
 def _switch_to_research() -> None:
     try:
-        st.switch_page("pages/0_Research_Workspace.py")
+        st.switch_page("pages/8_Package_Assembly.py")
     except (StreamlitPageNotFoundError, AttributeError):
-        st.page_link("pages/0_Research_Workspace.py", label="Open Research Workspace")
+        st.page_link("pages/8_Package_Assembly.py", label="Open Package Assembly Board")
 
 
 def _select_active_package(package: dict) -> None:
@@ -55,12 +52,32 @@ def _company_confirmation() -> None:
             """,
             unsafe_allow_html=True,
         )
-        if st.button("Confirm Company And Open Research Workspace", type="primary", use_container_width=True):
-            package, created = get_or_create_research_package(metadata)
-            _select_active_package(package)
-            message = "New research package created." if created else "Existing working package reopened."
-            st.success(message)
-            _switch_to_research()
+        active_recipe = get_active_recipe()
+        if active_recipe:
+            with st.form("recipe_package_create_form"):
+                detail_cols = st.columns(3)
+                compilation_date = detail_cols[0].date_input("Compilation date", value=date.today())
+                research_cutoff = detail_cols[1].date_input("Research cutoff", value=date.today(), max_value=date.today())
+                compiled_by = detail_cols[2].text_input("Compiled by", placeholder="Name or initials")
+                st.caption(f"Cutler Common Equity Recipe v{active_recipe['version']}")
+                create_submitted = st.form_submit_button("Create From Active Cutler Equity Recipe", type="primary", use_container_width=True)
+            if create_submitted:
+                if not compiled_by.strip():
+                    st.error("Enter the analyst compiling this package.")
+                else:
+                    package = create_package_from_active_recipe(
+                        metadata,
+                        research_cutoff=research_cutoff,
+                        compilation_date=compilation_date,
+                        compiled_by=compiled_by,
+                        created_by=compiled_by,
+                    )
+                    _select_active_package(package)
+                    st.success("Recipe-backed research package created.")
+                    _switch_to_research()
+        else:
+            st.warning("No active Common Equity recipe is available. An administrator must import, approve, and activate one before recipe-backed creation.")
+            st.page_link("pages/9_Recipe_Administration.py", label="Open Recipe Administration")
     elif status == "MULTIPLE_MATCHES":
         candidates = result.get("candidates") or []
         labels = {
