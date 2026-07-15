@@ -84,6 +84,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase7_tables(connection)
         _create_phase3_official_ir_schema(connection)
         _create_phase4_final_schema(connection)
+        _create_phase5_memo_schema(connection)
 
 
 def _table_columns(connection: sqlite3.Connection, table_name: str) -> set[str]:
@@ -1221,6 +1222,111 @@ def _create_phase4_final_schema(connection: sqlite3.Connection) -> None:
         "CREATE INDEX IF NOT EXISTS idx_processing_items_fingerprint ON processing_document_items(version_document_id, processing_fingerprint)",
         "CREATE INDEX IF NOT EXISTS idx_processing_timings_run ON processing_stage_timings(processing_run_id, stage_name)",
         "CREATE INDEX IF NOT EXISTS idx_documents_window_status ON documents(package_id, selected_window_status)",
+    ):
+        connection.execute(sql)
+
+
+def _create_phase5_memo_schema(connection: sqlite3.Connection) -> None:
+    """Add official-IR outcome and memo-quality audit records without rewriting history."""
+    additions_by_table = {
+        "analysis_runs": {
+            "memo_generation_status": "TEXT",
+            "memo_generation_error": "TEXT",
+        },
+        "generated_reports": {
+            "memo_generation_attempt_id": "TEXT",
+            "memo_quality_status": "TEXT",
+        },
+    }
+    for table, additions in additions_by_table.items():
+        columns = _table_columns(connection, table)
+        for column, definition in additions.items():
+            if column not in columns:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memo_generation_attempts (
+            attempt_id TEXT PRIMARY KEY,
+            analysis_run_id TEXT NOT NULL,
+            version_id TEXT NOT NULL,
+            processing_run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            model TEXT,
+            endpoint TEXT,
+            selected_candidate_ids_json TEXT NOT NULL,
+            rejected_candidate_count INTEGER NOT NULL DEFAULT 0,
+            draft_json TEXT,
+            error_code TEXT,
+            error_message TEXT,
+            created_at TEXT NOT NULL,
+            completed_at TEXT
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memo_evidence_candidates (
+            candidate_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL,
+            evidence_id TEXT NOT NULL,
+            version_document_id TEXT NOT NULL,
+            claim_family TEXT NOT NULL,
+            claim_text TEXT NOT NULL,
+            supporting_quote TEXT NOT NULL,
+            metric_name TEXT,
+            numeric_value REAL,
+            unit TEXT,
+            currency TEXT,
+            reporting_period TEXT,
+            filing_or_publication_date TEXT,
+            source_type TEXT,
+            form_type TEXT,
+            section_heading TEXT,
+            page_number INTEGER,
+            source_priority REAL NOT NULL,
+            recency_score REAL NOT NULL,
+            materiality_score REAL NOT NULL,
+            completeness_score REAL NOT NULL,
+            decision_relevance_score REAL NOT NULL,
+            rejection_reasons_json TEXT NOT NULL,
+            eligible_for_memo INTEGER NOT NULL DEFAULT 0,
+            candidate_kind TEXT NOT NULL,
+            citation TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    connection.execute(
+        """
+        CREATE TABLE IF NOT EXISTS memo_quality_audits (
+            audit_id TEXT PRIMARY KEY,
+            attempt_id TEXT NOT NULL,
+            analysis_run_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            complete_sentence_check TEXT NOT NULL,
+            ellipsis_check TEXT NOT NULL,
+            citation_check TEXT NOT NULL,
+            numeric_validation_check TEXT NOT NULL,
+            period_validation_check TEXT NOT NULL,
+            unit_validation_check TEXT NOT NULL,
+            currency_validation_check TEXT NOT NULL,
+            recency_check TEXT NOT NULL,
+            duplicate_check TEXT NOT NULL,
+            source_heading_check TEXT NOT NULL,
+            risk_coverage_check TEXT NOT NULL,
+            decision_relevance_check TEXT NOT NULL,
+            one_page_fit_check TEXT NOT NULL,
+            reasons_json TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        )
+        """
+    )
+    for sql in (
+        "CREATE INDEX IF NOT EXISTS idx_memo_attempts_analysis ON memo_generation_attempts(analysis_run_id, created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_memo_candidates_attempt ON memo_evidence_candidates(attempt_id, eligible_for_memo)",
+        "CREATE INDEX IF NOT EXISTS idx_memo_audits_analysis ON memo_quality_audits(analysis_run_id, created_at)",
     ):
         connection.execute(sql)
 
@@ -4155,6 +4261,8 @@ def update_analysis_run(
         "ai_model",
         "ai_endpoint",
         "openai_diagnostics_json",
+        "memo_generation_status",
+        "memo_generation_error",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:
@@ -4405,6 +4513,81 @@ def list_generated_reports(
     with get_connection(db_path) as connection:
         rows = connection.execute(sql, tuple(params)).fetchall()
     return [dict(row) for row in rows]
+
+
+def create_memo_generation_attempt(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("memo_generation_attempts", record, db_path=db_path)
+
+
+def update_memo_generation_attempt(
+    attempt_id: str, updates: dict[str, Any], *, db_path: Path | str = DATABASE_PATH
+) -> dict[str, Any] | None:
+    allowed = {
+        "status", "model", "endpoint", "selected_candidate_ids_json", "rejected_candidate_count",
+        "draft_json", "error_code", "error_message", "completed_at",
+    }
+    selected = {key: value for key, value in updates.items() if key in allowed}
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        if selected:
+            sql = ", ".join(f"{key} = ?" for key in selected)
+            connection.execute(f"UPDATE memo_generation_attempts SET {sql} WHERE attempt_id = ?", (*selected.values(), attempt_id))
+        row = connection.execute("SELECT * FROM memo_generation_attempts WHERE attempt_id = ?", (attempt_id,)).fetchone()
+    return row_to_dict(row)
+
+
+def latest_memo_generation_attempt(
+    analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM memo_generation_attempts WHERE analysis_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (analysis_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
+
+
+def create_memo_evidence_candidates(
+    records: list[dict[str, Any]], *, db_path: Path | str = DATABASE_PATH
+) -> None:
+    if not records:
+        return
+    initialize_database(db_path)
+    fields = tuple(records[0])
+    with get_connection(db_path) as connection:
+        connection.executemany(
+            f"INSERT INTO memo_evidence_candidates ({', '.join(fields)}) VALUES ({', '.join('?' for _ in fields)})",
+            [tuple(record[field] for field in fields) for record in records],
+        )
+
+
+def list_memo_evidence_candidates(
+    attempt_id: str, *, db_path: Path | str = DATABASE_PATH
+) -> list[dict[str, Any]]:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        rows = connection.execute(
+            "SELECT * FROM memo_evidence_candidates WHERE attempt_id = ? ORDER BY eligible_for_memo DESC, decision_relevance_score DESC, recency_score DESC, candidate_id",
+            (attempt_id,),
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_memo_quality_audit(record: dict[str, Any], *, db_path: Path | str = DATABASE_PATH) -> dict[str, Any]:
+    return _insert_record("memo_quality_audits", record, db_path=db_path)
+
+
+def latest_memo_quality_audit(
+    analysis_run_id: str, *, db_path: Path | str = DATABASE_PATH
+) -> dict[str, Any] | None:
+    initialize_database(db_path)
+    with get_connection(db_path) as connection:
+        row = connection.execute(
+            "SELECT * FROM memo_quality_audits WHERE analysis_run_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1",
+            (analysis_run_id,),
+        ).fetchone()
+    return row_to_dict(row)
 
 
 def create_research_workflow_run(

@@ -15,15 +15,16 @@ import requests
 from app import config
 from app.services.analysis_pipeline import AnalysisPipelineError, create_analysis_run, load_analysis_diagnostics
 from app.services.checklist_service import coverage_summary, ensure_package_checklist
-from app.services.collectors.ir_collector import discover_public_documents, download_selected_ir_documents
 from app.services.collectors.sec_collector import download_selected_filings, preview_filings
 from app.services.company_resolver import ResolutionResult, resolve_ticker_metadata
 from app.services.package_builder import build_package_version, included_documents, lock_version, validate_package_readiness, verify_snapshot
 from app.services.package_service import PackageInput, create_package, find_existing_ticker_packages
 from app.services.performance_service import StageTimer
 from app.services.processing_pipeline import repair_processing_run, run_processing_pipeline
+from app.services.official_ir_service import resolve_and_collect_official_ir_materials
 from app.services.research_window import document_window_status, normalize_window
 from app.services.reporting.investment_report import generate_investment_report
+from app.services.reporting.memo_quality import MemoGenerationError
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
 from app.utils.validation import validate_cutoff_date, validate_ticker
@@ -61,7 +62,7 @@ def _notify_workflow_progress(
 @dataclass(frozen=True)
 class CollectionResult:
     sec_summary: dict[str, int]
-    ir_summary: dict[str, int]
+    ir_summary: dict[str, Any]
     warnings: list[str]
     errors: list[str]
 
@@ -212,14 +213,20 @@ def start_automated_collection(
     *,
     filing_types: list[str],
     ir_url: str | None = None,
+    public_materials: list[str] | None = None,
     session: requests.Session | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> CollectionResult:
-    """Run the existing SEC and optional IR public-document collectors."""
+    """Collect SEC filings, then resolve and collect official IR materials automatically."""
     warnings: list[str] = []
     errors: list[str] = []
     sec_summary = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
-    ir_summary = {"discovered": 0, "downloaded": 0, "skipped": 0, "failed": 0}
+    ir_summary: dict[str, Any] = {
+        "official_website": None, "official_ir_site": None, "resolution_status": "WAITING",
+        "pages_crawled": 0, "discovered": 0, "downloaded": 0, "downloaded_now": 0,
+        "already_collected": 0, "needs_manual_review": 0, "outside_selected_window": 0,
+        "date_review_required": 0, "not_selected": 0, "duplicate": 0, "skipped": 0, "failed": 0,
+    }
 
     supported_forms = [form for form in filing_types if form in config.SEC_SUPPORTED_FORMS]
     if not supported_forms:
@@ -241,27 +248,25 @@ def start_automated_collection(
         except Exception as exc:
             errors.append(f"SEC collection failed: {exc}")
 
-    if ir_url:
-        try:
-            candidates, message = discover_public_documents(ir_url, session=session)
-            if message:
-                warnings.append(message)
-            if not candidates:
-                warnings.append("No public investor-relations PDFs were discovered within the conservative crawl limits.")
-            else:
-                selections = [(candidate, candidate.suggested_category) for candidate in candidates]
-                ir_summary = download_selected_ir_documents(
-                    package,
-                    selections,
-                    session=session,
-                    db_path=db_path,
-                )
-        except Exception as exc:
-            errors.append(f"Investor-relations collection failed: {exc}")
-    else:
-        warnings.append("Investor-relations discovery skipped because no IR URL was provided.")
-
     refreshed = database.get_package_by_package_id(package["package_id"], db_path=db_path) or package
+    try:
+        official_ir = resolve_and_collect_official_ir_materials(
+            refreshed,
+            selected_workspace_categories=public_materials or [],
+            analyst_ir_url=ir_url,
+            session=session,
+            db_path=db_path,
+        )
+        ir_summary = official_ir.to_summary()
+        warnings.extend(official_ir.warnings)
+        if official_ir.resolution_status == "NOT_FOUND":
+            warnings.append("SEC collection completed, but an official investor-relations site could not be verified automatically.")
+    except Exception as exc:
+        ir_summary["resolution_status"] = "NEEDS_MANUAL_REVIEW"
+        ir_summary["failed"] = 1
+        warnings.append(f"SEC collection completed; official IR collection requires manual review: {exc}")
+
+    refreshed = database.get_package_by_package_id(package["package_id"], db_path=db_path) or refreshed
     ensure_package_checklist(refreshed, db_path=db_path)
     return CollectionResult(sec_summary, ir_summary, warnings, errors)
 
@@ -285,6 +290,9 @@ def collection_timeline(
     ir_runs = [run for run in collection_runs if run.get("source_type") == "INVESTOR_RELATIONS"]
     latest_sec = sec_runs[0] if sec_runs else None
     latest_ir = ir_runs[0] if ir_runs else None
+    official_ir_runs = database.list_ir_discovery_runs(package_id, db_path=db_path)
+    latest_official_ir = official_ir_runs[0] if official_ir_runs else None
+    ir_materials = database.list_ir_material_candidates(package_id, db_path=db_path)
     latest_upload = upload_runs[0] if upload_runs else None
 
     return [
@@ -304,9 +312,34 @@ def collection_timeline(
             "detail": _download_detail(latest_sec),
         },
         {
+            "stage": "Official website resolved",
+            "status": TIMELINE_COMPLETED if package.get("official_website_url") else TIMELINE_NOT_FOUND if latest_official_ir else TIMELINE_WAITING,
+            "detail": package.get("official_website_url") or "Automatic official-site discovery has not completed.",
+        },
+        {
+            "stage": "Official IR site resolved",
+            "status": TIMELINE_COMPLETED if package.get("official_ir_url") else TIMELINE_NOT_FOUND if latest_official_ir else TIMELINE_WAITING,
+            "detail": package.get("official_ir_url") or "No verified official IR site is stored.",
+        },
+        {
+            "stage": "IR pages crawled",
+            "status": _official_ir_timeline_status(latest_official_ir),
+            "detail": f"{int((latest_official_ir or {}).get('pages_crawled') or 0)} official page(s) crawled.",
+        },
+        {
             "stage": "Investor-relations documents discovered",
-            "status": _collection_run_status(latest_ir, empty_status=TIMELINE_SKIPPED),
-            "detail": _collection_run_detail(latest_ir) or "Skipped until an IR URL is provided.",
+            "status": _official_ir_timeline_status(latest_official_ir) if latest_official_ir else _collection_run_status(latest_ir, empty_status=TIMELINE_WAITING),
+            "detail": f"{int((latest_official_ir or {}).get('materials_discovered') or 0)} official material(s) discovered." if latest_official_ir else _collection_run_detail(latest_ir) or "Automatic discovery has not run.",
+        },
+        {
+            "stage": "IR materials downloaded",
+            "status": TIMELINE_COMPLETED if any(item.get("download_status") in {"DOWNLOADED", "DOWNLOADED_NOW", "ALREADY_COLLECTED"} for item in ir_materials) else TIMELINE_WARNINGS if latest_official_ir else TIMELINE_WAITING,
+            "detail": f"{sum(item.get('download_status') in {'DOWNLOADED', 'DOWNLOADED_NOW', 'ALREADY_COLLECTED'} for item in ir_materials)} official IR material(s) collected.",
+        },
+        {
+            "stage": "Materials requiring manual review",
+            "status": TIMELINE_WARNINGS if any(item.get("download_status") in {"NEEDS_MANUAL_REVIEW", "DATE_REVIEW_REQUIRED"} for item in ir_materials) else TIMELINE_COMPLETED if latest_official_ir else TIMELINE_WAITING,
+            "detail": f"{sum(item.get('download_status') in {'NEEDS_MANUAL_REVIEW', 'DATE_REVIEW_REQUIRED'} for item in ir_materials)} material(s) require analyst review.",
         },
         {
             "stage": "Public documents downloaded",
@@ -658,29 +691,38 @@ def run_research_workflow(
 
         report = _existing_report(workflow, analysis_run, db_path=db_path)
         report_reused = bool(report)
+        memo_generation_failed = False
         report_timer = StageTimer("Creating report", workflow_run_id=workflow_id, package_id=package_id, version_id=version["version_id"], processing_run_id=processing_run["processing_run_id"], analysis_run_id=analysis_run["analysis_run_id"], db_path=db_path)
         if not report:
             _persist_stage(workflow_id, stage_statuses, "Creating report", "Running", db_path=db_path)
-            report = generate_investment_report(analysis_run["analysis_run_id"], final=False, db_path=db_path)
-            workflow = database.update_research_workflow_run(
-                workflow_id,
-                {"report_id": report["report_id"]},
-                db_path=db_path,
-            ) or workflow
-        report_timer.finish(reused=report_reused, reports_generated=0 if report_reused else 1)
-        _mark_stage(stage_statuses, "Creating report", "Completed")
+            try:
+                report = generate_investment_report(analysis_run["analysis_run_id"], final=False, db_path=db_path)
+            except MemoGenerationError:
+                memo_generation_failed = True
+                report = None
+                warnings.append("MEMO_GENERATION_FAILED: Memo requires review before release; retry memo generation only.")
+            else:
+                workflow = database.update_research_workflow_run(
+                    workflow_id,
+                    {"report_id": report["report_id"]},
+                    db_path=db_path,
+                ) or workflow
+        report_timer.finish(reused=report_reused, reports_generated=0 if report_reused or not report else 1)
+        _mark_stage(stage_statuses, "Creating report", TIMELINE_WARNINGS if memo_generation_failed else TIMELINE_COMPLETED)
         if analysis_has_warnings:
             warnings.extend(analysis_warning_messages)
+
+        completed_with_warnings = analysis_has_warnings or memo_generation_failed
 
         return database.update_research_workflow_run(
             workflow_id,
             {
-                "status": config.WORKFLOW_STATUS_COMPLETED_WITH_WARNINGS if analysis_has_warnings else config.WORKFLOW_STATUS_COMPLETED,
-                "current_step": "Completed with warnings" if analysis_has_warnings else "Completed",
+                "status": config.WORKFLOW_STATUS_COMPLETED_WITH_WARNINGS if completed_with_warnings else config.WORKFLOW_STATUS_COMPLETED,
+                "current_step": "Completed with warnings" if completed_with_warnings else "Completed",
                 "version_id": version["version_id"],
                 "processing_run_id": processing_run["processing_run_id"],
                 "analysis_run_id": analysis_run["analysis_run_id"],
-                "report_id": report["report_id"],
+                "report_id": report["report_id"] if report else None,
                 "stage_statuses_json": json.dumps(stage_statuses, sort_keys=True),
                 "warnings_json": json.dumps(sorted(set(warnings)), sort_keys=True),
                 "errors_json": json.dumps([], sort_keys=True),
@@ -870,6 +912,21 @@ def _collection_run_status(run: dict[str, Any] | None, *, empty_status: str) -> 
     if run.get("status") == config.COLLECTION_STATUS_FAILED:
         return TIMELINE_FAILED
     return empty_status
+
+
+def _official_ir_timeline_status(run: dict[str, Any] | None) -> str:
+    if not run:
+        return TIMELINE_WAITING
+    status = str(run.get("status") or "").upper()
+    if status == "NOT_FOUND":
+        return TIMELINE_NOT_FOUND
+    if status == "FAILED":
+        return TIMELINE_FAILED
+    if status in {"NEEDS_MANUAL_REVIEW", "COMPLETED_WITH_WARNINGS"}:
+        return TIMELINE_WARNINGS
+    if status == "RUNNING":
+        return TIMELINE_RUNNING
+    return TIMELINE_COMPLETED
 
 
 def _download_status(run: dict[str, Any] | None) -> str:

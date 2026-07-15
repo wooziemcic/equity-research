@@ -16,7 +16,8 @@ from app.services.combined_export_service import create_combined_export
 from app.services.conflict_audit_service import audit_historical_conflicts
 from app.services.processing_pipeline import processing_performance_summary
 from app.services.research_workflow_service import package_coverage_summary
-from app.services.reporting.investment_report import build_compact_memo, generate_investment_report
+from app.services.reporting.investment_report import generate_investment_report
+from app.services.reporting.memo_quality import MemoGenerationError
 from app.utils import database
 
 
@@ -67,11 +68,14 @@ def _load_result_context() -> dict[str, Any] | None:
         ),
         {},
     )
-    if not report:
-        try:
-            report = generate_investment_report(analysis["analysis_run_id"])
-        except Exception:
-            report = next((item for item in reports if item.get("report_mode") == config.REPORT_MODE), {})
+    latest_attempt = database.latest_memo_generation_attempt(analysis["analysis_run_id"])
+    if (
+        report
+        and latest_attempt
+        and latest_attempt.get("status") == "MEMO_GENERATION_FAILED"
+        and str(latest_attempt.get("created_at") or "") >= str(report.get("created_at") or "")
+    ):
+        report = {}
     st.session_state[config.SESSION_ACTIVE_PACKAGE_ID] = analysis["package_id"]
     st.session_state[config.SESSION_ACTIVE_VERSION_ID] = analysis["version_id"]
     st.session_state[config.SESSION_ACTIVE_PROCESSING_RUN_ID] = analysis["processing_run_id"]
@@ -311,6 +315,49 @@ def _advanced_review(context: dict[str, Any]) -> None:
         st.write(f"Citation audit: {report.get('citation_audit_status') or 'Not available'}")
         st.write(f"Evidence coverage: {_percent(analysis.get('evidence_coverage'))}")
         st.write(f"Model / endpoint: {analysis.get('ai_model') or 'Not available'} / {analysis.get('ai_endpoint') or 'Not available'}")
+        attempt = database.latest_memo_generation_attempt(analysis["analysis_run_id"])
+        memo_audit = database.latest_memo_quality_audit(analysis["analysis_run_id"])
+        if attempt:
+            st.markdown("**Memo generation**")
+            st.write(f"Status: {attempt.get('status') or 'Not available'}")
+            st.write(f"Model / endpoint: {attempt.get('model') or 'Not available'} / {attempt.get('endpoint') or 'Not available'}")
+            if attempt.get("error_code"):
+                st.write(f"Failure code: {attempt['error_code']}")
+            if attempt.get("error_message"):
+                st.write(f"Validation reason: {attempt['error_message']}")
+            selected_ids = set(json.loads(attempt.get("selected_candidate_ids_json") or "[]"))
+            candidates = database.list_memo_evidence_candidates(attempt["attempt_id"])
+            if candidates:
+                st.dataframe(
+                    [
+                        {
+                            "Selected": row["candidate_id"] in selected_ids,
+                            "Kind": row.get("candidate_kind"),
+                            "Family": row.get("claim_family"),
+                            "Source date": row.get("filing_or_publication_date"),
+                            "Citation": row.get("citation"),
+                            "Decision": "Eligible" if row.get("eligible_for_memo") else "Rejected",
+                            "Reasons": ", ".join(json.loads(row.get("rejection_reasons_json") or "[]")),
+                        }
+                        for row in candidates
+                    ],
+                    hide_index=True,
+                    use_container_width=True,
+                )
+        if memo_audit and attempt and memo_audit.get("attempt_id") == attempt.get("attempt_id"):
+            st.write(f"Memo quality audit: {memo_audit.get('status') or 'Not available'}")
+            quality_checks = {
+                key: value
+                for key, value in memo_audit.items()
+                if key.endswith("_check")
+            }
+            st.dataframe(
+                [{"Check": key.replace("_", " ").title(), "Status": value} for key, value in quality_checks.items()],
+                hide_index=True,
+                use_container_width=True,
+            )
+        elif attempt and attempt.get("status") == "MEMO_GENERATION_FAILED":
+            st.write("Memo quality audit: Not completed because synthesis validation failed.")
         st.write(f"Workflow duration: {processing_run.get('duration_seconds') or 0:.2f} seconds")
         conflict_summary = database.get_conflict_analysis_summary(processing_run["processing_run_id"])
         if not conflict_summary:
@@ -382,6 +429,8 @@ def _compact_memo_result(context: dict[str, Any]) -> None:
     st.write(f"**Research cutoff:** {memo['research_cutoff']}")
     st.subheader("Investment View")
     st.write(memo["investment_view"])
+    for citation in memo.get("investment_view_citations", []):
+        st.caption(citation)
     _memo_items("Key Supporting Facts", memo.get("supporting_facts", memo.get("supporting_evidence", [])))
     _memo_items("Key Risks", memo["risks"])
     st.subheader("Important Missing Information")
@@ -437,7 +486,27 @@ def _memo_model(context: dict[str, Any]) -> dict[str, Any]:
         stored = json.loads(report.get("memo_json") or "{}")
     except (TypeError, ValueError, json.JSONDecodeError):
         stored = {}
-    return stored or build_compact_memo(context["analysis"]["analysis_run_id"])
+    return stored
+
+
+def _memo_review_state(context: dict[str, Any]) -> None:
+    analysis_run_id = context["analysis"]["analysis_run_id"]
+    attempt = database.latest_memo_generation_attempt(analysis_run_id)
+    st.title("Memo requires review before release")
+    if attempt and attempt.get("status") == "MEMO_GENERATION_FAILED":
+        st.write("The candidate, synthesis, or quality checks did not produce a releasable one-page memo.")
+    else:
+        st.write("A current-template investment memo has not been generated for this analysis run.")
+    if st.button("Retry Memo Generation", type="primary"):
+        try:
+            report = generate_investment_report(analysis_run_id)
+        except MemoGenerationError:
+            st.error("Memo generation failed validation. Review Audit Details, then retry the memo only.")
+        except Exception:
+            st.error("Memo generation could not be completed. No research processing was rerun.")
+        else:
+            st.session_state[config.SESSION_ACTIVE_REPORT_ID] = report["report_id"]
+            st.rerun()
 
 
 def _evidence_table(evidence: list[dict[str, Any]]) -> None:
@@ -514,9 +583,12 @@ def main() -> None:
     if not context:
         return
 
-    _compact_memo_result(context)
-    st.divider()
-    _memo_downloads(context)
+    if context["report"]:
+        _compact_memo_result(context)
+        st.divider()
+        _memo_downloads(context)
+    else:
+        _memo_review_state(context)
     st.divider()
     _advanced_review(context)
 

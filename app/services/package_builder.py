@@ -220,6 +220,8 @@ def _category_code(document: dict[str, Any]) -> str:
 
 
 def _folder_for_document(document: dict[str, Any]) -> str:
+    if document.get("collection_method") == "INVESTOR_RELATIONS":
+        return "02_Investor_Relations"
     return FOLDER_MAP.get(_category_code(document), "11_Other")
 
 
@@ -366,6 +368,7 @@ def build_package_version(
             used = used_names_by_folder.setdefault(folder, set())
             package_filename = _package_filename(doc, index, used)
             destination = staging / folder / package_filename
+            destination.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(source, destination, follow_symlinks=False)
             copied_hash = sha256_file(destination)
             if copied_hash != doc["sha256_hash"]:

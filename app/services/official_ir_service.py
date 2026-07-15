@@ -77,6 +77,71 @@ class OfficialIrMaterial:
     rejection_reason: str = ""
 
 
+@dataclass(frozen=True)
+class OfficialIrCollectionResult:
+    official_website_url: str | None
+    official_ir_url: str | None
+    resolution_status: str
+    pages_crawled: int
+    materials_discovered: int
+    downloaded_now: int
+    already_collected: int
+    duplicate: int
+    not_selected: int
+    outside_selected_window: int
+    date_review_required: int
+    needs_manual_review: int
+    failed: int
+    warnings: tuple[str, ...] = ()
+
+    def to_summary(self) -> dict[str, Any]:
+        return {
+            "official_website": self.official_website_url,
+            "official_ir_site": self.official_ir_url,
+            "resolution_status": self.resolution_status,
+            "pages_crawled": self.pages_crawled,
+            "discovered": self.materials_discovered,
+            "materials_discovered": self.materials_discovered,
+            "downloaded": self.downloaded_now,
+            "downloaded_now": self.downloaded_now,
+            "already_collected": self.already_collected,
+            "duplicate": self.duplicate,
+            "not_selected": self.not_selected,
+            "outside_selected_window": self.outside_selected_window,
+            "date_review_required": self.date_review_required,
+            "needs_manual_review": self.needs_manual_review,
+            "failed": self.failed,
+            "skipped": self.not_selected + self.outside_selected_window + self.date_review_required + self.needs_manual_review,
+        }
+
+
+WORKSPACE_CATEGORY_MAP: dict[str, frozenset[str]] = {
+    "Earnings releases": frozenset({"Earnings Release"}),
+    "Earnings presentations": frozenset({"Earnings Presentation"}),
+    "Investor presentations": frozenset({"Investor Presentation"}),
+    "Annual reports": frozenset({"Annual Report"}),
+    "Investor-day materials": frozenset({"Investor Day"}),
+    "Public supplemental materials": frozenset({"Quarterly Supplement", "Financial Supplement", "Official Company Material"}),
+    "Public ESG or sustainability reports": frozenset({"ESG / Sustainability"}),
+}
+IR_CATEGORY_CODE_MAP = {
+    "Earnings Release": "earnings_release",
+    "Earnings Presentation": "earnings_presentation",
+    "Investor Presentation": "investor_presentation",
+    "Annual Report": "annual_filing",
+    "Investor Day": "investor_day",
+    "ESG / Sustainability": "esg_sustainability",
+    "Official Transcript": "earnings_transcript",
+    "Quarterly Supplement": "company_press_release",
+    "Financial Supplement": "company_press_release",
+    "Merger / Acquisition Presentation": "investor_presentation",
+    "Official Company Material": "company_press_release",
+}
+
+Q4_PUBLIC_ROOT_DOMAINS = {"q4inc.com", "q4api.com"}
+Q4_PRIVATE_PATH_TERMS = ("/admin", "/private", "/login", "/signin", "/oauth", "/graphql")
+
+
 class SearchProvider(Protocol):
     def search(self, queries: list[str], *, max_results: int) -> list[str]: ...
 
@@ -121,6 +186,7 @@ class HtmlMetadataParser(HTMLParser):
         self.links: list[tuple[str, str]] = []
         self.canonical: str = ""
         self.feeds: list[str] = []
+        self.scripts: list[str] = []
         self.json_ld: list[str] = []
         self._href: str | None = None
         self._text: list[str] = []
@@ -141,6 +207,8 @@ class HtmlMetadataParser(HTMLParser):
         if tag.lower() == "script" and values.get("type", "").lower() == "application/ld+json":
             self._json_ld = True
             self._json_parts = []
+        if tag.lower() == "script" and values.get("src"):
+            self.scripts.append(values["src"])
 
     def handle_data(self, data: str) -> None:
         if self._href:
@@ -352,6 +420,26 @@ def _urls_from_sec_filings(package: dict[str, Any], *, db_path: Path | str) -> l
     return found[:10]
 
 
+def _urls_from_verified_package_metadata(
+    package: dict[str, Any], *, db_path: Path | str
+) -> list[tuple[str, str]]:
+    """Reuse official websites verified for another package of the same SEC issuer."""
+    ticker = str(package.get("ticker") or "").upper()
+    cik = str(package.get("cik") or "").lstrip("0")
+    rows: list[tuple[str, str]] = []
+    for peer in database.list_packages_by_ticker(ticker, db_path=db_path):
+        if peer.get("package_id") == package.get("package_id"):
+            continue
+        peer_cik = str(peer.get("cik") or "").lstrip("0")
+        if cik and peer_cik != cik:
+            continue
+        url = str(peer.get("official_website_url") or "").strip()
+        if not url or str(peer.get("official_website_confidence") or "").upper() not in {"HIGH", "MEDIUM"}:
+            continue
+        rows.append((url, "Existing verified package metadata"))
+    return rows
+
+
 def resolve_official_company_website(
     package: dict[str, Any],
     *,
@@ -364,6 +452,7 @@ def resolve_official_company_website(
     raw.extend(_sec_submission_urls(package, session=session))
     if package.get("official_website_url"):
         raw.append((package["official_website_url"], "Existing verified company metadata"))
+    raw.extend(_urls_from_verified_package_metadata(package, db_path=db_path))
     filing_urls = _urls_from_sec_filings(package, db_path=db_path)
     for url, source in filing_urls:
         root_candidate = _company_root_candidate(url)
@@ -438,6 +527,43 @@ def extract_ir_entry_points(base_url: str, html: str) -> list[str]:
     )
 
 
+def extract_q4_public_endpoints(base_url: str, script_text: str, *, company_domain: str) -> list[str]:
+    """Return public Q4/static endpoints explicitly exposed by an official page or script."""
+    raw = re.findall(r"https?://[^\s\"'<>\\]+|(?:/[^\s\"'<>\\]+(?:\.json|\.xml|\.rss|\.pdf|\.pptx?))", script_text, flags=re.I)
+    raw.extend(
+        match.group(1)
+        for match in re.finditer(
+            r"[\"']([^\"']*(?:evergreen\.q4api|PressRelease|Event|Presentation|FinancialReport|NewsFeed)[^\"']*)[\"']",
+            script_text,
+            flags=re.I,
+        )
+    )
+    endpoints: list[str] = []
+    for value in raw:
+        candidate = canonicalize_url(urljoin(base_url, value.strip()))
+        if _q4_endpoint_allowed(company_domain, candidate):
+            endpoints.append(candidate)
+    return list(dict.fromkeys(endpoints))
+
+
+def _q4_endpoint_allowed(company_domain: str, url: str) -> bool:
+    parsed = urlparse(url)
+    domain = _domain(url)
+    path = parsed.path.lower()
+    query = parsed.query.lower()
+    if parsed.scheme != "https" or is_blocked_aggregator(domain):
+        return False
+    if any(term in path for term in Q4_PRIVATE_PATH_TERMS) or any(term in query for term in ("token=", "apikey=", "api_key=", "secret=")):
+        return False
+    related = _root_domain(domain) == _root_domain(company_domain) or _root_domain(domain) in Q4_PUBLIC_ROOT_DOMAINS
+    if not related:
+        return False
+    return any(
+        term in f"{domain}{path}".lower()
+        for term in ("q4api", "q4inc", "pressrelease", "news", "event", "presentation", "financial", ".json", ".xml", ".rss", ".pdf", ".ppt")
+    )
+
+
 def parse_sitemap(base_url: str, xml_text: str) -> list[str]:
     try:
         root = ElementTree.fromstring(xml_text)
@@ -509,7 +635,9 @@ def discover_official_ir_materials(
         if url in visited:
             continue
         candidate_domain = _domain(url)
-        directly_linked = candidate_domain in linked_domains
+        directly_linked = candidate_domain in linked_domains or (
+            method.startswith("q4_public") and _q4_endpoint_allowed(company_domain, url)
+        )
         if not ir_domain_allowed(company_domain, candidate_domain, directly_linked=directly_linked, analyst_confirmed=bool(analyst_confirmed_ir_url and url.startswith(analyst_confirmed_ir_url))):
             continue
         validation = validate_public_http_url(url)
@@ -591,6 +719,19 @@ def discover_official_ir_materials(
             warnings.append(f"NEEDS_MANUAL_REVIEW: {url}")
         for feed in parser.feeds:
             queue.append((urljoin(url, feed), "feed_link"))
+        for script in parser.scripts:
+            script_url = canonicalize_url(urljoin(url, script))
+            same_company_script = _root_domain(_domain(script_url)) == _root_domain(company_domain)
+            if (_q4_endpoint_allowed(company_domain, script_url) or (script_shell and same_company_script and urlparse(script_url).path.lower().endswith(".js"))) and len(visited) + len(queue) < config.IR_MAX_PAGES * 2:
+                queue.append((script_url, "q4_public_script"))
+        for endpoint in extract_q4_public_endpoints(url, text, company_domain=company_domain):
+            category, confidence = classify_ir_material("", endpoint)
+            extension = Path(urlparse(endpoint).path).suffix.lower()
+            if confidence != "LOW" and extension in {".pdf", ".ppt", ".pptx"}:
+                material = _material(package, Path(urlparse(endpoint).path).name, endpoint, page_canonical, "q4_public_endpoint", mimetypes.guess_type(endpoint)[0] or "application/octet-stream", _domain(endpoint))
+                materials[material.canonical_url] = material
+            elif len(visited) + len(queue) < config.IR_MAX_PAGES * 2:
+                queue.append((endpoint, "q4_public_endpoint"))
         for child in _json_ld_urls(url, parser.json_ld):
             child_domain = _domain(child)
             if not ir_domain_allowed(company_domain, child_domain, directly_linked=child_domain in linked_domains):
@@ -605,10 +746,14 @@ def discover_official_ir_materials(
             for point in extract_ir_entry_points(url, text):
                 if len(visited) + len(queue) < config.IR_MAX_PAGES * 2:
                     queue.append((point, "standard_path"))
+        if any(warning == f"NEEDS_MANUAL_REVIEW: {url}" for warning in warnings) and len(materials) == material_count_before:
+            manual = _manual_review_material(package, url, page_canonical, company_domain)
+            materials[manual.canonical_url] = manual
     for material in materials.values():
         _store_material(package["package_id"], run_id, material, db_path=db_path)
-    needs_review = sum(item.confidence == "LOW" or item.download_status == "NEEDS_MANUAL_REVIEW" for item in materials.values()) + len([w for w in warnings if w.startswith("NEEDS_MANUAL_REVIEW")])
-    status = "NEEDS_MANUAL_REVIEW" if warnings and not materials else "COMPLETED_WITH_WARNINGS" if warnings or errors else "COMPLETED"
+    needs_review = sum(item.confidence == "LOW" or item.download_status in {"NEEDS_MANUAL_REVIEW", "DATE_REVIEW_REQUIRED"} for item in materials.values())
+    review_only = bool(materials) and all(item.confidence == "LOW" or item.download_status in {"NEEDS_MANUAL_REVIEW", "DATE_REVIEW_REQUIRED"} for item in materials.values())
+    status = "NEEDS_MANUAL_REVIEW" if warnings and (not materials or review_only) else "COMPLETED_WITH_WARNINGS" if warnings or errors else "COMPLETED"
     completed = database.utc_now_iso()
     duration = max(0.0, (datetime.fromisoformat(completed) - datetime.fromisoformat(started)).total_seconds())
     database.update_ir_discovery_run(
@@ -627,17 +772,40 @@ def discover_official_ir_materials(
 def _material(package: dict[str, Any], title: str, url: str, discovery_page: str, method: str, mime_type: str, domain: str) -> OfficialIrMaterial:
     category, confidence = classify_ir_material(title, url)
     apparent = _date_from_text(f"{title} {url}")
-    eligible = window_from_package(package).contains(apparent or None)
+    eligible = bool(apparent) and window_from_package(package).contains(apparent)
+    status = "DISCOVERED" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "DATE_REVIEW_REQUIRED"
+    reason = "" if eligible else "Publication date is outside the selected research time window." if apparent else "Publication date could not be verified automatically."
     return OfficialIrMaterial(
         title=title or "Official company material", source_url=url, canonical_url=canonicalize_url(url),
         official_domain=domain, category=category, publication_date=apparent, document_date=apparent,
         mime_type=mime_type.split(";", 1)[0] or "application/octet-stream",
         file_extension=Path(urlparse(url).path).suffix.lower() or (".html" if "html" in mime_type else ""),
         discovery_page=discovery_page, discovery_method=method, confidence=confidence,
-        cutoff_eligibility="ELIGIBLE" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW,
-        download_status="DISCOVERED" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW,
+        cutoff_eligibility="ELIGIBLE" if eligible else config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW if apparent else "DATE_REVIEW_REQUIRED",
+        download_status=status,
         selected=eligible and confidence == "HIGH",
-        rejection_reason="" if eligible else "Publication date is outside the selected research time window.",
+        rejection_reason=reason,
+    )
+
+
+def _manual_review_material(package: dict[str, Any], url: str, discovery_page: str, domain: str) -> OfficialIrMaterial:
+    return OfficialIrMaterial(
+        title=f"{package.get('ticker') or 'Company'} official investor-relations page",
+        source_url=url,
+        canonical_url=canonicalize_url(url),
+        official_domain=domain,
+        category="Official Company Material",
+        publication_date="",
+        document_date="",
+        mime_type="text/html",
+        file_extension=".html",
+        discovery_page=discovery_page,
+        discovery_method="javascript_manual_review",
+        confidence="LOW",
+        cutoff_eligibility="DATE_REVIEW_REQUIRED",
+        download_status="NEEDS_MANUAL_REVIEW",
+        selected=False,
+        rejection_reason="The official page is JavaScript-loaded and no safe public static material endpoint was available.",
     )
 
 
@@ -662,7 +830,10 @@ def download_official_ir_materials(
     session: requests.Session | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, int]:
-    summary = {"selected": len(materials), "downloaded_now": 0, "already_collected": 0, "duplicate": 0, "failed": 0, "excluded": 0}
+    summary = {
+        "selected": len(materials), "downloaded_now": 0, "already_collected": 0,
+        "duplicate": 0, "failed": 0, "excluded": 0,
+    }
     for value in materials:
         item = value.__dict__ if isinstance(value, OfficialIrMaterial) else value
         if item.get("cutoff_eligibility") != "ELIGIBLE":
@@ -672,6 +843,7 @@ def download_official_ir_materials(
         existing = database.get_document_by_url(package["package_id"], canonical, db_path=db_path) or database.get_document_by_url(package["package_id"], item["source_url"], db_path=db_path)
         if existing and existing.get("collection_status") == config.DOCUMENT_STATUS_DOWNLOADED:
             summary["already_collected"] += 1
+            _set_ir_candidate_status(item, "ALREADY_COLLECTED", db_path=db_path)
             continue
         try:
             response = request_with_retries(item["source_url"], delay_seconds=config.IR_REQUEST_DELAY_SECONDS, session=session)
@@ -691,6 +863,7 @@ def download_official_ir_materials(
             sha = hashlib.sha256(content).hexdigest()
             if database.get_document_by_hash(package["package_id"], sha, db_path=db_path):
                 summary["duplicate"] += 1
+                _set_ir_candidate_status(item, "DUPLICATE", db_path=db_path)
                 continue
             filename = sanitize_filename(Path(urlparse(item["source_url"]).path).name or f"{package['ticker']}_{item['category']}{extension or '.html'}")
             path = safe_document_path(package["package_id"], "investor_relations", filename)
@@ -708,13 +881,14 @@ def download_official_ir_materials(
                 created["document_id"], {"canonical_url": canonical, "official_domain": item["official_domain"],
                                          "discovery_page": item.get("discovery_page"), "discovery_method": item.get("discovery_method"),
                                          "discovery_confidence": item.get("confidence"),
-                                         "selected_window_status": "ELIGIBLE"}, db_path=db_path,
+                                         "selected_window_status": "ELIGIBLE",
+                                         "final_category_code": IR_CATEGORY_CODE_MAP.get(str(item.get("category") or ""), "company_press_release")}, db_path=db_path,
             )
-            if item.get("candidate_id"):
-                database.update_ir_material_candidate(item["candidate_id"], {"download_status": "DOWNLOADED"}, db_path=db_path)
+            _set_ir_candidate_status(item, "DOWNLOADED_NOW", db_path=db_path)
             summary["downloaded_now"] += 1
-        except Exception:
+        except Exception as exc:
             summary["failed"] += 1
+            _set_ir_candidate_status(item, "FAILED", reason=str(exc), db_path=db_path)
     run_ids = {
         str((value.__dict__ if isinstance(value, OfficialIrMaterial) else value).get("discovery_run_id") or "")
         for value in materials
@@ -728,3 +902,159 @@ def download_official_ir_materials(
                 db_path=db_path,
             )
     return summary
+
+
+def _set_ir_candidate_status(
+    item: dict[str, Any], status: str, *, reason: str | None = None, db_path: Path | str
+) -> None:
+    candidate_id = item.get("candidate_id")
+    if not candidate_id:
+        return
+    updates: dict[str, Any] = {"download_status": status}
+    if reason:
+        updates["rejection_reason"] = reason[:500]
+    database.update_ir_material_candidate(str(candidate_id), updates, db_path=db_path)
+
+
+def resolve_and_collect_official_ir_materials(
+    package: dict[str, Any],
+    *,
+    selected_workspace_categories: list[str] | tuple[str, ...] | None = None,
+    analyst_ir_url: str | None = None,
+    search_provider: SearchProvider | None = None,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> OfficialIrCollectionResult:
+    """Resolve, discover, classify, and download official IR materials in one auditable flow."""
+    selected_categories = {
+        category
+        for workspace_label in selected_workspace_categories or ()
+        for category in WORKSPACE_CATEGORY_MAP.get(workspace_label, frozenset())
+    }
+    active_provider = search_provider
+    if active_provider is None and config.SEARCH_PROVIDER == "brave" and config.SEARCH_API_KEY:
+        active_provider = BraveSearchProvider(config.SEARCH_API_KEY, session=session)
+
+    resolved, candidates = resolve_official_company_website(
+        package,
+        analyst_url=str(analyst_ir_url or "").strip() or None,
+        search_provider=active_provider,
+        session=session,
+        db_path=db_path,
+    )
+    if not resolved:
+        reason = "No official company website could be verified from SEC metadata, package metadata, SEC filings, the optional override, or the configured search provider."
+        _record_ir_resolution_failure(package, reason, db_path=db_path)
+        return OfficialIrCollectionResult(
+            None, None, "NOT_FOUND", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            (reason, *tuple(reason for candidate in candidates for reason in candidate.rejection_reasons[:1])),
+        )
+
+    refreshed = database.get_package_by_package_id(package["package_id"], db_path=db_path) or package
+    discovery = discover_official_ir_materials(
+        refreshed,
+        resolved.url,
+        analyst_confirmed_ir_url=str(analyst_ir_url or "").strip() or None,
+        session=session,
+        db_path=db_path,
+    )
+    run_id = discovery["run_id"]
+    inventory = [
+        row for row in database.list_ir_material_candidates(package["package_id"], db_path=db_path)
+        if row.get("discovery_run_id") == run_id
+    ]
+    downloadable: list[dict[str, Any]] = []
+    status_counts = {
+        "not_selected": 0,
+        "outside_selected_window": 0,
+        "date_review_required": 0,
+        "needs_manual_review": 0,
+    }
+    for item in inventory:
+        status = str(item.get("download_status") or "")
+        reason = str(item.get("rejection_reason") or "")
+        selected = False
+        if status == "NEEDS_MANUAL_REVIEW" or item.get("confidence") != "HIGH":
+            status = "NEEDS_MANUAL_REVIEW"
+            reason = reason or "The material requires analyst review before download."
+            status_counts["needs_manual_review"] += 1
+        elif item.get("cutoff_eligibility") == "DATE_REVIEW_REQUIRED" or not item.get("publication_date"):
+            status = "DATE_REVIEW_REQUIRED"
+            reason = reason or "Publication date could not be verified automatically."
+            status_counts["date_review_required"] += 1
+        elif item.get("cutoff_eligibility") != "ELIGIBLE":
+            status = config.DOCUMENT_STATUS_OUTSIDE_SELECTED_WINDOW
+            reason = reason or "Publication date is outside the selected research time window."
+            status_counts["outside_selected_window"] += 1
+        elif item.get("category") not in selected_categories:
+            status = "NOT_SELECTED"
+            reason = "The material category was not selected in the workspace."
+            status_counts["not_selected"] += 1
+        else:
+            status = "DISCOVERED"
+            selected = True
+            downloadable.append(item)
+        database.update_ir_material_candidate(
+            item["candidate_id"],
+            {"selected": int(selected), "download_status": status, "rejection_reason": reason or None},
+            db_path=db_path,
+        )
+
+    downloads = download_official_ir_materials(refreshed, downloadable, session=session, db_path=db_path)
+    official_ir_url = discovery.get("ir_url") or refreshed.get("official_ir_url")
+    resolution_status = (
+        "NEEDS_MANUAL_REVIEW"
+        if discovery.get("status") == "NEEDS_MANUAL_REVIEW" or status_counts["needs_manual_review"]
+        else "COMPLETED_WITH_WARNINGS"
+        if discovery.get("warnings") or discovery.get("errors")
+        else "COMPLETED"
+    )
+    database.update_ir_discovery_run(
+        run_id,
+        {
+            "materials_downloaded": downloads["downloaded_now"],
+            "materials_needing_review": status_counts["needs_manual_review"] + status_counts["date_review_required"],
+        },
+        db_path=db_path,
+    )
+    return OfficialIrCollectionResult(
+        resolved.url,
+        official_ir_url,
+        resolution_status,
+        int(discovery.get("pages_crawled") or 0),
+        len(inventory),
+        downloads["downloaded_now"],
+        downloads["already_collected"],
+        downloads["duplicate"],
+        status_counts["not_selected"],
+        status_counts["outside_selected_window"],
+        status_counts["date_review_required"],
+        status_counts["needs_manual_review"],
+        downloads["failed"],
+        tuple(discovery.get("warnings") or ()) + tuple(discovery.get("errors") or ()),
+    )
+
+
+def _record_ir_resolution_failure(package: dict[str, Any], reason: str, *, db_path: Path | str) -> None:
+    now = database.utc_now_iso()
+    database.create_ir_discovery_run(
+        {
+            "discovery_run_id": f"IRDISC-{secrets.token_hex(8).upper()}",
+            "package_id": package["package_id"],
+            "official_url": None,
+            "official_domain": None,
+            "ir_url": None,
+            "ir_domain": None,
+            "status": "NOT_FOUND",
+            "started_at": now,
+            "completed_at": now,
+            "duration_seconds": 0.0,
+            "pages_crawled": 0,
+            "materials_discovered": 0,
+            "materials_downloaded": 0,
+            "materials_needing_review": 0,
+            "warnings_json": json.dumps([reason]),
+            "errors_json": "[]",
+        },
+        db_path=db_path,
+    )

@@ -4,7 +4,7 @@ Cutler Research AI is an internal Streamlit research product for searching a tic
 
 ## Current Status
 
-Implemented through the final Phase 4 stabilization pass:
+Implemented through the Phase 5 analyst-readiness pass:
 
 - Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
@@ -14,6 +14,7 @@ Implemented through the final Phase 4 stabilization pass:
 - Phase 6: deterministic financial metrics, evidence-backed scorecards, bull/base/bear scenarios, OpenAI-validated evidence interpretation and narrative generation, Buy/Hold/Sell/Insufficient Evidence/Analyst Review Required recommendations, analyst review, PM approval, DOCX/PDF reports, citation audits, report versioning, and report hashes.
 - Phase 7: polished three-screen workflow, SEC-backed ticker search, consolidated Research Workspace, simplified Investment Result page, resumable workflow orchestration, recent research history, Advanced Workbench navigation, and a combined research-package plus AI-report ZIP export.
 - Final stabilization: one-page PM memo, readable citations, collapsed audit details, document-level processing checkpoints and timings, bounded parsing concurrency, incremental OpenAI extraction, comparable-only conflict analysis, flexible year/month research windows, and deployment storage notices.
+- Phase 5 analyst readiness: automatic official company/IR resolution from the primary collection action, conservative Q4 public-endpoint discovery, selected-category and research-window IR downloads, IR package/checklist integration, ranked memo evidence candidates, mandatory structured memo synthesis, and a persisted memo quality gate.
 
 Not implemented: authentication, cloud deployment, continuous monitoring, or trading integration. The system does not execute trades.
 
@@ -34,7 +35,7 @@ Automated Research supports:
 - One or more calendar years, with one or more months when exactly one year is selected.
 - Research cutoff date, blocked from future dates by default.
 - SEC form selection: 10-K, 10-Q, 8-K, DEF 14A, 20-F, and 6-K.
-- Public company material preferences and an optional investor-relations URL.
+- Public company material preferences and an optional official IR URL override. Leaving it blank runs automatic official-site discovery after SEC collection.
 - A planned collection preview and a real collection timeline derived from collection runs, upload runs, documents, checklist rows, and readiness validation.
 
 Additional Research supports the existing secure upload workflow for authorized Bloomberg, Morningstar, FactSet, sell-side, credit, transcript, model, activist, industry, company-material, and internal files. Existing file validation, signature checks, ZIP inspection, duplicate detection, classification suggestions, category correction, authorization acknowledgement, and audit recording remain in force.
@@ -47,7 +48,11 @@ The primary proceed action calls the existing services in sequence:
 4. Run document processing and evidence extraction.
 5. Verify citations through the existing evidence pipeline.
 6. Run deterministic investment analysis.
-7. Generate a draft DOCX/PDF investment report.
+7. Select and rank eligible memo evidence candidates.
+8. Use structured OpenAI output to synthesize the memo from only those candidates.
+9. Validate candidate IDs, values, periods, units, citations, sentence completeness, recency, diversity, and one-page fit before generating DOCX/PDF artifacts.
+
+If memo synthesis or QA fails, package processing and analysis remain complete. The Result page shows `MEMO_GENERATION_FAILED` context in Audit Details and offers `Retry Memo Generation`, which reruns only memo synthesis and report QA.
 
 Workflow state is persisted in `research_workflow_runs`, including version ID, processing run ID, analysis run ID, report ID, stage statuses, warnings, errors, and an idempotency key so Streamlit reruns do not duplicate backend runs.
 
@@ -190,7 +195,7 @@ Final reports require PM approval. Approval does not execute trades.
 
 Phase 6 generates both DOCX and PDF reports. DOCX uses `python-docx`; PDF uses ReportLab and does not require Microsoft Word.
 
-The primary memo contains the company and ticker, cutoff date, recommendation, confidence, investment view, three to five supporting facts, key risks, missing information, a conclusion, and readable source citations. Technical identifiers and detailed ledgers remain in the audit ZIP.
+The primary memo contains the company and ticker, cutoff date, recommendation, confidence, investment view, three to five eligible supporting facts when available, distinct material risks, missing information, a conclusion, and readable source citations. It is rendered only after the memo quality audit passes or passes with noncritical warnings. Technical identifiers, selected/rejected candidates, rejection reasons, recency decisions, and detailed ledgers remain in Audit Details and the audit exports.
 
 Reports are written under:
 
@@ -220,6 +225,10 @@ Key Phase 6 and Phase 7 settings:
 - `SCORECARD_VERSION`
 - `VALUATION_CONFIGURATION_VERSION`
 - `REPORT_TEMPLATE_VERSION`
+- `MEMO_SYNTHESIS_REQUIRED`
+- `MEMO_PROMPT_VERSION`
+- `MEMO_SCHEMA_VERSION`
+- `MEMO_MAX_OUTPUT_TOKENS`
 - `MIN_EVIDENCE_COVERAGE`
 - `BUY_SCORE_THRESHOLD`
 - `HOLD_SCORE_THRESHOLD`
@@ -288,4 +297,4 @@ Direct page navigation is supported for the primary workflow and the Advanced Wo
 
 ## Known Limitations
 
-The final stabilization pass does not add Bloomberg, FactSet, Morningstar, mandatory browser automation, live market data, portfolio allocation, trade execution, or a new frontend framework. JavaScript-only official IR pages remain available for analyst manual review. SEC public collection still requires a configured SEC user agent. Investor-relations discovery remains conservative and may require an analyst-supplied public IR URL. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations and recommendation rules depend on the quality and structure of evidence extraction.
+The Phase 5 pass does not add Bloomberg, FactSet, Morningstar, mandatory browser automation, live market data, portfolio allocation, trade execution, or a new frontend framework. JavaScript-only official IR pages remain available for analyst manual review when no safe public static endpoint is exposed. SEC public collection still requires a configured SEC user agent. Investor-relations discovery remains conservative; an analyst URL is an optional override, not a prerequisite. Scenario valuation abstains when package-contained valuation inputs are missing. Calculations and recommendation rules depend on the quality and structure of evidence extraction.

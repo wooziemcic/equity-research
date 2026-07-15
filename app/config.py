@@ -86,15 +86,19 @@ ANALYSIS_PIPELINE_VERSION = os.getenv("ANALYSIS_PIPELINE_VERSION", "6.0")
 ANALYSIS_CONFIGURATION_VERSION = os.getenv("ANALYSIS_CONFIGURATION_VERSION", "6.0")
 SCORECARD_VERSION = os.getenv("SCORECARD_VERSION", "6.0")
 VALUATION_CONFIGURATION_VERSION = os.getenv("VALUATION_CONFIGURATION_VERSION", "6.0")
-_configured_report_template_version = os.getenv("REPORT_TEMPLATE_VERSION", "7.0").strip()
+_configured_report_template_version = os.getenv("REPORT_TEMPLATE_VERSION", "8.0").strip()
 try:
     REPORT_TEMPLATE_VERSION = (
         _configured_report_template_version
-        if float(_configured_report_template_version) >= 7.0
-        else "7.0"
+        if float(_configured_report_template_version) >= 8.0
+        else "8.0"
     )
 except ValueError:
-    REPORT_TEMPLATE_VERSION = "7.0"
+    REPORT_TEMPLATE_VERSION = "8.0"
+MEMO_SYNTHESIS_REQUIRED = os.getenv("MEMO_SYNTHESIS_REQUIRED", "true").strip().lower() in {"1", "true", "yes", "on"}
+MEMO_PROMPT_VERSION = os.getenv("MEMO_PROMPT_VERSION", "1.0")
+MEMO_SCHEMA_VERSION = os.getenv("MEMO_SCHEMA_VERSION", "1.0")
+MEMO_MAX_OUTPUT_TOKENS = max(1000, int(os.getenv("MEMO_MAX_OUTPUT_TOKENS", "4000")))
 MIN_EVIDENCE_COVERAGE = float(os.getenv("MIN_EVIDENCE_COVERAGE", "0.55"))
 BUY_SCORE_THRESHOLD = float(os.getenv("BUY_SCORE_THRESHOLD", "7.25"))
 HOLD_SCORE_THRESHOLD = float(os.getenv("HOLD_SCORE_THRESHOLD", "4.75"))

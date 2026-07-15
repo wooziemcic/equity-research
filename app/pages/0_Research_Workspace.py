@@ -142,7 +142,7 @@ def _header(package: dict[str, Any]) -> None:
 
 def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
     st.markdown('<div class="workflow-card-title">Automated Research</div>', unsafe_allow_html=True)
-    st.caption("Collect supported SEC filings and optional public company materials from an analyst-supplied IR URL.")
+    st.caption("Collect selected SEC filings, then automatically resolve and collect official investor-relations materials.")
 
     cutoff = st.date_input(
         "Research cutoff date",
@@ -200,7 +200,7 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
         key=f"public_materials_{package['package_id']}",
     )
     ir_url = st.text_input(
-        "Investor-relations URL",
+        "Optional official IR URL override",
         placeholder="https://investors.example.com",
         key=f"ir_url_{package['package_id']}",
     )
@@ -226,13 +226,13 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
         selected_label = "Selected" if item["selected"] else "Not selected"
         selected_class = "is-selected" if item["selected"] else "is-idle"
         ir_value = item["ir_url_available"]
-        ir_label = "Not required" if ir_value is None else "Available" if ir_value else "Not available"
+        discovery_label = "SEC filing-date filter" if ir_value is None else "Optional manual override supplied" if ir_value else "Automatic official-site discovery after SEC collection"
         plan_html.append(
             '<div class="collection-plan-row">'
             f'<div class="collection-plan-source">{html.escape(str(item["source"]))}</div>'
             f'<div class="collection-plan-method">{html.escape(str(item["collection_method"]))}</div>'
             f'<div class="collection-plan-status {selected_class}">{selected_label}</div>'
-            f'<div class="collection-plan-ir">IR URL: {ir_label}</div>'
+            f'<div class="collection-plan-ir">{html.escape(discovery_label)} · Research window applied</div>'
             "</div>"
         )
     plan_html.append("</div>")
@@ -240,11 +240,12 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
     if st.button("Start Research Collection", type="primary", use_container_width=True, disabled=not filing_types):
         refreshed = database.get_package_by_package_id(package["package_id"]) or package
         try:
-            with st.spinner("Running public collection through existing collectors..."):
+            with st.spinner("Collecting SEC filings and resolving official investor-relations materials..."):
                 result = start_automated_collection(
                     refreshed,
                     filing_types=list(filing_types),
                     ir_url=ir_url.strip() or None,
+                    public_materials=list(public_materials),
                 )
             st.session_state[config.SESSION_COLLECTION_STATE] = {
                 "sec_summary": result.sec_summary,
@@ -256,7 +257,7 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
                 st.error("; ".join(result.errors))
             else:
                 st.success(
-                    f"Collection finished: SEC {result.sec_summary['downloaded']} downloaded, IR {result.ir_summary['downloaded']} downloaded."
+                    f"Collection finished: SEC {result.sec_summary['downloaded']} downloaded, official IR {result.ir_summary['downloaded_now']} downloaded."
                 )
             for warning in result.warnings:
                 st.warning(warning)
@@ -265,6 +266,10 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
             st.error(f"Research collection failed: {exc}")
         st.rerun()
 
+    collection_state = st.session_state.get(config.SESSION_COLLECTION_STATE) or {}
+    if collection_state:
+        _collection_result_summary(collection_state)
+
     return {
         "filing_years": years,
         "cutoff": cutoff,
@@ -272,6 +277,28 @@ def _automated_research_card(package: dict[str, Any]) -> dict[str, Any]:
         "public_materials": public_materials,
         "ir_url": ir_url,
     }
+
+
+def _collection_result_summary(state: dict[str, Any]) -> None:
+    sec = state.get("sec_summary") or {}
+    ir = state.get("ir_summary") or {}
+    st.markdown("**Latest collection result**")
+    sec_cols = st.columns(5)
+    for column, label, key in zip(sec_cols, ("SEC discovered", "Downloaded now", "Already collected", "Excluded", "Failed"), ("discovered", "downloaded", "already_collected", "skipped", "failed")):
+        column.metric(label, int(sec.get(key) or 0))
+    ir_cols = st.columns(5)
+    for column, label, key in zip(ir_cols, ("IR pages", "Materials", "Downloaded now", "Manual review", "Failed"), ("pages_crawled", "materials_discovered", "downloaded_now", "needs_manual_review", "failed")):
+        column.metric(label, int(ir.get(key) or 0))
+    links = st.columns(3)
+    if ir.get("official_website"):
+        links[0].link_button("Open official website", ir["official_website"], use_container_width=True)
+    if ir.get("official_ir_site"):
+        links[1].link_button("Open official IR site", ir["official_ir_site"], use_container_width=True)
+    links[2].page_link("pages/2_Document_Collection.py", label="Review discovered materials", use_container_width=True)
+    st.caption(
+        f"Already collected: {int(ir.get('already_collected') or 0)} · Not selected: {int(ir.get('not_selected') or 0)} · "
+        f"Outside window: {int(ir.get('outside_selected_window') or 0)} · Date review: {int(ir.get('date_review_required') or 0)}"
+    )
 
 
 def _additional_research_card(package: dict[str, Any]) -> None:

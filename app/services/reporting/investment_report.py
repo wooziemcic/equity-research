@@ -14,6 +14,7 @@ from typing import Any
 from app import config
 from app.services.package_builder import sha256_file
 from app.services.reporting.docx_generator import build_docx_report
+from app.services.reporting.memo_quality import MemoGenerationError, audit_memo_quality, synthesize_memo
 from app.services.reporting.pdf_generator import build_pdf_report
 from app.services.workspace_service import ensure_inside, sanitize_filename
 from app.utils import database
@@ -125,7 +126,10 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
     )
     sections: list[dict[str, Any]] = [
         {"title": f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary", "paragraphs": [header]},
-        {"title": "Investment View", "paragraphs": [memo["investment_view"]]},
+        {
+            "title": "Investment View",
+            "paragraphs": [memo["investment_view"], *memo.get("investment_view_citations", [])],
+        },
         {"title": "Key Supporting Facts", "paragraphs": _fact_paragraphs(memo.get("supporting_facts", memo.get("supporting_evidence", []))[:5])},
     ]
     sections.extend(
@@ -147,7 +151,7 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
 def _fact_paragraphs(items: list[dict[str, str]]) -> list[str]:
     paragraphs: list[str] = []
     for item in items:
-        paragraphs.extend((_limit_words(item["claim"], 45), item["citation"]))
+        paragraphs.extend((item["claim"], item["citation"]))
     return paragraphs
 
 
@@ -450,10 +454,6 @@ def fit_memo_to_one_page(memo: dict[str, Any]) -> dict[str, Any]:
                 fitted["risks"].pop()
             elif len(fitted.get("missing_information", [])) > 1:
                 fitted["missing_information"].pop()
-            elif len(str(fitted.get("investment_view") or "").split()) > 80:
-                fitted["investment_view"] = _limit_words(fitted["investment_view"], 80)
-            elif len(str(fitted.get("conclusion") or "").split()) > 55:
-                fitted["conclusion"] = _limit_words(fitted["conclusion"], 55)
             else:
                 break
     finally:
@@ -468,7 +468,11 @@ def _pdf_page_count(path: Path) -> int:
 
 
 def generate_investment_report(
-    analysis_run_id: str, *, final: bool = False, db_path: Path | str = config.DATABASE_PATH,
+    analysis_run_id: str,
+    *,
+    final: bool = False,
+    client: Any | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     run = database.get_analysis_run(analysis_run_id, db_path=db_path)
     if not run:
@@ -483,7 +487,27 @@ def generate_investment_report(
     audit = citation_audit(analysis_run_id, db_path=db_path)
     if final and audit["status"] != "PASSED":
         raise ValueError("Final report citation audit failed.")
-    memo = fit_memo_to_one_page(build_compact_memo(analysis_run_id, db_path=db_path))
+    memo, attempt_id, candidates = synthesize_memo(analysis_run_id, client=client, db_path=db_path)
+    try:
+        memo = fit_memo_to_one_page(memo)
+    except ValueError as exc:
+        audit_memo_quality(
+            memo, candidates, attempt_id=attempt_id, analysis_run_id=analysis_run_id,
+            one_page_fit=False, db_path=db_path,
+        )
+        raise MemoGenerationError(
+            "Memo requires review before release because it did not fit one page.",
+            attempt_id=attempt_id,
+        ) from exc
+    memo_audit = audit_memo_quality(
+        memo, candidates, attempt_id=attempt_id, analysis_run_id=analysis_run_id,
+        one_page_fit=True, db_path=db_path,
+    )
+    if memo_audit["status"] == "FAILED":
+        raise MemoGenerationError(
+            "Memo requires review before release because its quality audit failed.",
+            attempt_id=attempt_id,
+        )
     fingerprint = _report_fingerprint(run, decision, memo, db_path=db_path)
     desired_status = config.REPORT_STATUS_FINAL if final else config.REPORT_STATUS_DRAFT
     for existing in database.list_generated_reports(analysis_run_id, db_path=db_path):
@@ -509,6 +533,7 @@ def generate_investment_report(
         "docx_path": str(docx_path), "docx_sha256": sha256_file(docx_path),
         "pdf_path": str(pdf_path), "pdf_sha256": sha256_file(pdf_path),
         "template_version": config.REPORT_TEMPLATE_VERSION, "citation_audit_status": audit["status"],
+        "memo_generation_attempt_id": attempt_id, "memo_quality_status": memo_audit["status"],
         "warnings_json": json.dumps([] if audit["status"] == "PASSED" else ["Draft memo contains citation audit warnings."]),
         "input_fingerprint": fingerprint, "report_mode": config.REPORT_MODE,
         "memo_json": json.dumps(memo, sort_keys=True), "duration_seconds": round(perf_counter() - started, 6),
