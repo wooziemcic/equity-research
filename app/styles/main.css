@@ -250,6 +250,25 @@ button[data-testid="stBaseButton-primaryFormSubmit"]:disabled {
     color: rgba(255, 255, 255, 0.55) !important;
 }
 
+button[data-testid="stBaseButton-secondary"]:not(:disabled) {
+    background: var(--panel-2);
+    border-color: var(--border);
+    color: var(--text) !important;
+}
+
+button[data-testid="stBaseButton-secondary"]:not(:disabled):hover,
+button[data-testid="stBaseButton-secondary"]:not(:disabled):focus {
+    background: #262d33;
+    border-color: #6e7880;
+    color: #ffffff !important;
+}
+
+button[data-testid="stBaseButton-secondary"]:disabled {
+    background: #171c21;
+    border-color: var(--border);
+    color: var(--muted-2) !important;
+}
+
 .ticker-search-wrap .stButton button:hover {
     background: #cf343c;
     border-color: #cf343c;

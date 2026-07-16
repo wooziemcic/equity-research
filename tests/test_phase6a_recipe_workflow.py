@@ -188,7 +188,7 @@ def test_migration_is_additive_idempotent_and_test_database_isolated(tmp_path: P
     after = database.get_package_by_package_id(legacy["package_id"], db_path=db_path)
     assert before == after
     details = database_audit_details(db_path=db_path)
-    assert details == {"environment": "TEST", "storage": "Temporary", "package_count": 1, "most_recent_package_id": legacy["package_id"], "schema_version": "6A.0"}
+    assert details == {"environment": "TEST", "storage": "Temporary", "package_count": 1, "most_recent_package_id": legacy["package_id"], "schema_version": "6B.0"}
     assert runtime_state == (runtime_path.exists(), runtime_path.stat().st_mtime_ns if runtime_path.exists() else None)
 
 
@@ -322,7 +322,7 @@ def test_legacy_clone_and_snapshot_import_create_distinct_drafts(active_recipe_d
     assert get_package_recipe_instance(imported["package_id"], db_path=db_path)
 
 
-def test_board_contract_has_sections_mobile_css_and_deferred_search(active_recipe_db: tuple[Path, dict]) -> None:
+def test_board_contract_has_sections_mobile_css_and_targeted_search(active_recipe_db: tuple[Path, dict]) -> None:
     db_path, _ = active_recipe_db
     package = _create_recipe_package(db_path)
     payload = board_payload(package["package_id"], db_path=db_path)
@@ -334,5 +334,5 @@ def test_board_contract_has_sections_mobile_css_and_deferred_search(active_recip
     page = (config.PROJECT_ROOT / "app" / "pages" / "8_Package_Assembly.py").read_text(encoding="utf-8")
     css = config.STYLE_PATH.read_text(encoding="utf-8")
     assert "Comprehensive Equity Research Package" in page
-    assert "Find Automatically - Available in Phase 6B" in page
+    assert 'st.button("Find Automatically"' in page
     assert ".assembly-mobile" in css and "@media (max-width: 760px)" in css

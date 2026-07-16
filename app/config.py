@@ -395,9 +395,24 @@ BRAVE_SEARCH_API_KEY = str(_PROJECT_DOTENV.get("BRAVE_SEARCH_API_KEY") or os.get
 BRAVE_SEARCH_ENDPOINT = str(_PROJECT_DOTENV.get("BRAVE_SEARCH_ENDPOINT") or os.getenv(
     "BRAVE_SEARCH_ENDPOINT", "https://api.search.brave.com/res/v1/web/search"
 )).strip()
-BRAVE_SEARCH_MAX_RESULTS = max(1, int(os.getenv("BRAVE_SEARCH_MAX_RESULTS", "10")))
+BRAVE_SEARCH_COUNTRY = os.getenv("BRAVE_SEARCH_COUNTRY", "US").strip().upper()
+BRAVE_SEARCH_LANGUAGE = os.getenv("BRAVE_SEARCH_LANGUAGE", "en").strip().lower()
+BRAVE_SEARCH_UI_LANGUAGE = os.getenv("BRAVE_SEARCH_UI_LANGUAGE", "en-US").strip()
+BRAVE_SEARCH_SAFESEARCH = os.getenv("BRAVE_SEARCH_SAFESEARCH", "moderate").strip().lower()
+BRAVE_SEARCH_EXTRA_SNIPPETS = os.getenv("BRAVE_SEARCH_EXTRA_SNIPPETS", "true").strip().lower() in {"1", "true", "yes", "on"}
+BRAVE_MAX_RESULTS_PER_QUERY = max(1, min(20, int(os.getenv("BRAVE_MAX_RESULTS_PER_QUERY", os.getenv("BRAVE_SEARCH_MAX_RESULTS", "10")))))
+BRAVE_SEARCH_MAX_RESULTS = BRAVE_MAX_RESULTS_PER_QUERY
 BRAVE_MAX_QUERIES_PER_PACKAGE = max(1, int(os.getenv("BRAVE_MAX_QUERIES_PER_PACKAGE", "40")))
 BRAVE_MAX_QUERIES_PER_SLOT = max(1, int(os.getenv("BRAVE_MAX_QUERIES_PER_SLOT", "3")))
+BRAVE_MAX_PAGES_PER_QUERY = max(1, min(2, int(os.getenv("BRAVE_MAX_PAGES_PER_QUERY", "2"))))
+BRAVE_QUERY_CACHE_HOURS = max(1, int(os.getenv("BRAVE_QUERY_CACHE_HOURS", "24")))
+BRAVE_REQUEST_TIMEOUT_SECONDS = max(1.0, float(os.getenv("BRAVE_REQUEST_TIMEOUT_SECONDS", "20")))
+BRAVE_REQUEST_MAX_RETRIES = max(0, int(os.getenv("BRAVE_REQUEST_MAX_RETRIES", "2")))
+BRAVE_REQUEST_BACKOFF_SECONDS = max(0.0, float(os.getenv("BRAVE_REQUEST_BACKOFF_SECONDS", "1.0")))
+BRAVE_COST_PER_1000_REQUESTS = _optional_float("BRAVE_COST_PER_1000_REQUESTS")
+OPENAI_DISCOVERY_CLASSIFICATION_ENABLED = os.getenv("OPENAI_DISCOVERY_CLASSIFICATION_ENABLED", "false").strip().lower() in {"1", "true", "yes", "on"}
+OPENAI_DISCOVERY_MAX_CANDIDATES_PER_SLOT = max(1, int(os.getenv("OPENAI_DISCOVERY_MAX_CANDIDATES_PER_SLOT", "5")))
+OPENAI_DISCOVERY_MAX_CALLS_PER_PACKAGE = max(1, int(os.getenv("OPENAI_DISCOVERY_MAX_CALLS_PER_PACKAGE", "5")))
 IR_MAX_REDIRECTS = max(0, int(os.getenv("IR_MAX_REDIRECTS", "5")))
 IR_REQUEST_DELAY_SECONDS = float(os.getenv("IR_REQUEST_DELAY_SECONDS", "0.2"))
 OPENAI_EVIDENCE_PROMPT_VERSION = os.getenv("OPENAI_EVIDENCE_PROMPT_VERSION", "1.0")
@@ -466,4 +481,4 @@ def sec_user_agent_is_configured() -> bool:
 
 def brave_search_api_key() -> str:
     """Resolve the optional Brave key lazily after Streamlit page configuration."""
-    return _secret_setting("BRAVE_SEARCH_API_KEY", "").strip()
+    return (_secret_setting("BRAVE_SEARCH_API_KEY", "") or _secret_setting("SEARCH_API_KEY", "")).strip()

@@ -8,6 +8,7 @@ import streamlit as st
 from app import config
 from app.components.layout import bootstrap_page
 from app.components.sidebar import render_sidebar
+from app.services.default_recipe_service import bundled_recipe_status, initialize_default_common_equity_recipe
 from app.services.package_recipe_service import (
     activate_recipe,
     approve_recipe,
@@ -37,6 +38,47 @@ REQUIREMENT_OPTIONS = ["REQUIRED", "RECOMMENDED", "OPTIONAL", "CONDITIONAL", "MA
 
 def _actor() -> str:
     return st.session_state.get("recipe_admin_actor", "") or "administrator"
+
+
+def _default_recipe_recovery() -> None:
+    st.subheader("Default Common Equity Recipe")
+    status = bundled_recipe_status()
+    active = status.get("active_recipe") or {}
+    cols = st.columns(3)
+    if cols[0].button("Initialize Default Common Equity Recipe"):
+        result = initialize_default_common_equity_recipe()
+        if result["status"] == "ADMIN_RECOVERY_REQUIRED":
+            st.warning("Common Equity recipes exist but none is active. Select and activate an approved version explicitly.")
+        else:
+            st.success("Default recipe initialization verified. No duplicate recipe was created.")
+        st.rerun()
+    if cols[1].button("Verify Active Recipe"):
+        st.session_state["default_recipe_verification"] = status
+    approved = [row for row in list_recipes() if row["security_type"] == "Common Equity" and row["status"] == "APPROVED"]
+    if approved:
+        choices = {f"{row['recipe_name']} v{row['version']}": row["recipe_id"] for row in approved}
+        selected = st.selectbox("Approved recipe to activate", list(choices), key="approved_recipe_recovery")
+        if cols[2].button("Activate Approved Recipe"):
+            activate_recipe(choices[selected], actor=_actor())
+            st.success("Approved recipe activated for new packages.")
+            st.rerun()
+    else:
+        cols[2].button("Activate Approved Recipe", disabled=True)
+    if active:
+        st.dataframe(
+            [{
+                "Active recipe": active.get("recipe_name"), "Version": active.get("version"),
+                "Checksum": active.get("source_workbook_hash"), "Slot count": active.get("slot_count"),
+                "Activation date": active.get("approved_at"),
+                "Initialization source": active.get("source_sheet"),
+                "Database environment": status["database_environment"],
+                "Validation result": status["validation_result"],
+            }],
+            hide_index=True,
+            use_container_width=True,
+        )
+    else:
+        st.info("No Common Equity recipe is active. Administrative recovery is required.")
 
 
 def _import_panel() -> None:
@@ -173,6 +215,7 @@ def main() -> None:
     st.markdown('<div class="eyebrow">Administrator Workflow</div>', unsafe_allow_html=True)
     st.title("Recipe Administration")
     st.write("Review workbook provenance, normalize ordered slots, and explicitly approve versioned recipes.")
+    _default_recipe_recovery()
     _import_panel()
     recipes = list_recipes()
     if recipes:
@@ -198,7 +241,7 @@ def main() -> None:
         st.json(details)
         brave = "Disabled" if config.SEARCH_PROVIDER != "brave" else "Configured" if config.brave_search_api_key() else "Not configured"
         st.write(f"Brave Search: {brave}")
-        st.caption("No Brave request is available in Phase 6A.")
+        st.caption("Connection tests run only from an explicit action in Advanced Workbench.")
 
 
 if __name__ == "__main__":

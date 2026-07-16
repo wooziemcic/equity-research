@@ -1086,8 +1086,9 @@ def resolve_and_collect_official_ir_materials(
         for category in WORKSPACE_CATEGORY_MAP.get(workspace_label, frozenset())
     }
     active_provider = search_provider
-    if active_provider is None and config.SEARCH_PROVIDER == "brave" and config.SEARCH_API_KEY:
-        active_provider = BraveSearchProvider(config.SEARCH_API_KEY, session=session)
+    brave_key = config.brave_search_api_key()
+    if active_provider is None and config.SEARCH_PROVIDER == "brave" and brave_key:
+        active_provider = BraveSearchProvider(brave_key, session=session)
 
     resolved, candidates = resolve_official_company_website(
         package,

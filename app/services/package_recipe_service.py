@@ -307,7 +307,8 @@ def list_slot_instances(package_id: str, *, db_path: Path | str = config.DATABAS
     with database.get_connection(db_path) as connection:
         rows = connection.execute(
             """SELECT psi.*, rs.section_code, rs.normalized_slot_type, rs.manual_upload_allowed,
-                      rs.auto_search_enabled, rs.freshness_rule
+                      rs.auto_search_enabled, rs.freshness_rule, rs.anchor_rule,
+                      rs.allowed_document_types_json, rs.analyst_review_required
                FROM package_slot_instances psi JOIN research_slots rs ON rs.slot_id=psi.slot_id
                WHERE psi.package_id=? ORDER BY psi.order_number, psi.suborder, psi.created_at""",
             (package_id,),

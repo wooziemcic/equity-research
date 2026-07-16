@@ -10,7 +10,7 @@ from streamlit.errors import StreamlitPageNotFoundError
 from app import config
 from app.components.layout import bootstrap_page
 from app.services.company_resolver import resolve_ticker_metadata
-from app.services.package_recipe_service import create_package_from_active_recipe, get_active_recipe
+from app.services.package_recipe_service import create_package_from_active_recipe, get_active_recipe, list_recipe_slots
 from app.services.research_workflow_service import normalize_ticker_input, resolve_search_ticker, validate_search_ticker
 from app.utils import database
 
@@ -54,13 +54,17 @@ def _company_confirmation() -> None:
         )
         active_recipe = get_active_recipe()
         if active_recipe:
+            slot_count = len(list_recipe_slots(active_recipe["recipe_id"]))
             with st.form("recipe_package_create_form"):
                 detail_cols = st.columns(3)
                 compilation_date = detail_cols[0].date_input("Compilation date", value=date.today())
                 research_cutoff = detail_cols[1].date_input("Research cutoff", value=date.today(), max_value=date.today())
                 compiled_by = detail_cols[2].text_input("Compiled by", placeholder="Name or initials")
-                st.caption(f"Cutler Common Equity Recipe v{active_recipe['version']}")
-                create_submitted = st.form_submit_button("Create From Active Cutler Equity Recipe", type="primary", use_container_width=True)
+                st.caption(
+                    f"Recipe: {active_recipe['recipe_name']} v{active_recipe['version']} | "
+                    f"{slot_count} research items"
+                )
+                create_submitted = st.form_submit_button("Create Equity Research Package", type="primary", use_container_width=True)
             if create_submitted:
                 if not compiled_by.strip():
                     st.error("Enter the analyst compiling this package.")
@@ -76,7 +80,7 @@ def _company_confirmation() -> None:
                     st.success("Recipe-backed research package created.")
                     _switch_to_research()
         else:
-            st.warning("No active Common Equity recipe is available. An administrator must import, approve, and activate one before recipe-backed creation.")
+            st.warning("Common Equity recipes exist, but none is active. An administrator must verify and activate an approved recipe.")
             st.page_link("pages/9_Recipe_Administration.py", label="Open Recipe Administration")
     elif status == "MULTIPLE_MATCHES":
         candidates = result.get("candidates") or []

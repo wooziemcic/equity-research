@@ -1,0 +1,74 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Cutler Common Equity bundled recipe",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "recipe_name", "recipe_type", "security_type", "recipe_version",
+    "description", "slots", "checksum", "importer_version", "approval_metadata"
+  ],
+  "properties": {
+    "recipe_name": {"type": "string", "minLength": 1},
+    "recipe_type": {"const": "COMMON_EQUITY"},
+    "security_type": {"const": "Common Equity"},
+    "recipe_version": {"type": "integer", "minimum": 1},
+    "description": {"type": "string"},
+    "checksum": {"type": "string", "pattern": "^[a-f0-9]{64}$"},
+    "importer_version": {"type": "string", "minLength": 1},
+    "approval_metadata": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["status", "approved_by", "initialization_source"],
+      "properties": {
+        "status": {"const": "APPROVED"},
+        "approved_by": {"type": "string", "minLength": 1},
+        "initialization_source": {"const": "BUNDLED_RESOURCE"}
+      }
+    },
+    "slots": {
+      "type": "array",
+      "minItems": 28,
+      "maxItems": 28,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+          "order_number", "suborder", "display_name", "normalized_slot_type",
+          "section_code", "section_name", "required_level", "long_applicable",
+          "short_applicable", "conditional_rule", "preferred_sources",
+          "fallback_sources", "instructions", "minimum_documents",
+          "maximum_documents", "freshness_rule", "anchor_rule",
+          "allowed_document_types", "expected_output_format",
+          "automatic_availability", "manual_upload_allowed",
+          "analyst_review_required", "default_status", "enabled"
+        ],
+        "properties": {
+          "order_number": {"type": ["integer", "null"]},
+          "suborder": {"type": "integer", "minimum": 0},
+          "display_name": {"type": "string", "minLength": 1},
+          "normalized_slot_type": {"type": "string", "pattern": "^[a-z0-9_]+$"},
+          "section_code": {"type": "string", "minLength": 1},
+          "section_name": {"type": "string", "minLength": 1},
+          "required_level": {"type": "string", "minLength": 1},
+          "long_applicable": {"type": ["boolean", "null"]},
+          "short_applicable": {"type": ["boolean", "null"]},
+          "conditional_rule": {"type": ["string", "null"]},
+          "preferred_sources": {"type": "array", "items": {"type": "string"}},
+          "fallback_sources": {"type": "array", "items": {"type": "string"}},
+          "instructions": {"type": "string"},
+          "minimum_documents": {"type": "integer", "minimum": 0},
+          "maximum_documents": {"type": "integer", "minimum": 1},
+          "freshness_rule": {"type": ["string", "null"]},
+          "anchor_rule": {"type": ["string", "null"]},
+          "allowed_document_types": {"type": "array", "items": {"type": "string"}},
+          "expected_output_format": {"type": ["string", "null"]},
+          "automatic_availability": {"type": "boolean"},
+          "manual_upload_allowed": {"type": "boolean"},
+          "analyst_review_required": {"type": "boolean"},
+          "default_status": {"type": "string", "minLength": 1},
+          "enabled": {"type": "boolean"}
+        }
+      }
+    }
+  }
+}

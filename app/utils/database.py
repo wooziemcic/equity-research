@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import logging
 import secrets
 import shutil
@@ -16,6 +17,7 @@ from app import config
 from app.config import DATABASE_PATH, ensure_directories
 
 logger = logging.getLogger(__name__)
+_INITIALIZED_DATABASES: set[Path] = set()
 
 
 class DatabaseError(RuntimeError):
@@ -50,8 +52,20 @@ def get_connection(db_path: Path | str = DATABASE_PATH) -> Iterator[sqlite3.Conn
 
 def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
     """Create and safely upgrade the application database schema."""
+    resolved_path = Path(db_path).resolve()
+    if resolved_path in _INITIALIZED_DATABASES and resolved_path.is_file():
+        try:
+            with sqlite3.connect(resolved_path) as probe:
+                current = probe.execute(
+                    "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
+                ).fetchone()
+            if current and current[0] == "6B.0":
+                return
+        except sqlite3.Error:
+            _INITIALIZED_DATABASES.discard(resolved_path)
     ensure_directories()
     _backup_before_phase6a_migration(db_path)
+    _backup_before_phase6b_migration(db_path)
     with get_connection(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -90,6 +104,11 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase5_memo_schema(connection)
         _create_phase51_stabilization_schema(connection)
         _create_phase6a_recipe_schema(connection)
+        _create_phase6b_discovery_schema(connection)
+        from app.services.default_recipe_service import bootstrap_default_common_equity_recipe
+
+        bootstrap_default_common_equity_recipe(connection)
+    _INITIALIZED_DATABASES.add(resolved_path)
 
 
 def _backup_before_phase6a_migration(db_path: Path | str) -> Path | None:
@@ -113,6 +132,34 @@ def _backup_before_phase6a_migration(db_path: Path | str) -> Path | None:
     if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
         return recent[-1]
     destination = backup_dir / f"cutler_research_pre_phase6a_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
+    shutil.copy2(path, destination)
+    return destination
+
+
+def _backup_before_phase6b_migration(db_path: Path | str) -> Path | None:
+    """Preserve an existing Phase 6A development database before the 6B migration."""
+    path = Path(db_path).resolve()
+    configured = Path(DATABASE_PATH).resolve()
+    if path != configured or config.DATABASE_ENVIRONMENT != "DEVELOPMENT" or not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(path) as probe:
+            has_phase6a = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='package_recipes'"
+            ).fetchone()
+            has_phase6b = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='package_discovery_runs'"
+            ).fetchone()
+        if not has_phase6a or has_phase6b:
+            return None
+    except sqlite3.Error:
+        return None
+    backup_dir = config.MIGRATION_BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    recent = sorted(backup_dir.glob("cutler_research_pre_phase6b_*.db"), key=lambda item: item.stat().st_mtime)
+    if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
+        return recent[-1]
+    destination = backup_dir / f"cutler_research_pre_phase6b_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
     shutil.copy2(path, destination)
     return destination
 
@@ -1726,6 +1773,259 @@ def _create_phase6a_recipe_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_phase6b_discovery_schema(connection: sqlite3.Connection) -> None:
+    """Create the additive Phase 6B search, candidate, routing, and audit schema."""
+    document_columns = _table_columns(connection, "documents")
+    if "final_package_format_pending" not in document_columns:
+        connection.execute("ALTER TABLE documents ADD COLUMN final_package_format_pending TEXT")
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS slot_search_profiles (
+            search_profile_id TEXT PRIMARY KEY,
+            profile_version TEXT NOT NULL,
+            normalized_slot_type TEXT NOT NULL,
+            enabled INTEGER NOT NULL DEFAULT 1,
+            authoritative_source_order_json TEXT NOT NULL,
+            query_templates_json TEXT NOT NULL,
+            positive_terms_json TEXT NOT NULL,
+            exclusion_terms_json TEXT NOT NULL,
+            allowed_domains_json TEXT NOT NULL,
+            allowed_file_types_json TEXT NOT NULL,
+            freshness_rule TEXT,
+            maximum_queries INTEGER NOT NULL,
+            maximum_candidates INTEGER NOT NULL,
+            minimum_auto_accept_score REAL NOT NULL,
+            minimum_review_score REAL NOT NULL,
+            openai_semantic_review_allowed INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            status TEXT NOT NULL,
+            UNIQUE(profile_version, normalized_slot_type)
+        );
+        CREATE TABLE IF NOT EXISTS package_discovery_runs (
+            discovery_run_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_recipe_instance_id TEXT NOT NULL,
+            search_profile_version TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            started_by TEXT NOT NULL,
+            slot_count_requested INTEGER NOT NULL DEFAULT 0,
+            slot_count_completed INTEGER NOT NULL DEFAULT 0,
+            queries_executed INTEGER NOT NULL DEFAULT 0,
+            cached_queries_reused INTEGER NOT NULL DEFAULT 0,
+            results_considered INTEGER NOT NULL DEFAULT 0,
+            candidates_created INTEGER NOT NULL DEFAULT 0,
+            candidates_rejected INTEGER NOT NULL DEFAULT 0,
+            candidates_auto_selected INTEGER NOT NULL DEFAULT 0,
+            candidates_needing_review INTEGER NOT NULL DEFAULT 0,
+            documents_downloaded INTEGER NOT NULL DEFAULT 0,
+            warnings_json TEXT NOT NULL DEFAULT '[]',
+            safe_error_json TEXT NOT NULL DEFAULT '{}',
+            total_duration_ms INTEGER,
+            FOREIGN KEY(package_id) REFERENCES packages(package_id),
+            FOREIGN KEY(package_recipe_instance_id) REFERENCES package_recipe_instances(package_recipe_instance_id)
+        );
+        CREATE TABLE IF NOT EXISTS slot_discovery_runs (
+            slot_discovery_run_id TEXT PRIMARY KEY,
+            discovery_run_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT NOT NULL,
+            normalized_slot_type TEXT NOT NULL,
+            source_route TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            completed_at TEXT,
+            query_count INTEGER NOT NULL DEFAULT 0,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            candidate_count INTEGER NOT NULL DEFAULT 0,
+            selected_count INTEGER NOT NULL DEFAULT 0,
+            rejected_count INTEGER NOT NULL DEFAULT 0,
+            cached INTEGER NOT NULL DEFAULT 0,
+            warnings_json TEXT NOT NULL DEFAULT '[]',
+            safe_error_json TEXT NOT NULL DEFAULT '{}',
+            duration_ms INTEGER,
+            FOREIGN KEY(discovery_run_id) REFERENCES package_discovery_runs(discovery_run_id),
+            FOREIGN KEY(package_slot_instance_id) REFERENCES package_slot_instances(package_slot_instance_id)
+        );
+        CREATE TABLE IF NOT EXISTS search_queries (
+            search_query_id TEXT PRIMARY KEY,
+            discovery_run_id TEXT,
+            slot_discovery_run_id TEXT,
+            package_id TEXT,
+            package_slot_instance_id TEXT,
+            provider TEXT NOT NULL,
+            query_text TEXT NOT NULL,
+            query_hash TEXT NOT NULL,
+            freshness_filter TEXT,
+            country TEXT NOT NULL,
+            language TEXT NOT NULL,
+            result_limit INTEGER NOT NULL,
+            page_offset INTEGER NOT NULL DEFAULT 0,
+            status TEXT NOT NULL,
+            executed_at TEXT NOT NULL,
+            duration_ms INTEGER NOT NULL DEFAULT 0,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            more_results_available INTEGER NOT NULL DEFAULT 0,
+            cache_hit INTEGER NOT NULL DEFAULT 0,
+            safe_rate_limit_json TEXT NOT NULL DEFAULT '{}',
+            estimated_cost REAL,
+            error_category TEXT,
+            safe_error_message TEXT,
+            FOREIGN KEY(discovery_run_id) REFERENCES package_discovery_runs(discovery_run_id),
+            FOREIGN KEY(slot_discovery_run_id) REFERENCES slot_discovery_runs(slot_discovery_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS search_query_cache (
+            cache_key TEXT PRIMARY KEY,
+            provider TEXT NOT NULL,
+            query_hash TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            expires_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS discovered_candidates (
+            candidate_id TEXT PRIMARY KEY,
+            discovery_run_id TEXT NOT NULL,
+            slot_discovery_run_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT NOT NULL,
+            source_provider TEXT NOT NULL,
+            source_route TEXT NOT NULL,
+            rank INTEGER,
+            title TEXT NOT NULL,
+            canonical_url TEXT NOT NULL,
+            original_url TEXT NOT NULL,
+            final_redirect_url TEXT,
+            domain TEXT NOT NULL,
+            publication_date TEXT,
+            date_confidence TEXT,
+            mime_type TEXT,
+            file_extension TEXT,
+            file_signature TEXT,
+            content_length INTEGER,
+            company_identity_score REAL NOT NULL DEFAULT 0,
+            source_authority_score REAL NOT NULL DEFAULT 0,
+            slot_relevance_score REAL NOT NULL DEFAULT 0,
+            freshness_score REAL NOT NULL DEFAULT 0,
+            format_score REAL NOT NULL DEFAULT 0,
+            overall_score REAL NOT NULL DEFAULT 0,
+            validation_status TEXT NOT NULL,
+            candidate_status TEXT NOT NULL,
+            rejection_reason_code TEXT,
+            rejection_reason TEXT,
+            metadata_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(package_slot_instance_id, canonical_url),
+            FOREIGN KEY(discovery_run_id) REFERENCES package_discovery_runs(discovery_run_id),
+            FOREIGN KEY(slot_discovery_run_id) REFERENCES slot_discovery_runs(slot_discovery_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS source_router_decisions (
+            router_decision_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT NOT NULL,
+            discovery_run_id TEXT NOT NULL,
+            selected_route TEXT NOT NULL,
+            alternative_routes_json TEXT NOT NULL,
+            decision_reasons_json TEXT NOT NULL,
+            authoritative_source_available INTEGER NOT NULL DEFAULT 0,
+            brave_required INTEGER NOT NULL DEFAULT 0,
+            manual_upload_required INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS earnings_cycle_anchors (
+            anchor_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            fiscal_year INTEGER,
+            fiscal_quarter TEXT,
+            reporting_period_end TEXT,
+            earnings_release_date TEXT,
+            filing_date TEXT,
+            anchor_document_id TEXT,
+            anchor_candidate_id TEXT,
+            anchor_source TEXT NOT NULL,
+            confidence TEXT NOT NULL,
+            validation_status TEXT NOT NULL,
+            analyst_override INTEGER NOT NULL DEFAULT 0,
+            override_reason TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            approved_at TEXT,
+            approved_by TEXT
+        );
+        CREATE TABLE IF NOT EXISTS candidate_decisions (
+            decision_id TEXT PRIMARY KEY,
+            candidate_id TEXT NOT NULL,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT NOT NULL,
+            decision TEXT NOT NULL,
+            reason_code TEXT,
+            analyst_notes TEXT,
+            decided_at TEXT NOT NULL,
+            decided_by TEXT NOT NULL,
+            previous_decision_id TEXT,
+            FOREIGN KEY(candidate_id) REFERENCES discovered_candidates(candidate_id)
+        );
+        CREATE TABLE IF NOT EXISTS discovery_usage (
+            usage_id TEXT PRIMARY KEY,
+            discovery_run_id TEXT,
+            slot_discovery_run_id TEXT,
+            provider TEXT NOT NULL,
+            request_count INTEGER NOT NULL DEFAULT 0,
+            cached_request_count INTEGER NOT NULL DEFAULT 0,
+            result_count INTEGER NOT NULL DEFAULT 0,
+            estimated_cost REAL,
+            recorded_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_discovery_package ON package_discovery_runs(package_id, started_at);
+        CREATE INDEX IF NOT EXISTS idx_slot_discovery_run ON slot_discovery_runs(discovery_run_id, status);
+        CREATE INDEX IF NOT EXISTS idx_queries_package_hash ON search_queries(package_id, query_hash, executed_at);
+        CREATE INDEX IF NOT EXISTS idx_candidates_slot_status ON discovered_candidates(package_slot_instance_id, candidate_status, overall_score);
+        CREATE INDEX IF NOT EXISTS idx_candidate_decisions_candidate ON candidate_decisions(candidate_id, decided_at);
+        CREATE INDEX IF NOT EXISTS idx_anchor_package ON earnings_cycle_anchors(package_id, created_at);
+        """
+    )
+    _seed_phase6b_search_profiles(connection)
+    connection.execute(
+        """INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
+           VALUES ('database_schema_version', '6B.0', ?)
+           ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at""",
+        (utc_now_iso(),),
+    )
+
+
+def _seed_phase6b_search_profiles(connection: sqlite3.Connection) -> None:
+    """Install immutable v1 discovery policies without altering recipe rows."""
+    profiles = {
+        "latest_earnings_release": (["OFFICIAL_IR", "SEC_8K", "BRAVE_OFFICIAL", "MANUAL_REVIEW"], ["{official_ir_site} ({company_name} OR {ticker}) (quarterly results OR financial results OR earnings release)"]),
+        "available_supplemental_or_earnings_presentation": (["OFFICIAL_IR", "BRAVE_OFFICIAL", "MANUAL_REVIEW"], ["{official_ir_site} ({company_name} OR {ticker}) (earnings presentation OR results presentation OR quarterly presentation) filetype:pdf"]),
+        "latest_earnings_call_transcript": (["OFFICIAL_IR", "BRAVE_OFFICIAL", "MANUAL_UPLOAD"], ["{official_ir_site} ({company_name} OR {ticker}) (earnings transcript OR prepared remarks OR earnings commentary)"]),
+        "latest_earnings_call_audio": (["OFFICIAL_IR", "BRAVE_OFFICIAL", "MANUAL_REVIEW"], ["{official_ir_site} ({company_name} OR {ticker}) (earnings webcast OR earnings call audio OR event replay)"]),
+        "investor_presentations": (["OFFICIAL_IR", "BRAVE_OFFICIAL", "MANUAL_REVIEW"], ["{official_ir_site} ({company_name} OR {ticker}) (investor presentation OR corporate presentation) filetype:pdf"]),
+        "material_company_press_releases_since_last_earnings_release": (["OFFICIAL_NEWSROOM", "OFFICIAL_IR", "BRAVE_OFFICIAL", "MANUAL_REVIEW"], ["{official_site} ({company_name} OR {ticker}) (acquisition OR launch OR approval OR guidance OR financing OR executive)"]),
+        "liquidity_and_capital_resources": (["SEC", "MANUAL_REVIEW"], []),
+        "description_of_business_and_risk": (["SEC", "MANUAL_REVIEW"], []),
+        "executive_compensation_information": (["SEC", "MANUAL_REVIEW"], []),
+        "most_recent_10_q_and_10_k": (["SEC", "MANUAL_REVIEW"], []),
+    }
+    now = utc_now_iso()
+    positive = ["earnings", "financial results", "investor", "quarterly", "annual", "presentation", "webcast", "guidance", "10-k", "10-q", "proxy", "item 2.02"]
+    exclusions = ["new-account", "application", "careers", "login", "privacy", "vendor", "customer", "brochure", "catalog", "order-form"]
+    for slot_type, (routes, templates) in profiles.items():
+        connection.execute(
+            """INSERT OR IGNORE INTO slot_search_profiles VALUES (
+                ?, '1.0', ?, 1, ?, ?, ?, ?, '[]', ?, 'LATEST_COMPLETED_CYCLE', ?, 20,
+                85, 55, 0, ?, 'SYSTEM', 'ACTIVE'
+            )""",
+            (
+                f"SP-1-{slot_type.upper()}", slot_type, json.dumps(routes), json.dumps(templates),
+                json.dumps(positive), json.dumps(exclusions), json.dumps(["pdf", "html", "htm", "mp3", "m4a"]),
+                0 if not templates else min(3, config.BRAVE_MAX_QUERIES_PER_SLOT), now,
+            ),
+        )
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Convert a SQLite row to a regular dictionary."""
     return dict(row) if row is not None else None
@@ -3126,6 +3426,7 @@ def update_document_metadata(
         "discovery_method",
         "discovery_confidence",
         "selected_window_status",
+        "final_package_format_pending",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:

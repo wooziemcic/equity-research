@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import logging
+import json
+import secrets
 from calendar import month_name
 from datetime import date
 
@@ -16,6 +18,8 @@ from app.services.package_service import (
     create_package,
     find_existing_ticker_packages,
 )
+from app.services.search import get_search_provider
+from app.utils import database
 from app.utils.database import DatabaseError
 from app.utils.validation import (
     MAX_ANALYST_NOTES_LENGTH,
@@ -25,6 +29,31 @@ from app.utils.validation import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _brave_connection_panel() -> None:
+    with st.expander("Search Provider Diagnostics", expanded=False):
+        provider = get_search_provider()
+        status = "Disabled" if config.SEARCH_PROVIDER != "brave" else "Configured" if provider.is_configured() else "Not configured"
+        st.write(f"Brave Search: {status}")
+        if st.button("Test Brave Search Connection"):
+            response = provider.test_connection()
+            st.session_state["brave_connection_result"] = response.to_dict()
+            database.initialize_database(config.DATABASE_PATH)
+            successful = int(response.response_status == "SUCCESS")
+            estimated = successful * config.BRAVE_COST_PER_1000_REQUESTS / 1000 if config.BRAVE_COST_PER_1000_REQUESTS is not None else None
+            with database.get_connection(config.DATABASE_PATH) as connection:
+                connection.execute(
+                    "INSERT INTO discovery_usage VALUES (?, NULL, NULL, ?, ?, 0, ?, ?, ?)",
+                    (f"USE-{secrets.token_hex(8).upper()}", provider.provider_name, successful, response.result_count, estimated, database.utc_now_iso()),
+                )
+        result = st.session_state.get("brave_connection_result")
+        if result:
+            st.write(f"Result: {result['response_status']} | {result['request_duration_ms']} ms")
+            if result.get("safe_rate_limit_metadata"):
+                st.json(result["safe_rate_limit_metadata"])
+            if result.get("safe_error_message"):
+                st.caption(result["safe_error_message"])
 
 
 def _selected_filing_years(label: str) -> int:
@@ -95,6 +124,7 @@ def main() -> None:
     st.write(
         "Create a persistent package workspace. Phase 1 does not resolve tickers or collect documents."
     )
+    _brave_connection_panel()
 
     ticker = st.text_input(
         "Ticker",

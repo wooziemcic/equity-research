@@ -364,7 +364,8 @@ def _official_ir_collection(package: dict) -> None:
     refresh_discovery = actions[1].button("Refresh Discovery", disabled=not refreshed.get("official_website_url"), use_container_width=True)
     discover_materials = actions[2].button("Review Discovered Materials", disabled=not (refreshed.get("official_website_url") or manual_url), use_container_width=True)
     if discover_site:
-        provider = BraveSearchProvider(config.SEARCH_API_KEY) if config.SEARCH_PROVIDER == "brave" and config.SEARCH_API_KEY else None
+        brave_key = config.brave_search_api_key()
+        provider = BraveSearchProvider(brave_key) if config.SEARCH_PROVIDER == "brave" and brave_key else None
         resolved, candidates = resolve_official_company_website(refreshed, analyst_url=manual_url or None, search_provider=provider)
         if resolved:
             st.success(f"Official company site verified from {resolved.discovery_source}.")

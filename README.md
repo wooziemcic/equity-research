@@ -6,7 +6,8 @@ Cutler Research AI is an internal Streamlit research product for searching a tic
 
 Implemented through the Phase 5 analyst-readiness pass:
 
-- Phase 6A stabilization: versioned workbook-derived common-equity recipes, explicit administrator approval and activation, immutable per-package recipe snapshots, ordered package slots, deterministic upload suggestions and completion, the responsive Package Assembly Board, checklist XLSX export, safe JSON snapshot portability, legacy-package cloning, test-database classification, and guarded development migrations. Phase 6A makes no Brave requests and does not alter the analysis corpus or pipeline.
+- Phase 6B discovery: checksum-validated default Common Equity recipe bootstrap, controlled Brave Web Search, slot-specific source routing, curated SEC selection, bounded official-site discovery, deterministic candidate validation and ranking, analyst review, query budgets and caching, earnings-cycle anchors, resumable discovery runs, and complete search/candidate auditing. Licensed and internal rows remain manual.
+- Phase 6A stabilization: versioned workbook-derived common-equity recipes, explicit administrator approval and activation, immutable per-package recipe snapshots, ordered package slots, deterministic upload suggestions and completion, the responsive Package Assembly Board, checklist XLSX export, safe JSON snapshot portability, legacy-package cloning, test-database classification, and guarded development migrations.
 
 - Phase 1: package setup, SQLite persistence, validation, dashboard, shared UI, and navigation.
 - Phase 2: SEC company resolution, SEC filing preview/download, investor-relations PDF discovery, public document metadata, hashes, duplicate prevention, and collection history.
@@ -30,7 +31,9 @@ The default application experience is now:
 
 Secondary navigation includes `Dashboard / History` for previous packages and `Advanced Workbench` for the detailed Phase 1-6 pages: package setup, public collection, licensed uploads, package review, evidence exploration, analyst review, PM approval, generated reports, and audit history.
 
-`Recipe Administration` is under Advanced Workbench. Import `reference/Equity Research Package.xlsx` (or set `CUTLER_RECIPE_WORKBOOK_PATH`), review `Template`, `Instructions`, and `MDT` differences, then explicitly approve and activate a recipe. The source workbook is ignored by Git and is not reopened during normal package sessions.
+Fresh deployments automatically receive the checksum-validated bundled Common Equity v1 recipe from `app/resources/recipes/common_equity_v1.json`. Normal package creation does not require Recipe Administration. Administrators can verify initialization, activate an approved replacement, or import a new workbook-derived draft without changing existing package snapshots.
+
+Public discovery searches only incomplete recipe rows with an active search profile. Configure `SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` outside source control to enable Brave fallback. The connection test in Advanced Workbench runs only when clicked, requests one result, and never displays or stores the key. Set `SEARCH_PROVIDER=none` to retain SEC, static official-site, and manual workflows without Brave.
 
 ## Research Workspace Details
 
@@ -259,9 +262,14 @@ Key Phase 6 and Phase 7 settings:
 - `DATABASE_ENVIRONMENT` (`DEVELOPMENT`, `TEST`, `STREAMLIT_CLOUD`, or `UNKNOWN`)
 - `BRAVE_SEARCH_API_KEY`
 - `BRAVE_SEARCH_ENDPOINT`
-- `BRAVE_SEARCH_MAX_RESULTS`
+- `BRAVE_MAX_RESULTS_PER_QUERY`
 - `BRAVE_MAX_QUERIES_PER_PACKAGE`
 - `BRAVE_MAX_QUERIES_PER_SLOT`
+- `BRAVE_MAX_PAGES_PER_QUERY`
+- `BRAVE_QUERY_CACHE_HOURS`
+- `BRAVE_REQUEST_TIMEOUT_SECONDS`
+- `BRAVE_REQUEST_MAX_RETRIES`
+- `BRAVE_COST_PER_1000_REQUESTS` (optional; no default price is assumed)
 
 Arithmetic, ratios, formulas, hashes, database writes, package integrity, citation checks, and score thresholds remain deterministic. With `OPENAI_REQUIRED=true`, analysis and narrative generation stop safely until the configured model passes an explicit OpenAI preflight check. OpenAI requests use the Responses API at `/v1/responses`, with no web or external tools, and only selected locked-package evidence.
 
