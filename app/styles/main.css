@@ -1113,7 +1113,8 @@ hr {
 .status-cell.manual-upload-required { color: #83b9e7; }
 .status-cell.not-available { color: #b5a995; }
 
-.assembly-mobile {
+.assembly-mobile,
+.package-contents-mobile {
     display: none;
 }
 
@@ -1147,6 +1148,12 @@ hr {
     }
 
     .assembly-mobile {
+        display: grid;
+        gap: 0.55rem;
+        margin: 0.8rem 0 1rem;
+    }
+
+    .package-contents-mobile {
         display: grid;
         gap: 0.55rem;
         margin: 0.8rem 0 1rem;

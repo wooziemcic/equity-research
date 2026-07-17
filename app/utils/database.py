@@ -59,7 +59,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
                 current = probe.execute(
                     "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
                 ).fetchone()
-            if current and current[0] == "6B.0":
+            if current and current[0] == "6B.1":
                 return
         except sqlite3.Error:
             _INITIALIZED_DATABASES.discard(resolved_path)
@@ -105,6 +105,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase51_stabilization_schema(connection)
         _create_phase6a_recipe_schema(connection)
         _create_phase6b_discovery_schema(connection)
+        _create_phase6b1_assembly_schema(connection)
         from app.services.default_recipe_service import bootstrap_default_common_equity_recipe
 
         bootstrap_default_common_equity_recipe(connection)
@@ -2026,6 +2027,78 @@ def _seed_phase6b_search_profiles(connection: sqlite3.Connection) -> None:
         )
 
 
+def _create_phase6b1_assembly_schema(connection: sqlite3.Connection) -> None:
+    """Add live-assembly metadata without rewriting Phase 6B or locked package rows."""
+    additions = {
+        "earnings_cycle_anchors": {
+            "fiscal_period_label": "TEXT",
+            "reporting_period_start": "TEXT",
+            "filing_form": "TEXT",
+            "accession": "TEXT",
+            "source_document_id": "TEXT",
+            "source_candidate_id": "TEXT",
+            "source_url": "TEXT",
+            "evidence_summary": "TEXT",
+        },
+        "discovered_candidates": {
+            "review_reason_codes_json": "TEXT NOT NULL DEFAULT '[]'",
+            "query_fallback_level": "INTEGER NOT NULL DEFAULT 0",
+            "automatic_selection_reason": "TEXT",
+            "downloaded_document_id": "TEXT",
+        },
+        "search_queries": {
+            "query_fallback_level": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "documents": {
+            "package_display_filename": "TEXT",
+            "working_package_inclusion": "INTEGER NOT NULL DEFAULT 0",
+            "audit_package_inclusion": "INTEGER NOT NULL DEFAULT 1",
+        },
+    }
+    for table, columns in additions.items():
+        existing = _table_columns(connection, table)
+        for column, definition in columns.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS preliminary_package_reports (
+            preliminary_report_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            package_snapshot_json TEXT NOT NULL DEFAULT '{}',
+            selected_document_ids_json TEXT NOT NULL DEFAULT '[]',
+            workflow_run_id TEXT,
+            analysis_run_id TEXT,
+            generated_report_id TEXT,
+            recommendation TEXT,
+            confidence TEXT,
+            quality_result_json TEXT NOT NULL DEFAULT '{}',
+            safe_error_message TEXT,
+            requested_by TEXT,
+            requested_at TEXT,
+            completed_at TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(package_id) REFERENCES packages(package_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_preliminary_reports_package
+        ON preliminary_package_reports(package_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_candidates_review
+        ON discovered_candidates(package_id, candidate_status, query_fallback_level);
+        CREATE INDEX IF NOT EXISTS idx_working_package_documents
+        ON documents(package_id, working_package_inclusion, package_display_filename);
+        """
+    )
+    connection.execute(
+        """INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
+           VALUES ('database_schema_version', '6B.1', ?)
+           ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at""",
+        (utc_now_iso(),),
+    )
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Convert a SQLite row to a regular dictionary."""
     return dict(row) if row is not None else None
@@ -3427,6 +3500,9 @@ def update_document_metadata(
         "discovery_confidence",
         "selected_window_status",
         "final_package_format_pending",
+        "package_display_filename",
+        "working_package_inclusion",
+        "audit_package_inclusion",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:

@@ -22,6 +22,11 @@ from app.services.candidate_validation_service import (
     validate_candidate_metadata,
 )
 from app.services.collectors.sec_collector import FilingCandidate, preview_cutler_profile
+from app.services.company_resolver import sec_headers
+from app.services.earnings_cycle_service import (
+    fiscal_period_from_report_date,
+    resolve_earnings_cycle,
+)
 from app.services.official_ir_service import discover_official_ir_materials, resolve_official_company_website
 from app.services.package_recipe_service import (
     assign_document,
@@ -117,6 +122,14 @@ class EarningsAnchor:
     confidence: str
     validation_status: str
     reasons: tuple[str, ...]
+    fiscal_period_label: str | None = None
+    reporting_period_start: str | None = None
+    filing_form: str | None = None
+    accession: str | None = None
+    source_document_id: str | None = None
+    source_candidate_id: str | None = None
+    source_url: str | None = None
+    evidence_summary: str | None = None
 
 
 @dataclass(frozen=True)
@@ -241,54 +254,44 @@ class SlotQueryPlannerAgent:
         phrase = self._PHRASES.get(plan.normalized_slot_type)
         if not phrase or plan.maximum_queries <= 0:
             return []
-        domain_url = package.get("official_ir_url") or package.get("official_newsroom_url") or package.get("official_website_url") or ""
-        domain = (urlparse(str(domain_url)).hostname or "").removeprefix("www.")
-        site = f"site:{domain} " if domain else ""
+        ir_url = package.get("official_ir_url") or package.get("official_newsroom_url") or ""
+        company_url = package.get("official_website_url") or ir_url
+        ir_domain = (urlparse(str(ir_url)).hostname or "").removeprefix("www.")
+        company_domain = (urlparse(str(company_url)).hostname or "").removeprefix("www.")
         company = str(package.get("company_name") or package["ticker"]).replace('"', "")
         identity = f'("{company}" OR "{package["ticker"]}")'
-        query = f"{site}{identity} {phrase}".strip()
         freshness = None
         if anchor and anchor.earnings_release_date:
             freshness = f"{anchor.earnings_release_date}to{plan.date_end}"
+        broad_phrase = phrase.replace(" filetype:pdf", "")
+        queries = [
+            (f"site:{ir_domain} {identity} {phrase}" if ir_domain else f"{identity} {phrase}"),
+            (f"site:{company_domain} {identity} {broad_phrase}" if company_domain else f"{identity} {broad_phrase}"),
+            f'{identity} {broad_phrase} official',
+        ]
         return [
             BraveSearchRequest(
-                query=query,
+                query=query.strip(),
                 count=config.BRAVE_MAX_RESULTS_PER_QUERY,
                 freshness=freshness,
                 package_id=package["package_id"],
                 slot_instance_id=plan.package_slot_instance_id,
-                query_purpose=plan.normalized_slot_type,
+                query_purpose=f"{plan.normalized_slot_type}:L{level}",
             )
+            for level, query in enumerate(dict.fromkeys(queries), start=1)
         ][: plan.maximum_queries]
 
 
 class EarningsAnchorAgent:
     def determine(self, sources: Iterable[dict[str, Any]]) -> EarningsAnchor:
-        authoritative = [row for row in sources if str(row.get("source_type") or "").upper() != "BRAVE_SNIPPET"]
-        if not authoritative:
-            return EarningsAnchor(None, None, None, None, None, "NONE", "LOW", "NEEDS_ANALYST_REVIEW", ("No authoritative earnings-cycle source is available.",))
-        def key(row: dict[str, Any]) -> tuple[str, str]:
-            return (str(row.get("reporting_period_end") or ""), str(row.get("earnings_release_date") or row.get("filing_date") or ""))
-        latest_period = max(str(row.get("reporting_period_end") or "") for row in authoritative)
-        current = [row for row in authoritative if str(row.get("reporting_period_end") or "") == latest_period] if latest_period else authoritative
-        selected = max(current, key=key)
-        periods = {str(row.get("reporting_period_end") or "") for row in current if row.get("reporting_period_end")}
-        release_dates = {str(row.get("earnings_release_date") or "") for row in current if row.get("earnings_release_date")}
-        types = {str(row.get("source_type") or "").upper() for row in current}
-        conflict = len(periods) > 1 or len(release_dates) > 1
-        agreement = bool(types & {"OFFICIAL_EARNINGS_RELEASE", "OFFICIAL_IR"}) and bool(types & {"SEC_8K", "SEC"})
-        confidence = "HIGH" if agreement and not conflict else "MEDIUM" if not conflict else "LOW"
-        status = "VALIDATED" if confidence in {"HIGH", "MEDIUM"} else "NEEDS_ANALYST_REVIEW"
+        cycle = resolve_earnings_cycle(sources)
         return EarningsAnchor(
-            int(selected["fiscal_year"]) if selected.get("fiscal_year") else None,
-            str(selected.get("fiscal_quarter") or "") or None,
-            str(selected.get("reporting_period_end") or "") or None,
-            str(selected.get("earnings_release_date") or "") or None,
-            str(selected.get("filing_date") or "") or None,
-            str(selected.get("source_type") or "AUTHORITATIVE_SOURCE"),
-            confidence,
-            status,
-            ("Official earnings release and SEC filing agree." if agreement else "Latest authoritative reporting-period source selected.",),
+            cycle.fiscal_year, cycle.fiscal_quarter, cycle.reporting_period_end,
+            cycle.earnings_release_date, cycle.filing_date, cycle.anchor_source,
+            cycle.confidence, cycle.validation_status, (cycle.evidence_summary,),
+            cycle.fiscal_period_label, cycle.reporting_period_start, cycle.filing_form,
+            cycle.accession, cycle.source_document_id, cycle.source_candidate_id,
+            cycle.source_url, cycle.evidence_summary,
         )
 
 
@@ -433,21 +436,24 @@ def _execute_search(
     estimated = None
     if response.response_status == "SUCCESS" and response.cache_status != "HIT" and config.BRAVE_COST_PER_1000_REQUESTS is not None:
         estimated = config.BRAVE_COST_PER_1000_REQUESTS / 1000
+    level_match = re.search(r":L([1-3])$", request.query_purpose or "")
+    fallback_level = int(level_match.group(1)) if level_match else 1
     with database.get_connection(db_path) as connection:
         connection.execute(
             """INSERT INTO search_queries(
                 search_query_id, discovery_run_id, slot_discovery_run_id, package_id, package_slot_instance_id,
                 provider, query_text, query_hash, freshness_filter, country, language, result_limit,
                 page_offset, status, executed_at, duration_ms, result_count, more_results_available,
-                cache_hit, safe_rate_limit_json, estimated_cost, error_category, safe_error_message
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                cache_hit, safe_rate_limit_json, estimated_cost, error_category, safe_error_message,
+                query_fallback_level
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (
                 _token("QUERY"), discovery_run_id, slot_run_id, request.package_id, request.slot_instance_id,
                 provider.provider_name, request.query, hashlib.sha256(request.query.encode()).hexdigest(), request.freshness,
                 request.country, request.search_language, request.count, request.offset, response.response_status, now,
                 response.request_duration_ms, response.result_count, int(response.more_results_available),
                 int(response.cache_status == "HIT"), _json(response.safe_rate_limit_metadata), estimated,
-                response.error_category or None, response.safe_error_message or None,
+                response.error_category or None, response.safe_error_message or None, fallback_level,
             ),
         )
     return response
@@ -470,6 +476,8 @@ def _upsert_candidate(
     validation_status: str = "METADATA_VALID",
     explicit_status: str | None = None,
     rejection_reason: str = "",
+    query_fallback_level: int = 0,
+    source_metadata: dict[str, Any] | None = None,
     db_path: Path | str,
 ) -> dict[str, Any]:
     canonical = normalized_candidate_url(url) or url
@@ -486,6 +494,11 @@ def _upsert_candidate(
     status = explicit_status or ("ELIGIBLE" if validation.eligible else validation.status)
     reason_code = "" if validation.eligible else validation.reason_code
     reason = rejection_reason or validation.reason
+    sec_form = str((source_metadata or {}).get("form_type") or "").upper()
+    if route == "SEC" and sec_form in {"10-K", "10-Q", "DEF 14A", "8-K"} and urlparse(url).hostname and str(urlparse(url).hostname).lower().endswith("sec.gov"):
+        status = "ELIGIBLE"
+        reason_code = ""
+        reason = ""
     anchor = get_earnings_anchor(package["package_id"], db_path=db_path)
     if (
         status == "ELIGIBLE"
@@ -505,11 +518,35 @@ def _upsert_candidate(
     profile = next((row for row in list_active_search_profiles(db_path=db_path) if row["normalized_slot_type"] == plan.normalized_slot_type), {})
     if status == "ELIGIBLE":
         status = "NEEDS_ANALYST_REVIEW" if score.overall_score >= float(profile.get("minimum_review_score", 55)) else "REJECTED"
+    review_codes: list[str] = []
+    if status == "NEEDS_ANALYST_REVIEW":
+        if not publication_date:
+            review_codes.extend(("PUBLICATION_DATE_MISSING", "DATE_UNCERTAIN"))
+        if route.startswith("BRAVE"):
+            review_codes.append("OFFICIAL_DOMAIN_UNCONFIRMED")
+        if not mime_type:
+            review_codes.append("CONTENT_NOT_DOWNLOADED")
+        if plan.normalized_slot_type in {"latest_earnings_release", "available_supplemental_or_earnings_presentation"} and not (anchor or {}).get("fiscal_quarter"):
+            review_codes.append("FISCAL_PERIOD_UNCERTAIN")
+        if plan.normalized_slot_type == "latest_earnings_call_audio":
+            review_codes.append("TRANSCRIPT_ACCESS_UNCERTAIN")
+        if plan.normalized_slot_type == "material_company_press_releases_since_last_earnings_release":
+            review_codes.append("PRESS_RELEASE_MATERIALITY_UNCERTAIN")
+        if not review_codes:
+            review_codes.append("SLOT_MATCH_AMBIGUOUS")
+        if not reason:
+            reason = candidate_review_explanation(review_codes)
+        reason_code = review_codes[0]
     if status in REJECTED_CANDIDATE_STATUSES and not reason_code:
         reason_code = status
     now = database.utc_now_iso()
     candidate_id = _token("CAND")
-    metadata = {"description": description, "score_reasons": score.reasons, "final_package_format_pending": "PDF" if mime_type != "application/pdf" else None}
+    metadata = {
+        "description": description,
+        "score_reasons": score.reasons,
+        "final_package_format_pending": "PDF" if mime_type != "application/pdf" else None,
+        "source_metadata": source_metadata or {},
+    }
     with database.get_connection(db_path) as connection:
         existing = connection.execute(
             "SELECT candidate_id FROM discovered_candidates WHERE package_slot_instance_id=? AND canonical_url=?",
@@ -522,13 +559,13 @@ def _upsert_candidate(
                    rank=?, title=?, original_url=?, publication_date=?, mime_type=?, file_extension=?,
                    company_identity_score=?, source_authority_score=?, slot_relevance_score=?, freshness_score=?,
                    format_score=?, overall_score=?, validation_status=?, candidate_status=?, rejection_reason_code=?,
-                   rejection_reason=?, metadata_json=?, updated_at=? WHERE candidate_id=?""",
+                   rejection_reason=?, metadata_json=?, review_reason_codes_json=?, query_fallback_level=?, updated_at=? WHERE candidate_id=?""",
                 (
                     run_id, slot_run_id, source_provider, route, rank, title, url, publication_date, mime_type,
                     Path(urlparse(url).path).suffix.lower(), score.company_identity_score, score.source_authority_score,
                     score.slot_relevance_score, score.freshness_score, score.format_score, score.overall_score,
                     validation_status if validation.eligible else validation.status, status, reason_code or None, reason or None,
-                    _json(metadata), now, candidate_id,
+                    _json(metadata), _json(review_codes), query_fallback_level, now, candidate_id,
                 ),
             )
         else:
@@ -539,8 +576,8 @@ def _upsert_candidate(
                     publication_date, date_confidence, mime_type, file_extension, company_identity_score,
                     source_authority_score, slot_relevance_score, freshness_score, format_score, overall_score,
                     validation_status, candidate_status, rejection_reason_code, rejection_reason, metadata_json,
-                    created_at, updated_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    created_at, updated_at, review_reason_codes_json, query_fallback_level
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     candidate_id, run_id, slot_run_id, package["package_id"], plan.package_slot_instance_id,
                     source_provider, route, rank, title, canonical, url, (urlparse(canonical).hostname or "").lower(),
@@ -548,9 +585,97 @@ def _upsert_candidate(
                     score.company_identity_score, score.source_authority_score, score.slot_relevance_score, score.freshness_score,
                     score.format_score, score.overall_score, validation_status if validation.eligible else validation.status,
                     status, reason_code or None, reason or None, _json(metadata), now, now,
+                    _json(review_codes), query_fallback_level,
                 ),
             )
     return get_candidate(candidate_id, db_path=db_path) or {}
+
+
+REVIEW_EXPLANATIONS = {
+    "DATE_UNCERTAIN": "The document date could not be confirmed from authoritative metadata.",
+    "FISCAL_PERIOD_UNCERTAIN": "The document may be relevant, but its fiscal quarter is unresolved.",
+    "SLOT_MATCH_AMBIGUOUS": "The document could reasonably belong to more than one checklist item.",
+    "OFFICIAL_DOMAIN_UNCONFIRMED": "The search result appears relevant, but its official-company domain is not confirmed.",
+    "JS_DOCUMENT_UNRESOLVED": "The official page uses JavaScript and the underlying document URL could not be resolved safely.",
+    "MULTIPLE_EQUAL_CANDIDATES": "Multiple authoritative candidates appear to cover the same period.",
+    "PUBLICATION_DATE_MISSING": "The document is authoritative, but its publication date could not be confirmed.",
+    "MIME_TYPE_UNCERTAIN": "The final content type has not been verified.",
+    "CONTENT_NOT_DOWNLOADED": "The result metadata is relevant, but the document content has not been validated and downloaded.",
+    "COMPANY_IDENTITY_PARTIAL": "Only part of the company identity could be verified.",
+    "POSSIBLE_DUPLICATE": "The candidate may duplicate an existing package document.",
+    "SLOT_CAP_REACHED": "The checklist item has reached its configured document cap.",
+    "STALE_BUT_POSSIBLY_RELEVANT": "The document is older than the preferred window but may still be relevant.",
+    "TRANSCRIPT_ACCESS_UNCERTAIN": "The page appears to contain an earnings event, but safe downloadable content was not resolved.",
+    "PRESS_RELEASE_MATERIALITY_UNCERTAIN": "The release is official, but its investment relevance needs analyst confirmation.",
+}
+
+
+def candidate_review_explanation(reason_codes: Iterable[str] | str | None) -> str:
+    if isinstance(reason_codes, str):
+        try:
+            parsed = json.loads(reason_codes)
+            codes = parsed if isinstance(parsed, list) else [reason_codes]
+        except json.JSONDecodeError:
+            codes = [reason_codes]
+    else:
+        codes = list(reason_codes or [])
+    explanations = [REVIEW_EXPLANATIONS[code] for code in codes if code in REVIEW_EXPLANATIONS]
+    return " ".join(dict.fromkeys(explanations)) or "The candidate requires a specific analyst decision before collection."
+
+
+def automatic_selection_reason(
+    candidate: dict[str, Any], package: dict[str, Any], plan: SlotDiscoveryPlan
+) -> str | None:
+    if candidate.get("candidate_status") != "NEEDS_ANALYST_REVIEW":
+        return None
+    canonical = str(candidate.get("canonical_url") or "")
+    domain = (urlparse(canonical).hostname or "").lower().removeprefix("www.")
+    if candidate.get("source_route") == "SEC":
+        metadata = _loads(candidate.get("metadata_json"), {}).get("source_metadata", {})
+        form = str(metadata.get("form_type") or "").upper()
+        accession = str(metadata.get("accession_number") or "")
+        if domain.endswith("sec.gov") and form in {"10-K", "10-Q", "DEF 14A", "8-K"} and accession and candidate.get("publication_date"):
+            return f"Latest applicable original {form} from SEC.gov passed CIK, accession, cutoff, and slot-cap checks."
+        return None
+    official_domains = {
+        (urlparse(str(package.get(field) or "")).hostname or "").lower().removeprefix("www.")
+        for field in ("official_website_url", "official_ir_url", "official_newsroom_url")
+        if package.get(field)
+    }
+    verified_domain = any(domain == allowed or domain.endswith(f".{allowed}") for allowed in official_domains if allowed)
+    strong = float(candidate.get("source_authority_score") or 0) >= 90 and float(candidate.get("slot_relevance_score") or 0) >= 90
+    if verified_domain and strong and candidate.get("publication_date") and plan.normalized_slot_type in OFFICIAL_IR_CATEGORIES:
+        return "Verified official-company material passed identity, relevance, date, content, duplicate, and slot-cap checks."
+    return None
+
+
+def _attempt_automatic_selection(
+    candidate: dict[str, Any], package: dict[str, Any], plan: SlotDiscoveryPlan, *, actor: str,
+    session: requests.Session | None, db_path: Path | str,
+) -> dict[str, Any]:
+    reason = automatic_selection_reason(candidate, package, plan)
+    if not reason:
+        return candidate
+    try:
+        result = approve_and_download_candidate(
+            candidate["candidate_id"], actor=actor, session=session,
+            automatic_reason=reason, db_path=db_path,
+        )
+        return result["candidate"] or candidate
+    except (ValueError, requests.RequestException) as exc:
+        codes = ["CONTENT_NOT_DOWNLOADED"]
+        message = candidate_review_explanation(codes)
+        if "cap" in str(exc).casefold():
+            codes = ["SLOT_CAP_REACHED"]
+            message = candidate_review_explanation(codes)
+        with database.get_connection(db_path) as connection:
+            connection.execute(
+                """UPDATE discovered_candidates SET candidate_status='NEEDS_ANALYST_REVIEW',
+                   review_reason_codes_json=?, rejection_reason_code=?, rejection_reason=?, updated_at=?
+                   WHERE candidate_id=?""",
+                (_json(codes), codes[0], message, database.utc_now_iso(), candidate["candidate_id"]),
+            )
+        return get_candidate(candidate["candidate_id"], db_path=db_path) or candidate
 
 
 def _fiscal_quarter_from_text(value: str) -> str | None:
@@ -575,11 +700,15 @@ def _store_anchor(package_id: str, anchor: EarningsAnchor, *, db_path: Path | st
         connection.execute(
             """INSERT INTO earnings_cycle_anchors(
                 anchor_id, package_id, fiscal_year, fiscal_quarter, reporting_period_end, earnings_release_date,
-                filing_date, anchor_source, confidence, validation_status, analyst_override, created_at, updated_at
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)""",
+                filing_date, anchor_source, confidence, validation_status, analyst_override, created_at, updated_at,
+                fiscal_period_label, reporting_period_start, filing_form, accession, source_document_id,
+                source_candidate_id, source_url, evidence_summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (anchor_id, package_id, anchor.fiscal_year, anchor.fiscal_quarter, anchor.reporting_period_end,
              anchor.earnings_release_date, anchor.filing_date, anchor.anchor_source, anchor.confidence,
-             anchor.validation_status, now, now),
+             anchor.validation_status, now, now, anchor.fiscal_period_label, anchor.reporting_period_start,
+             anchor.filing_form, anchor.accession, anchor.source_document_id, anchor.source_candidate_id,
+             anchor.source_url, anchor.evidence_summary or "; ".join(anchor.reasons)),
         )
     return get_earnings_anchor(package_id, db_path=db_path) or {}
 
@@ -592,6 +721,44 @@ def get_earnings_anchor(package_id: str, *, db_path: Path | str = config.DATABAS
             (package_id,),
         ).fetchone()
     return dict(row) if row else None
+
+
+def refresh_earnings_cycle(
+    package_id: str,
+    *,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    """Recalculate the cycle from SEC period metadata even when collection slots are already filled."""
+    package = database.get_package_by_package_id(package_id, db_path=db_path)
+    if not package:
+        raise ValueError("Package does not exist.")
+    inventory = preview_cutler_profile(
+        package, enabled_families={"10-K", "10-Q", "8-K", "DEF 14A"},
+        session=session, db_path=db_path,
+    )
+    curated = select_curated_sec_filings(inventory, research_cutoff=str(package["research_cutoff_date"])[:10])
+    sources: list[dict[str, Any]] = []
+    seen: set[str] = set()
+    for rows in curated.values():
+        for row in rows:
+            form = str(row.get("form_type") or "").upper()
+            accession = str(row.get("accession_number") or "")
+            if form not in {"10-Q", "10-K"} or (accession and accession in seen):
+                continue
+            seen.add(accession)
+            report_period = str(row.get("report_period") or "") or None
+            fiscal_year, fiscal_quarter = fiscal_period_from_report_date(
+                report_period or "", str(package.get("fiscal_year_end") or "1231"), form,
+            )
+            sources.append({
+                "source_type": "SEC_10Q" if form == "10-Q" else "SEC_10K",
+                "title": row.get("title"), "reporting_period_end": report_period,
+                "filing_date": row.get("filing_date"), "filing_form": form,
+                "accession": accession, "source_url": row.get("primary_document_url"),
+                "fiscal_year": fiscal_year, "fiscal_quarter": fiscal_quarter,
+            })
+    return _store_anchor(package_id, EarningsAnchorAgent().determine(sources), db_path=db_path)
 
 
 def override_earnings_anchor(
@@ -612,10 +779,14 @@ def override_earnings_anchor(
             """INSERT INTO earnings_cycle_anchors(
                 anchor_id, package_id, fiscal_year, fiscal_quarter, reporting_period_end, earnings_release_date,
                 filing_date, anchor_source, confidence, validation_status, analyst_override, override_reason,
-                created_at, updated_at, approved_at, approved_by
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ANALYST_OVERRIDE', 'HIGH', 'CONFIRMED', 1, ?, ?, ?, ?, ?)""",
+                created_at, updated_at, approved_at, approved_by, fiscal_period_label, reporting_period_start,
+                filing_form, accession, source_document_id, source_candidate_id, source_url, evidence_summary
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, 'ANALYST_OVERRIDE', 'HIGH', 'CONFIRMED', 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (anchor_id, package_id, values.get("fiscal_year"), values.get("fiscal_quarter"), values.get("reporting_period_end"),
-             values.get("earnings_release_date"), values.get("filing_date"), reason.strip(), now, now, now, actor),
+             values.get("earnings_release_date"), values.get("filing_date"), reason.strip(), now, now, now, actor,
+             values.get("fiscal_period_label"), values.get("reporting_period_start"), values.get("filing_form"),
+             values.get("accession"), values.get("source_document_id"), values.get("source_candidate_id"),
+             values.get("source_url"), f"Analyst confirmed the earnings cycle: {reason.strip()}"),
         )
         connection.execute(
             "INSERT INTO phase6a_audit_events VALUES (?, ?, NULL, NULL, NULL, 'EARNINGS_ANCHOR_OVERRIDDEN', ?, ?, ?)",
@@ -666,6 +837,9 @@ def run_discovery(
         anchor.get("fiscal_year"), anchor.get("fiscal_quarter"), anchor.get("reporting_period_end"),
         anchor.get("earnings_release_date"), anchor.get("filing_date"), anchor.get("anchor_source", ""),
         anchor.get("confidence", "LOW"), anchor.get("validation_status", "NEEDS_ANALYST_REVIEW"), (),
+        anchor.get("fiscal_period_label"), anchor.get("reporting_period_start"), anchor.get("filing_form"),
+        anchor.get("accession"), anchor.get("source_document_id"), anchor.get("source_candidate_id"),
+        anchor.get("source_url"), anchor.get("evidence_summary"),
     ) if anchor else None
     for plan in plans:
         slot_started = time.perf_counter()
@@ -699,25 +873,45 @@ def run_discovery(
                         package, enabled_families={"10-K", "10-Q", "8-K", "DEF 14A"}, session=session, db_path=db_path,
                     )
                     curated = select_curated_sec_filings(sec_inventory, research_cutoff=str(package["research_cutoff_date"])[:10])
-                    anchor_sources = [
-                        {
-                            "source_type": "SEC_8K" if row.get("form_type") == "8-K" else "SEC",
-                            "reporting_period_end": row.get("report_period"), "filing_date": row.get("filing_date"),
-                            "earnings_release_date": row.get("filing_date") if row.get("form_type") == "8-K" else None,
-                            "fiscal_year": int(str(row.get("report_period") or row.get("filing_date"))[:4]) if str(row.get("report_period") or row.get("filing_date"))[:4].isdigit() else None,
-                        }
-                        for rows in curated.values() for row in rows
-                    ]
+                    anchor_sources = []
+                    seen_accessions: set[str] = set()
+                    for rows in curated.values():
+                        for row in rows:
+                            accession = str(row.get("accession_number") or "")
+                            if accession and accession in seen_accessions:
+                                continue
+                            seen_accessions.add(accession)
+                            form = str(row.get("form_type") or "").upper()
+                            if form not in {"10-Q", "10-K"}:
+                                continue
+                            report_period = None if form == "8-K" else str(row.get("report_period") or "") or None
+                            fiscal_year, fiscal_quarter = fiscal_period_from_report_date(
+                                report_period or "", str(package.get("fiscal_year_end") or "1231"), form,
+                            )
+                            anchor_sources.append({
+                                "source_type": "SEC_10Q" if form == "10-Q" else "SEC_10K",
+                                "title": row.get("title"),
+                                "reporting_period_end": report_period,
+                                "filing_date": row.get("filing_date"),
+                                "filing_form": form,
+                                "accession": accession,
+                                "source_url": row.get("primary_document_url"),
+                                "fiscal_year": fiscal_year,
+                                "fiscal_quarter": fiscal_quarter,
+                            })
                     if anchor_sources:
                         anchor_model = EarningsAnchorAgent().determine(anchor_sources)
                         _store_anchor(package_id, anchor_model, db_path=db_path)
                 curated = select_curated_sec_filings(sec_inventory or [], research_cutoff=str(package["research_cutoff_date"])[:10])
                 for rank, row in enumerate(curated.get(plan.normalized_slot_type, []), start=1):
-                    created.append(_upsert_candidate(
+                    sec_candidate = _upsert_candidate(
                         run_id=run_id, slot_run_id=slot_run_id, package=package, plan=plan, route="SEC", source_provider="SEC",
                         title=str(row.get("title") or f"{package['ticker']} {row.get('form_type')}"), url=str(row.get("primary_document_url") or ""),
                         description=str(row.get("selection_reason") or "Curated SEC filing"), publication_date=str(row.get("filing_date") or "") or None,
-                        mime_type="text/html", rank=rank, db_path=db_path,
+                        mime_type="text/html", rank=rank, source_metadata=row, db_path=db_path,
+                    )
+                    created.append(_attempt_automatic_selection(
+                        sec_candidate, package, plan, actor=actor, session=session, db_path=db_path,
                     ))
             if plan.normalized_slot_type in OFFICIAL_IR_CATEGORIES:
                 if not official_resolution_attempted:
@@ -734,11 +928,14 @@ def run_discovery(
                         if material.category not in OFFICIAL_IR_CATEGORIES[plan.normalized_slot_type]:
                             continue
                         explicit = material.download_status if material.download_status in REJECTED_CANDIDATE_STATUSES | {"NEEDS_JS_MANUAL_REVIEW"} else None
-                        created.append(_upsert_candidate(
+                        official_candidate = _upsert_candidate(
                             run_id=run_id, slot_run_id=slot_run_id, package=package, plan=plan, route="OFFICIAL_IR", source_provider="OFFICIAL_SITE",
                             title=material.title, url=material.source_url, description=material.discovery_method,
                             publication_date=material.publication_date or None, mime_type=material.mime_type, rank=rank,
                             explicit_status=explicit, rejection_reason=material.rejection_reason, db_path=db_path,
+                        )
+                        created.append(_attempt_automatic_selection(
+                            official_candidate, package, plan, actor=actor, session=session, db_path=db_path,
                         ))
                         if (
                             plan.normalized_slot_type == "latest_earnings_release"
@@ -749,17 +946,22 @@ def run_discovery(
                             anchor_sources = []
                             if prior:
                                 anchor_sources.append({
-                                    "source_type": "SEC", "fiscal_year": prior.fiscal_year,
+                                    "source_type": prior.anchor_source or "SEC", "fiscal_year": prior.fiscal_year,
                                     "fiscal_quarter": prior.fiscal_quarter,
                                     "reporting_period_end": prior.reporting_period_end,
                                     "filing_date": prior.filing_date,
+                                    "filing_form": prior.filing_form,
+                                    "accession": prior.accession,
+                                    "source_url": prior.source_url,
                                 })
                             anchor_sources.append({
                                 "source_type": "OFFICIAL_EARNINGS_RELEASE",
+                                "title": material.title,
                                 "fiscal_year": _fiscal_year_from_text(f"{material.title} {material.source_url}") or (prior.fiscal_year if prior else None),
                                 "fiscal_quarter": _fiscal_quarter_from_text(f"{material.title} {material.source_url}") or (prior.fiscal_quarter if prior else None),
                                 "reporting_period_end": prior.reporting_period_end if prior else None,
                                 "earnings_release_date": material.publication_date,
+                                "source_url": material.source_url,
                             })
                             anchor_model = EarningsAnchorAgent().determine(anchor_sources)
                             _store_anchor(package_id, anchor_model, db_path=db_path)
@@ -775,12 +977,23 @@ def run_discovery(
                             slot_warnings.append("PACKAGE_QUERY_BUDGET_REACHED")
                             break
                         response = _execute_search(request, provider=search_provider, discovery_run_id=run_id, slot_run_id=slot_run_id, db_path=db_path)
+                        fallback_match = re.search(r":L([1-3])$", request.query_purpose or "")
+                        fallback_level = int(fallback_match.group(1)) if fallback_match else 1
+                        authoritative_found = False
                         for result in response.results[: plan.maximum_candidates]:
-                            created.append(_upsert_candidate(
+                            brave_candidate = _upsert_candidate(
                                 run_id=run_id, slot_run_id=slot_run_id, package=package, plan=plan, route="BRAVE_OFFICIAL",
                                 source_provider=search_provider.provider_name, title=result.title, url=result.url,
-                                description=" ".join((result.description, *result.extra_snippets)), rank=result.rank, db_path=db_path,
-                            ))
+                                description=" ".join((result.description, *result.extra_snippets)), rank=result.rank,
+                                query_fallback_level=fallback_level, db_path=db_path,
+                            )
+                            selected_candidate = _attempt_automatic_selection(
+                                brave_candidate, package, plan, actor=actor, session=session, db_path=db_path,
+                            )
+                            created.append(selected_candidate)
+                            authoritative_found = authoritative_found or selected_candidate.get("candidate_status") == "AUTO_SELECTED"
+                        if authoritative_found:
+                            break
                         if (
                             response.more_results_available
                             and config.BRAVE_MAX_PAGES_PER_QUERY > 1
@@ -791,11 +1004,17 @@ def run_discovery(
                             second = BraveSearchRequest(**{**asdict(request), "offset": 1})
                             page = _execute_search(second, provider=search_provider, discovery_run_id=run_id, slot_run_id=slot_run_id, db_path=db_path)
                             for result in page.results[: max(0, plan.maximum_candidates - len(created))]:
-                                created.append(_upsert_candidate(
+                                page_candidate = _upsert_candidate(
                                     run_id=run_id, slot_run_id=slot_run_id, package=package, plan=plan, route="BRAVE_OFFICIAL",
                                     source_provider=search_provider.provider_name, title=result.title, url=result.url,
-                                    description=" ".join((result.description, *result.extra_snippets)), rank=result.rank, db_path=db_path,
+                                    description=" ".join((result.description, *result.extra_snippets)), rank=result.rank,
+                                    query_fallback_level=fallback_level, db_path=db_path,
+                                )
+                                created.append(_attempt_automatic_selection(
+                                    page_candidate, package, plan, actor=actor, session=session, db_path=db_path,
                                 ))
+                        if response.result_count > 0:
+                            break
             completed += 1
             rejected = sum(row.get("candidate_status") in REJECTED_CANDIDATE_STATUSES for row in created)
             with database.get_connection(db_path) as connection:
@@ -803,11 +1022,16 @@ def run_discovery(
                     "SELECT COUNT(*) AS count, COALESCE(SUM(result_count),0) AS results, COALESCE(SUM(cache_hit),0) AS cached FROM search_queries WHERE slot_discovery_run_id=?",
                     (slot_run_id,),
                 ).fetchone()
+                selected_count = int(connection.execute(
+                    """SELECT COUNT(*) FROM slot_document_assignments
+                       WHERE package_slot_instance_id=? AND assignment_status='APPROVED' AND selected_for_package=1""",
+                    (plan.package_slot_instance_id,),
+                ).fetchone()[0])
                 connection.execute(
                     """UPDATE slot_discovery_runs SET status='COMPLETED', completed_at=?, query_count=?, result_count=?,
-                       candidate_count=?, rejected_count=?, cached=?, warnings_json=?, duration_ms=? WHERE slot_discovery_run_id=?""",
-                    (database.utc_now_iso(), query_stats["count"], query_stats["results"], len(created), rejected,
-                     int(query_stats["cached"] > 0), _json(slot_warnings), round((time.perf_counter() - slot_started) * 1000), slot_run_id),
+                       candidate_count=?, selected_count=?, rejected_count=?, cached=?, warnings_json=?, duration_ms=? WHERE slot_discovery_run_id=?""",
+                    (database.utc_now_iso(), query_stats["count"], query_stats["results"], len(created), selected_count,
+                     rejected, int(query_stats["cached"] > 0), _json(slot_warnings), round((time.perf_counter() - slot_started) * 1000), slot_run_id),
                 )
         except Exception as exc:
             safe_message = f"{type(exc).__name__}: discovery stage failed."
@@ -823,7 +1047,8 @@ def run_discovery(
             """SELECT COUNT(*) AS candidates,
                       SUM(CASE WHEN candidate_status IN ('REJECTED','NON_INVESTOR_MATERIAL','MIME_MISMATCH','COMPANY_MISMATCH','FAILED') THEN 1 ELSE 0 END) AS rejected,
                       SUM(CASE WHEN candidate_status='AUTO_SELECTED' THEN 1 ELSE 0 END) AS auto_selected,
-                      SUM(CASE WHEN candidate_status='NEEDS_ANALYST_REVIEW' THEN 1 ELSE 0 END) AS review
+                      SUM(CASE WHEN candidate_status='NEEDS_ANALYST_REVIEW' THEN 1 ELSE 0 END) AS review,
+                      SUM(CASE WHEN downloaded_document_id IS NOT NULL THEN 1 ELSE 0 END) AS downloaded
                FROM discovered_candidates WHERE discovery_run_id=?""",
             (run_id,),
         ).fetchone()
@@ -836,11 +1061,11 @@ def run_discovery(
         connection.execute(
             """UPDATE package_discovery_runs SET status=?, completed_at=?, slot_count_completed=?, queries_executed=?,
                cached_queries_reused=?, results_considered=?, candidates_created=?, candidates_rejected=?,
-               candidates_auto_selected=?, candidates_needing_review=?, warnings_json=?, total_duration_ms=?
+               candidates_auto_selected=?, candidates_needing_review=?, documents_downloaded=?, warnings_json=?, total_duration_ms=?
                WHERE discovery_run_id=?""",
             (status, database.utc_now_iso(), completed, query_stats["queries"] - query_stats["cached"], query_stats["cached"],
              query_stats["results"], stats["candidates"], stats["rejected"] or 0, stats["auto_selected"] or 0,
-             stats["review"] or 0, _json(warnings), duration, run_id),
+             stats["review"] or 0, stats["downloaded"] or 0, _json(warnings), duration, run_id),
         )
         actual_requests = int(query_stats["queries"] - query_stats["cached"])
         estimated = actual_requests * config.BRAVE_COST_PER_1000_REQUESTS / 1000 if config.BRAVE_COST_PER_1000_REQUESTS is not None else None
@@ -946,11 +1171,85 @@ def decide_candidate(
     return get_candidate(candidate_id, db_path=db_path) or {}
 
 
+def correct_candidate_date(
+    candidate_id: str,
+    publication_date: str,
+    *,
+    actor: str,
+    notes: str,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    candidate = get_candidate(candidate_id, db_path=db_path)
+    if not candidate or not notes.strip():
+        raise ValueError("A candidate and correction reason are required.")
+    package = database.get_package_by_package_id(candidate["package_id"], db_path=db_path) or {}
+    try:
+        corrected = date.fromisoformat(publication_date[:10]).isoformat()
+    except ValueError as exc:
+        raise ValueError("Enter a valid publication date.") from exc
+    if corrected > str(package.get("research_cutoff_date") or "")[:10]:
+        raise ValueError("The corrected date cannot be after the research cutoff.")
+    now = database.utc_now_iso()
+    with database.get_connection(db_path) as connection:
+        previous = connection.execute("SELECT decision_id FROM candidate_decisions WHERE candidate_id=? ORDER BY decided_at DESC LIMIT 1", (candidate_id,)).fetchone()
+        connection.execute(
+            "INSERT INTO candidate_decisions VALUES (?, ?, ?, ?, 'DEFER', 'DATE_CORRECTED', ?, ?, ?, ?)",
+            (_token("CDEC"), candidate_id, candidate["package_id"], candidate["package_slot_instance_id"], notes.strip(), now, actor, previous[0] if previous else None),
+        )
+        connection.execute(
+            """UPDATE discovered_candidates SET publication_date=?, date_confidence='ANALYST_CONFIRMED',
+               review_reason_codes_json='[]', rejection_reason_code=NULL, rejection_reason=NULL, updated_at=?
+               WHERE candidate_id=?""",
+            (corrected, now, candidate_id),
+        )
+    return get_candidate(candidate_id, db_path=db_path) or {}
+
+
+def change_candidate_slot(
+    candidate_id: str,
+    slot_instance_id: str,
+    *,
+    actor: str,
+    notes: str,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    candidate = get_candidate(candidate_id, db_path=db_path)
+    if not candidate or not notes.strip():
+        raise ValueError("A candidate and slot-change reason are required.")
+    with database.get_connection(db_path) as connection:
+        slot = connection.execute(
+            "SELECT * FROM package_slot_instances WHERE package_slot_instance_id=? AND package_id=?",
+            (slot_instance_id, candidate["package_id"]),
+        ).fetchone()
+        if not slot:
+            raise ValueError("The destination checklist item is not in this package.")
+        duplicate = connection.execute(
+            "SELECT candidate_id FROM discovered_candidates WHERE package_slot_instance_id=? AND canonical_url=? AND candidate_id!=?",
+            (slot_instance_id, candidate["canonical_url"], candidate_id),
+        ).fetchone()
+        if duplicate:
+            raise ValueError("The destination checklist item already contains this candidate URL.")
+        previous = connection.execute("SELECT decision_id FROM candidate_decisions WHERE candidate_id=? ORDER BY decided_at DESC LIMIT 1", (candidate_id,)).fetchone()
+        now = database.utc_now_iso()
+        connection.execute(
+            "INSERT INTO candidate_decisions VALUES (?, ?, ?, ?, 'DEFER', 'SLOT_CHANGED', ?, ?, ?, ?)",
+            (_token("CDEC"), candidate_id, candidate["package_id"], slot_instance_id, notes.strip(), now, actor, previous[0] if previous else None),
+        )
+        connection.execute(
+            "UPDATE discovered_candidates SET package_slot_instance_id=?, rejection_reason_code=NULL, rejection_reason=NULL, updated_at=? WHERE candidate_id=?",
+            (slot_instance_id, now, candidate_id),
+        )
+    return get_candidate(candidate_id, db_path=db_path) or {}
+
+
 def approve_and_download_candidate(
     candidate_id: str,
     *,
     actor: str,
     session: requests.Session | None = None,
+    automatic_reason: str | None = None,
+    replace_assignment_id: str | None = None,
+    replacement_reason: str = "",
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     candidate = get_candidate(candidate_id, db_path=db_path)
@@ -964,7 +1263,10 @@ def approve_and_download_candidate(
         document = existing
         status = "ALREADY_COLLECTED"
     else:
-        validated = fetch_and_validate_candidate(candidate["canonical_url"], session=session)
+        validated = fetch_and_validate_candidate(
+            candidate["canonical_url"], session=session,
+            headers=sec_headers() if candidate.get("source_route") == "SEC" else None,
+        )
         if not validated.eligible:
             with database.get_connection(db_path) as connection:
                 connection.execute(
@@ -979,7 +1281,8 @@ def approve_and_download_candidate(
         else:
             suffix = validated.file_extension or mimetypes.guess_extension(validated.mime_type) or ".bin"
             filename = sanitize_filename(f"{package['ticker']}_{candidate['title']}{suffix}")
-            path = safe_document_path(package["package_id"], "discovery", filename)
+            workspace_source = "sec" if candidate.get("source_route") == "SEC" else "investor_relations"
+            path = safe_document_path(package["package_id"], workspace_source, filename)
             atomic_write_bytes(path, validated.content)
             document = database.create_document_record(
                 {
@@ -1000,34 +1303,53 @@ def approve_and_download_candidate(
                 db_path=db_path,
             )
             status = "DOWNLOADED"
-    try:
-        assignment = assign_document(
-            candidate["package_slot_instance_id"], document["document_id"], actor=actor,
-            assignment_source="PUBLIC_DISCOVERY", db_path=db_path,
+    if replace_assignment_id:
+        if not replacement_reason.strip():
+            raise ValueError("A replacement reason is required.")
+        from app.services.package_recipe_service import replace_assignment
+
+        assignment = replace_assignment(
+            replace_assignment_id, document["document_id"], actor=actor,
+            reason=replacement_reason, db_path=db_path,
         )
-    except ValueError as exc:
-        if "already assigned" not in str(exc).lower():
-            raise
-        assignment = next(
-            row for row in list_assignments(package["package_id"], db_path=db_path)
-            if row["package_slot_instance_id"] == candidate["package_slot_instance_id"] and row["document_id"] == document["document_id"]
-        )
+    else:
+        try:
+            assignment = assign_document(
+                candidate["package_slot_instance_id"], document["document_id"], actor=actor,
+                assignment_source="PUBLIC_DISCOVERY", db_path=db_path,
+            )
+        except ValueError as exc:
+            if "already assigned" not in str(exc).lower():
+                raise
+            assignment = next(
+                row for row in list_assignments(package["package_id"], db_path=db_path)
+                if row["package_slot_instance_id"] == candidate["package_slot_instance_id"] and row["document_id"] == document["document_id"]
+            )
     now = database.utc_now_iso()
+    if automatic_reason:
+        status = "AUTO_SELECTED"
     with database.get_connection(db_path) as connection:
         previous = connection.execute("SELECT decision_id FROM candidate_decisions WHERE candidate_id=? ORDER BY decided_at DESC LIMIT 1", (candidate_id,)).fetchone()
         connection.execute(
-            "INSERT INTO candidate_decisions VALUES (?, ?, ?, ?, 'ACCEPT', 'ANALYST_APPROVED', NULL, ?, ?, ?)",
-            (_token("CDEC"), candidate_id, package["package_id"], candidate["package_slot_instance_id"], now, actor, previous[0] if previous else None),
+            "INSERT INTO candidate_decisions VALUES (?, ?, ?, ?, 'ACCEPT', ?, ?, ?, ?, ?)",
+            (_token("CDEC"), candidate_id, package["package_id"], candidate["package_slot_instance_id"],
+             "AUTHORITATIVE_AUTO_SELECTION" if automatic_reason else "ANALYST_APPROVED", automatic_reason,
+             now, actor, previous[0] if previous else None),
         )
         connection.execute(
             """UPDATE discovered_candidates SET candidate_status=?, validation_status='CONTENT_VALID', final_redirect_url=?,
-               mime_type=?, file_extension=?, file_signature=?, content_length=?, updated_at=? WHERE candidate_id=?""",
+               mime_type=?, file_extension=?, file_signature=?, content_length=?, automatic_selection_reason=?,
+               downloaded_document_id=?, review_reason_codes_json='[]', updated_at=? WHERE candidate_id=?""",
             (status, validated.final_url if 'validated' in locals() else candidate.get("final_redirect_url"),
              validated.mime_type if 'validated' in locals() else candidate.get("mime_type"),
              validated.file_extension if 'validated' in locals() else candidate.get("file_extension"),
              validated.file_signature if 'validated' in locals() else candidate.get("file_signature"),
-             validated.content_length if 'validated' in locals() else candidate.get("content_length"), now, candidate_id),
+             validated.content_length if 'validated' in locals() else candidate.get("content_length"), automatic_reason,
+             document["document_id"], now, candidate_id),
         )
+    from app.services.package_assembly_service import package_contents
+
+    package_contents(package["package_id"], db_path=db_path)
     recalculate_completion(package["package_id"], actor=actor, db_path=db_path)
     return {"candidate": get_candidate(candidate_id, db_path=db_path), "document": document, "assignment": assignment}
 

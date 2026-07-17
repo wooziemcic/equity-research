@@ -125,7 +125,14 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
         f"Research cutoff: {memo['research_cutoff']}"
     )
     sections: list[dict[str, Any]] = [
-        {"title": f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary", "paragraphs": [header]},
+        {
+            "title": (
+                f"{memo['company_name']} ({memo['ticker']}) - Preliminary Package View"
+                if memo.get("preliminary_package_view")
+                else f"{memo['company_name']} ({memo['ticker']}) - Equity Research Summary"
+            ),
+            "paragraphs": [header],
+        },
         {
             "title": "Investment View",
             "paragraphs": [memo["investment_view"], *memo.get("investment_view_citations", [])],
@@ -140,7 +147,11 @@ def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
                 "title": "Conclusion",
                 "paragraphs": [
                     memo["conclusion"],
-                    "Closed-corpus memo: conclusions are limited to the locked research package and its verified citations.",
+                    (
+                        "Prepared from selected package documents only. Analyst review is required before investment action."
+                        if memo.get("preliminary_package_view")
+                        else "Closed-corpus memo: conclusions are limited to the locked research package and its verified citations."
+                    ),
                 ],
             },
         ]
@@ -471,6 +482,7 @@ def generate_investment_report(
     analysis_run_id: str,
     *,
     final: bool = False,
+    preliminary_package_view: bool = False,
     client: Any | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
@@ -488,6 +500,12 @@ def generate_investment_report(
     if final and audit["status"] != "PASSED":
         raise ValueError("Final report citation audit failed.")
     memo, attempt_id, candidates = synthesize_memo(analysis_run_id, client=client, db_path=db_path)
+    if preliminary_package_view:
+        memo["preliminary_package_view"] = True
+        if not str(memo.get("investment_view") or "").startswith("Preliminary Package View"):
+            memo["investment_view"] = f"Preliminary Package View. {memo.get('investment_view') or ''}".strip()
+        if "analyst review" not in str(memo.get("conclusion") or "").casefold():
+            memo["conclusion"] = f"{memo.get('conclusion') or ''} Analyst review is required before investment action.".strip()
     try:
         memo = fit_memo_to_one_page(memo)
     except ValueError as exc:

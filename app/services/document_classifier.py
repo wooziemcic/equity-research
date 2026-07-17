@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from pathlib import Path
+import re
 
 
 @dataclass(frozen=True)
@@ -14,10 +15,17 @@ class ClassificationSuggestion:
 
 
 RULES: tuple[tuple[str, tuple[str, ...], str, str], ...] = (
-    ("bloomberg_des", ("bloomberg", "des"), "Bloomberg DES", "High"),
-    ("bloomberg_fa", ("bloomberg", "fa"), "Bloomberg FA", "High"),
+    ("bloomberg_credit_ratios", ("credit", "ratios"), "Bloomberg Credit Ratios", "High"),
+    ("historical_valuation", ("ev", "ebitda"), "Historical Multiples or Valuation Analysis", "High"),
+    ("morningstar_model", ("morningstar",), "Morningstar Model", "High"),
+    ("bloomberg_des", ("des",), "Bloomberg DES", "High"),
+    ("bloomberg_dvd", ("dvd",), "Bloomberg DVD", "High"),
+    ("bloomberg_hds", ("hds",), "Bloomberg HDS", "High"),
     ("bloomberg_anr", ("anr",), "Bloomberg ANR", "High"),
     ("bloomberg_drsk", ("drsk",), "Bloomberg DRSK", "High"),
+    ("bloomberg_fa", ("fa",), "Bloomberg FA", "High"),
+    ("bloomberg_des", ("bloomberg", "des"), "Bloomberg DES", "High"),
+    ("bloomberg_fa", ("bloomberg", "fa"), "Bloomberg FA", "High"),
     ("annual_filing", ("10-k",), "Annual Filing", "High"),
     ("quarterly_filing", ("10-q",), "Quarterly Filing", "High"),
     ("current_report", ("8-k",), "Current Report", "High"),
@@ -45,7 +53,13 @@ def classify_document(filename: str, *, source_type: str = "") -> Classification
     ext = Path(filename).suffix.lower()
     haystack = f"{stem} {source_type.lower()}".replace("_", " ")
     for category_code, keywords, display, confidence in RULES:
-        if all(keyword in haystack for keyword in keywords):
+        matched = all(
+            bool(re.search(rf"\b{re.escape(keyword)}\b", haystack)) if len(keyword) <= 4 else keyword in haystack
+            for keyword in keywords
+        )
+        if matched:
+            if category_code == "morningstar_model" and ext not in {".xlsx", ".xlsm", ".xls", ".csv"}:
+                continue
             if category_code == "financial_model" and ext not in {".xlsx", ".xlsm", ".csv"}:
                 continue
             return ClassificationSuggestion(

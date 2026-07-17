@@ -14,7 +14,9 @@ from openpyxl.styles import Alignment, Font, PatternFill
 
 from app import config
 from app.services.package_service import PackageInput, create_package
+from app.services.package_naming_service import classify_upload_filename
 from app.services.recipe_import_service import SECTION_ORDER
+from app.services.slot_policy_service import effective_document_counts
 from app.utils import database
 
 
@@ -359,6 +361,7 @@ def recalculate_completion(package_id: str, *, actor: str = "system", db_path: P
     now = database.utc_now_iso()
     updates: list[tuple[Any, ...]] = []
     for slot in slots:
+        count_rule = effective_document_counts(slot)
         selected = [item for item in by_slot.get(slot["package_slot_instance_id"], []) if item.get("selected_for_package")]
         approved = [item for item in selected if item["assignment_status"] == "APPROVED" and item["collection_status"] in VALID_INTEGRITY_STATUSES]
         count = len(approved)
@@ -371,9 +374,9 @@ def recalculate_completion(package_id: str, *, actor: str = "system", db_path: P
             status = "NEEDS_ANALYST_REVIEW"
         elif _freshness_violation(slot, approved):
             status = "STALE"
-        elif count > slot["maximum_documents"] and not slot["cap_override_approved"]:
+        elif count > count_rule["maximum"] and not slot["cap_override_approved"]:
             status = "NEEDS_ANALYST_REVIEW"
-        elif count >= slot["minimum_documents"] and all(item["assignment_status"] == "APPROVED" for item in selected):
+        elif count >= count_rule["minimum"] and all(item["assignment_status"] == "APPROVED" for item in selected):
             status = "COMPLETE"
         elif selected:
             status = "PARTIAL"
@@ -464,6 +467,24 @@ CLASSIFICATION_RULES: tuple[tuple[str, tuple[str, ...], float, bool], ...] = (
 
 
 def classify_filename(filename: str, slots: list[dict[str, Any]]) -> dict[str, Any]:
+    cutler = classify_upload_filename(filename)
+    if cutler.normalized_slot_type:
+        slot = next(
+            (item for item in slots if item.get("normalized_slot_type") == cutler.normalized_slot_type),
+            None,
+        )
+        if slot:
+            return {
+                "suggested_slot_id": slot.get("package_slot_instance_id") or slot.get("slot_id"),
+                "suggested_slot_name": slot.get("display_name_snapshot") or slot.get("display_name"),
+                "normalized_slot_type": cutler.normalized_slot_type,
+                "source": cutler.source,
+                "document_date": cutler.document_date,
+                "confidence": 0.98 if cutler.confidence == "HIGH" else 0.65,
+                "requires_review": cutler.confidence != "HIGH",
+                "matched_tokens": list(cutler.matched_tokens),
+                "reason": cutler.explanation,
+            }
     normalized = f" {re.sub(r'[^a-z0-9]+', ' ', Path(filename).stem.lower())} "
     slot_by_name = {slot.get("display_name_snapshot") or slot.get("display_name"): slot for slot in slots}
     for name, tokens, confidence, ambiguous in CLASSIFICATION_RULES:
@@ -524,7 +545,12 @@ def assign_document(
     now = database.utc_now_iso()
     suggestion = suggestion or {}
     with database.get_connection(db_path) as connection:
-        slot = connection.execute("SELECT * FROM package_slot_instances WHERE package_slot_instance_id=?", (slot_instance_id,)).fetchone()
+        slot = connection.execute(
+            """SELECT psi.*, rs.normalized_slot_type
+               FROM package_slot_instances psi JOIN research_slots rs ON rs.slot_id=psi.slot_id
+               WHERE psi.package_slot_instance_id=?""",
+            (slot_instance_id,),
+        ).fetchone()
         document = connection.execute("SELECT * FROM documents WHERE document_id=?", (document_id,)).fetchone()
         if not slot or not document or slot["package_id"] != document["package_id"]:
             raise ValueError("The slot and document must belong to the same package.")
@@ -538,13 +564,21 @@ def assign_document(
             "SELECT 1 FROM slot_document_assignments WHERE document_id=? AND package_slot_instance_id!=? AND assignment_status NOT IN ('REJECTED','REPLACED','REMOVED') LIMIT 1",
             (document_id, slot_instance_id),
         ).fetchone()
-        if another_slot and assignment_source != "GENERATED_DERIVATIVE":
+        reusable_authoritative_source = (
+            assignment_source == "PUBLIC_DISCOVERY"
+            and (
+                str(document["source_domain"] or "").lower().endswith("sec.gov")
+                or str(document["source_url"] or "").lower().startswith("https://www.sec.gov/")
+            )
+        )
+        if another_slot and assignment_source != "GENERATED_DERIVATIVE" and not reusable_authoritative_source:
             raise ValueError("This original document is already assigned to another slot. Create a recorded generated derivative for multi-slot use.")
         approved_count = int(connection.execute(
             "SELECT COUNT(*) FROM slot_document_assignments WHERE package_slot_instance_id=? AND selected_for_package=1 AND assignment_status='APPROVED'",
             (slot_instance_id,),
         ).fetchone()[0])
-        if selected and status == "APPROVED" and approved_count >= int(slot["maximum_documents"]) and not override_cap:
+        maximum_documents = effective_document_counts(dict(slot))["maximum"]
+        if selected and status == "APPROVED" and approved_count >= maximum_documents and not override_cap:
             raise ValueError("This slot has reached its document cap. Replace a document or record an approved override.")
         if override_cap and not override_reason.strip():
             raise ValueError("A reason is required for a slot-cap override.")
@@ -582,9 +616,14 @@ def update_assignment(assignment_id: str, action: str, *, actor: str, notes: str
         if not row:
             raise ValueError("Assignment does not exist.")
         if action == "approve":
-            slot = connection.execute("SELECT * FROM package_slot_instances WHERE package_slot_instance_id=?", (row["package_slot_instance_id"],)).fetchone()
+            slot = connection.execute(
+                """SELECT psi.*, rs.normalized_slot_type
+                   FROM package_slot_instances psi JOIN research_slots rs ON rs.slot_id=psi.slot_id
+                   WHERE psi.package_slot_instance_id=?""",
+                (row["package_slot_instance_id"],),
+            ).fetchone()
             count = int(connection.execute("SELECT COUNT(*) FROM slot_document_assignments WHERE package_slot_instance_id=? AND selected_for_package=1 AND assignment_status='APPROVED'", (row["package_slot_instance_id"],)).fetchone()[0])
-            if count >= int(slot["maximum_documents"]):
+            if count >= effective_document_counts(dict(slot))["maximum"]:
                 raise ValueError("This slot has reached its document cap.")
         connection.execute(
             "UPDATE slot_document_assignments SET assignment_status=?, selected_for_package=?, analyst_notes=?, approved_at=?, approved_by=? WHERE assignment_id=?",

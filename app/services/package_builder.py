@@ -110,10 +110,21 @@ def included_documents(package_id: str, *, db_path: Path | str = config.DATABASE
     inclusion_by_document = {row["document_id"]: bool(row["included"]) for row in inclusion_rows}
     package = database.get_package_by_package_id(package_id, db_path=db_path)
     window = window_from_package(package) if package else None
+    with database.get_connection(db_path) as connection:
+        recipe_backed = connection.execute(
+            "SELECT 1 FROM package_recipe_instances WHERE package_id=? LIMIT 1", (package_id,)
+        ).fetchone()
+        approved_rows = connection.execute(
+            """SELECT DISTINCT document_id FROM slot_document_assignments
+               WHERE package_id=? AND assignment_status='APPROVED' AND selected_for_package=1""",
+            (package_id,),
+        ).fetchall() if recipe_backed else []
+    approved_document_ids = {row["document_id"] for row in approved_rows}
     return [
         doc
         for doc in database.list_documents_by_package(package_id, db_path=db_path)
         if doc.get("collection_status") != "DELETED"
+        and (not recipe_backed or doc["document_id"] in approved_document_ids)
         and inclusion_by_document.get(doc["document_id"], True)
         and (window is None or window.contains(doc.get("publication_date") or doc.get("document_date")))
     ]
@@ -143,6 +154,7 @@ def package_build_fingerprint(
 def validate_package_readiness(
     package: dict[str, Any] | None,
     *,
+    preliminary: bool = False,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> ReadinessResult:
     """Return structured readiness errors, warnings, notices, and status."""
@@ -185,13 +197,13 @@ def validate_package_readiness(
     ]
     needs_review = [item for item in checklist if item["effective_status"] == config.CHECKLIST_STATUS_NEEDS_REVIEW]
     stale = [item for item in checklist if item["effective_status"] == config.CHECKLIST_STATUS_STALE]
-    if not int(package.get("checklist_reviewed") or 0):
+    if not preliminary and not int(package.get("checklist_reviewed") or 0):
         errors.append("Checklist review acknowledgement is required.")
-    if missing_core and not int(package.get("missing_core_acknowledged") or 0):
+    if not preliminary and missing_core and not int(package.get("missing_core_acknowledged") or 0):
         errors.append("Missing core checklist items require acknowledgement.")
-    if needs_review and not int(package.get("needs_review_acknowledged") or 0):
+    if not preliminary and needs_review and not int(package.get("needs_review_acknowledged") or 0):
         errors.append("Needs-review checklist items require acknowledgement.")
-    if stale and not int(package.get("stale_documents_acknowledged") or 0):
+    if not preliminary and stale and not int(package.get("stale_documents_acknowledged") or 0):
         errors.append("Stale checklist items require acknowledgement.")
     for item in missing_core:
         warnings.append(f"Missing core item: {item['display_name']}")
@@ -283,10 +295,11 @@ def build_package_version(
     package: dict[str, Any],
     *,
     notes: str = "",
+    preliminary: bool = False,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     """Build a versioned package snapshot and ZIP without locking it."""
-    readiness = validate_package_readiness(package, db_path=db_path)
+    readiness = validate_package_readiness(package, preliminary=preliminary, db_path=db_path)
     database.create_package_version_event(
         event_id=f"PVE-{secrets.token_hex(8).upper()}",
         parent_package_id=package["package_id"],

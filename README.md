@@ -6,6 +6,7 @@ Cutler Research AI is an internal Streamlit research product for searching a tic
 
 Implemented through the Phase 5 analyst-readiness pass:
 
+- Phase 6B.1 live assembly: authoritative SEC and official-company candidates can be validated, downloaded, cleanly named, and assigned automatically; earnings-cycle dates retain their distinct meanings; discovery progress is separate from checklist completion; multi-document slots and bulk licensed-file classification are supported; Package Contents shows only working-package files; and explicitly requested preliminary one-page recommendations reuse the Phase 5.1 closed-corpus workflow with an analyst-review posture for incomplete packages.
 - Phase 6B discovery: checksum-validated default Common Equity recipe bootstrap, controlled Brave Web Search, slot-specific source routing, curated SEC selection, bounded official-site discovery, deterministic candidate validation and ranking, analyst review, query budgets and caching, earnings-cycle anchors, resumable discovery runs, and complete search/candidate auditing. Licensed and internal rows remain manual.
 - Phase 6A stabilization: versioned workbook-derived common-equity recipes, explicit administrator approval and activation, immutable per-package recipe snapshots, ordered package slots, deterministic upload suggestions and completion, the responsive Package Assembly Board, checklist XLSX export, safe JSON snapshot portability, legacy-package cloning, test-database classification, and guarded development migrations.
 
@@ -26,7 +27,7 @@ Not implemented: authentication, cloud deployment, continuous monitoring, or tra
 The default application experience is now:
 
 1. `Search` - `app/Home.py` verifies an exact ticker match through the supported SEC company database. After confirmation, a new Common Equity package is created from the active approved Cutler recipe and receives an immutable recipe snapshot.
-2. `Package Assembly` - `app/pages/8_Package_Assembly.py` is the default analyst workspace for recipe-backed packages. It preserves workbook order and numbering gaps, supports reviewed uploads and existing-document assignments, distinguishes missing/unavailable/not-applicable items, and exports the current database-backed checklist.
+2. `Package Assembly` - `app/pages/8_Package_Assembly.py` is the default analyst workspace for recipe-backed packages. It separates public-search progress from filled checklist items, supports automatic authoritative collection, reviewed batch uploads, multi-document assignments, Cutler-style working filenames, package-content preview, preliminary recommendation generation, and current checklist export.
 3. `Result` - `app/pages/6_Investment_Result.py` renders the same compact memo model used by the one-page PDF and DOCX. Package identifiers, diagnostics, filtered conflict counts, and performance data remain in the collapsed `Audit Details` section.
 
 Secondary navigation includes `Dashboard / History` for previous packages and `Advanced Workbench` for the detailed Phase 1-6 pages: package setup, public collection, licensed uploads, package review, evidence exploration, analyst review, PM approval, generated reports, and audit history.
@@ -34,6 +35,10 @@ Secondary navigation includes `Dashboard / History` for previous packages and `A
 Fresh deployments automatically receive the checksum-validated bundled Common Equity v1 recipe from `app/resources/recipes/common_equity_v1.json`. Normal package creation does not require Recipe Administration. Administrators can verify initialization, activate an approved replacement, or import a new workbook-derived draft without changing existing package snapshots.
 
 Public discovery searches only incomplete recipe rows with an active search profile. Configure `SEARCH_PROVIDER=brave` and `BRAVE_SEARCH_API_KEY` outside source control to enable Brave fallback. The connection test in Advanced Workbench runs only when clicked, requests one result, and never displays or stores the key. Set `SEARCH_PROVIDER=none` to retain SEC, static official-site, and manual workflows without Brave.
+
+Brave searches use a maximum three-level ladder within the existing slot and package budgets. A narrow official-IR query runs first; broader company-domain and official-preference queries run only when the prior level returns zero results. Search completion never marks a checklist item complete. Only an approved, integrity-checked assignment satisfying the slot minimum does that.
+
+The preliminary recommendation action is disabled until an approved 10-K or 10-Q and at least one approved earnings document are present. It uses only approved recipe assignments, reuses the existing processing, evidence, recommendation, memo QA, PDF/DOCX, retry, token, and cost controls, and labels incomplete-package output as a preliminary package view requiring analyst review.
 
 ## Research Workspace Details
 

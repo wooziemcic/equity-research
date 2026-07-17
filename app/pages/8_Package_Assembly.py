@@ -14,16 +14,23 @@ from app.services.package_discovery_service import (
     CompletenessAgent,
     RecipePlannerAgent,
     approve_and_download_candidate,
+    candidate_review_explanation,
+    change_candidate_slot,
+    correct_candidate_date,
     decide_candidate,
     discovery_audit_details,
     discovery_preview,
     get_earnings_anchor,
     latest_discovery_run,
     list_discovery_candidates,
+    override_earnings_anchor,
+    refresh_earnings_cycle,
     resume_discovery,
     run_discovery,
     stop_discovery,
 )
+from app.services.package_assembly_service import package_contents, public_package_summary
+from app.services.package_naming_service import generate_package_display_filename
 from app.services.package_recipe_service import (
     add_slot_note,
     assign_document,
@@ -32,12 +39,22 @@ from app.services.package_recipe_service import (
     export_checklist_xlsx,
     export_package_snapshot,
     mark_slot,
+    list_assignments,
+    list_slot_instances,
     replace_assignment,
     set_highlighted,
     suggest_document_assignments,
     update_assignment,
     update_package_header,
+    classify_filename,
 )
+from app.services.preliminary_recommendation_service import (
+    generate_preliminary_recommendation,
+    latest_preliminary_report,
+    preliminary_report_files,
+    preliminary_report_gate,
+)
+from app.services.slot_policy_service import effective_document_counts
 from app.services.upload_service import UploadCandidate, prepare_batch_review, store_reviewed_upload_batch
 from app.utils import database
 
@@ -128,25 +145,51 @@ def _header(payload: dict) -> None:
                 hide_index=True,
                 use_container_width=True,
             )
-            st.caption("Use Refresh Public Discovery to recalculate. Analyst overrides are recorded in Audit Details.")
+            missing = []
+            if not anchor.get("fiscal_quarter"):
+                missing.append("fiscal quarter")
+            if not anchor.get("reporting_period_end"):
+                missing.append("reporting-period end")
+            if missing:
+                st.warning(f"Analyst confirmation required. Missing: {', '.join(missing)}.")
+            st.caption(anchor.get("evidence_summary") or "Use Refresh Public Discovery to recalculate. Analyst confirmations are audited.")
+            with st.form("confirm_earnings_cycle"):
+                fiscal_year = st.number_input("Fiscal year", min_value=2000, max_value=2100, value=int(anchor.get("fiscal_year") or date.today().year))
+                fiscal_quarter = st.selectbox("Fiscal quarter", ["Q1", "Q2", "Q3", "Q4"], index=max(0, ["Q1", "Q2", "Q3", "Q4"].index(anchor.get("fiscal_quarter")) if anchor.get("fiscal_quarter") in {"Q1", "Q2", "Q3", "Q4"} else 0))
+                period_end = st.date_input("Reporting-period end", value=date.fromisoformat(str(anchor.get("reporting_period_end") or date.today().isoformat())[:10]))
+                release_date = st.date_input("Earnings-release date", value=date.fromisoformat(str(anchor.get("earnings_release_date") or anchor.get("filing_date") or date.today().isoformat())[:10]))
+                reason = st.text_input("Confirmation reason")
+                if st.form_submit_button("Confirm Earnings Cycle", disabled=not reason.strip()):
+                    override_earnings_anchor(
+                        package["package_id"],
+                        {"fiscal_year": fiscal_year, "fiscal_quarter": fiscal_quarter,
+                         "fiscal_period_label": f"{fiscal_quarter} FY{str(fiscal_year)[-2:]}",
+                         "reporting_period_end": period_end.isoformat(), "earnings_release_date": release_date.isoformat(),
+                         "filing_date": anchor.get("filing_date"), "filing_form": anchor.get("filing_form"),
+                         "accession": anchor.get("accession"), "source_url": anchor.get("source_url")},
+                        reason=reason, actor=_actor(),
+                    )
+                    st.rerun()
         else:
             st.info("The latest completed earnings cycle will be determined during public discovery.")
 
 
 def _summary(payload: dict) -> None:
-    summary = payload["summary"]
+    package_id = payload["package"]["package_id"]
+    summary = public_package_summary(package_id)
+    report = latest_preliminary_report(package_id) or {"status": preliminary_report_gate(package_id)["status"]}
     cols = st.columns(6)
-    cols[0].metric("Overall", f"{summary['overall_percent']}%", f"{summary['overall_complete']}/{summary['overall_total']}")
-    cols[1].metric("Required", f"{summary['required_complete']}/{summary['required_total']}")
-    cols[2].metric("Recommended", f"{summary['recommended_complete']}/{summary['recommended_total']}")
-    cols[3].metric("Optional", f"{summary['optional_complete']}/{summary['optional_total']}")
-    cols[4].metric("Manual / Missing", summary["manual_uploads_required"])
-    cols[5].metric("Needs review", summary["needs_review"])
+    cols[0].metric("Public discovery", f"{summary['discovery']['completed']}/{summary['discovery']['planned']}")
+    cols[1].metric("Public package", f"{summary['public_package']['filled']}/{summary['public_package']['total']}")
+    cols[2].metric("Manual / licensed", f"{summary['manual_package']['filled']}/{summary['manual_package']['total']}")
+    cols[3].metric("Downloaded", summary["public_package"]["documents_downloaded"])
+    cols[4].metric("Awaiting review", summary["discovery"]["candidates_requiring_review"])
+    cols[5].metric("Preliminary report", str(report.get("status") or "NOT_READY").replace("_", " "))
     st.markdown(
-        f'<div class="guidance-panel"><strong>Recipe Readiness: {html.escape(summary["readiness"])}</strong><span>{html.escape(payload["guidance"])}</span></div>',
+        f'<div class="guidance-panel"><strong>Public Package Status</strong><span>{summary["public_package"]["required_filled"]} of {summary["public_package"]["required_total"]} required public items filled; {summary["manual_package"]["missing"]} manual or licensed items remain.</span></div>',
         unsafe_allow_html=True,
     )
-    st.caption("Recipe-gated analysis becomes enforceable in Phase 6C. Existing analysis controls remain in Advanced Workbench.")
+    st.caption("Search completion records finished discovery work. A checklist item is complete only after approved documents satisfy its minimum count.")
 
 
 def _brave_status() -> str:
@@ -168,6 +211,8 @@ def _discovery_controls(payload: dict) -> None:
     if actions[0].button("Find All Missing Public Items", type="primary", use_container_width=True):
         st.session_state["assembly_discovery_preview"] = discovery_preview(package_id)
     if actions[1].button("Refresh Public Discovery", use_container_width=True):
+        with st.spinner("Refreshing the authoritative earnings-cycle anchor..."):
+            refresh_earnings_cycle(package_id)
         st.session_state["assembly_discovery_preview"] = discovery_preview(package_id)
     if actions[2].button("Review All Candidates", use_container_width=True):
         st.session_state["assembly_review_all_candidates"] = True
@@ -200,7 +245,7 @@ def _discovery_controls(payload: dict) -> None:
                 st.rerun()
     if latest:
         st.caption(
-            f"{latest.get('slot_count_completed', 0)}/{latest.get('slot_count_requested', 0)} slots complete | "
+            f"Public discovery: {latest.get('slot_count_completed', 0)}/{latest.get('slot_count_requested', 0)} searches completed | "
             f"{latest.get('results_considered', 0)} results considered | "
             f"{latest.get('candidates_created', 0)} candidates | {latest.get('candidates_rejected', 0)} rejected"
         )
@@ -218,14 +263,18 @@ def _candidate_review(package_id: str, slot_id: str, *, expanded: bool = False) 
                 "Title": row["title"], "Source": row["source_route"], "Publication date": row.get("publication_date"),
                 "File type": row.get("mime_type") or row.get("file_extension"), "Relevance": row["slot_relevance_score"],
                 "Authority": row["source_authority_score"], "Freshness": row["freshness_score"],
-                "Status": row["candidate_status"], "Host": row["domain"], "Reason": row.get("rejection_reason") or "",
+                "Status": row["candidate_status"], "Host": row["domain"],
+                "Fallback level": row.get("query_fallback_level") or 0,
+                "Reason": row.get("rejection_reason") or candidate_review_explanation(row.get("review_reason_codes_json")),
             } for row in candidates],
             hide_index=True,
             use_container_width=True,
         )
         labels = {f"{row['title']} | {row['domain']} | {row['candidate_status']}": row for row in candidates}
         selected = labels[st.selectbox("Candidate", list(labels), key=f"candidate_select_{slot_id}")]
-        cols = st.columns(4)
+        reason_text = selected.get("rejection_reason") or candidate_review_explanation(selected.get("review_reason_codes_json"))
+        st.info(reason_text)
+        cols = st.columns(5)
         if cols[0].button("Approve And Download", type="primary", key=f"candidate_approve_{selected['candidate_id']}"):
             try:
                 approve_and_download_candidate(selected["candidate_id"], actor=_actor())
@@ -239,8 +288,39 @@ def _candidate_review(package_id: str, slot_id: str, *, expanded: bool = False) 
         if cols[2].button("Defer", key=f"candidate_defer_{selected['candidate_id']}"):
             decide_candidate(selected["candidate_id"], "DEFER", actor=_actor())
             st.rerun()
+        if cols[3].button("Mark Duplicate", key=f"candidate_duplicate_{selected['candidate_id']}"):
+            decide_candidate(selected["candidate_id"], "MARK_DUPLICATE", actor=_actor(), reason_code="POSSIBLE_DUPLICATE")
+            st.rerun()
         if selected.get("canonical_url"):
-            cols[3].link_button("Open Official Source", selected["canonical_url"])
+            cols[4].link_button("Open Official Source", selected["canonical_url"])
+        with st.expander("Correct or Replace Candidate", expanded=False):
+            correction_reason = st.text_input("Analyst reason", key=f"candidate_reason_{selected['candidate_id']}")
+            current_date = str(selected.get("publication_date") or date.today().isoformat())[:10]
+            corrected_date = st.date_input("Correct publication date", value=date.fromisoformat(current_date), key=f"candidate_date_{selected['candidate_id']}")
+            slots = list_slot_instances(package_id)
+            slot_labels = {f"{_order(row)} - {row['display_name_snapshot']}": row for row in slots}
+            destination = st.selectbox("Change checklist item", list(slot_labels), key=f"candidate_slot_{selected['candidate_id']}")
+            corrections = st.columns(2)
+            if corrections[0].button("Correct Date", disabled=not correction_reason.strip(), key=f"correct_date_{selected['candidate_id']}"):
+                correct_candidate_date(selected["candidate_id"], corrected_date.isoformat(), actor=_actor(), notes=correction_reason)
+                st.rerun()
+            if corrections[1].button("Change Slot", disabled=not correction_reason.strip(), key=f"change_slot_{selected['candidate_id']}"):
+                change_candidate_slot(selected["candidate_id"], slot_labels[destination]["package_slot_instance_id"], actor=_actor(), notes=correction_reason)
+                st.rerun()
+            approved = [
+                row for row in list_assignments(package_id)
+                if row["package_slot_instance_id"] == slot_id and row["assignment_status"] == "APPROVED" and row.get("selected_for_package")
+            ]
+            if approved:
+                replacement_labels = {row.get("document_title") or row["document_id"]: row for row in approved}
+                replaced = st.selectbox("Existing selection to replace", list(replacement_labels), key=f"replace_candidate_{selected['candidate_id']}")
+                if st.button("Replace Existing Selection", disabled=not correction_reason.strip(), key=f"replace_existing_{selected['candidate_id']}"):
+                    approve_and_download_candidate(
+                        selected["candidate_id"], actor=_actor(),
+                        replace_assignment_id=replacement_labels[replaced]["assignment_id"],
+                        replacement_reason=correction_reason,
+                    )
+                    st.rerun()
 
 
 def _order(slot: dict) -> str:
@@ -254,6 +334,7 @@ def _board(payload: dict) -> None:
     cards = []
     current_section = None
     for slot in payload["slots"]:
+        count_rule = effective_document_counts(slot)
         if slot["section_snapshot"] != current_section:
             current_section = slot["section_snapshot"]
             rows.append(f'<tr class="assembly-section-row"><th colspan="9">{html.escape(current_section)}</th></tr>')
@@ -262,8 +343,9 @@ def _board(payload: dict) -> None:
         document_date = "; ".join(str(item.get("document_date") or item.get("publication_date") or "") for item in assignments)
         source = "; ".join(__import__("json").loads(slot["preferred_sources_snapshot_json"] or "[]")) or "Not specified"
         status_class = slot["completion_status"].lower().replace("_", "-")
+        count_label = f"{slot.get('selected_document_count', 0)} selected | min {count_rule['minimum']} | preferred {count_rule['preferred']} | max {count_rule['maximum']}"
         row_values = [
-            _order(slot), slot["display_name_snapshot"], slot["requirement_snapshot"], slot["completion_status"],
+            _order(slot), slot["display_name_snapshot"], f"{slot['requirement_snapshot']} | {count_label}", slot["completion_status"],
             source, document, document_date, slot.get("analyst_notes") or "", "Select below",
         ]
         rows.append("<tr>" + "".join(
@@ -273,19 +355,19 @@ def _board(payload: dict) -> None:
         cards.append(
             f'<article class="assembly-slot-card"><div class="slot-card-top"><strong>{html.escape(_order(slot))} {html.escape(slot["display_name_snapshot"])}</strong>'
             f'<span class="status-cell {status_class}">{html.escape(slot["completion_status"])}</span></div>'
-            f'<div class="slot-card-meta">{html.escape(slot["requirement_snapshot"])} | {html.escape(source)}</div>'
+            f'<div class="slot-card-meta">{html.escape(slot["requirement_snapshot"])} | {html.escape(count_label)} | {html.escape(source)}</div>'
             f'<div>{html.escape(document)}</div><small>Select this item in Slot Actions below.</small></article>'
         )
     rows.append(
         '<tr class="assembly-section-row"><th colspan="9">Final Memo</th></tr>'
-        '<tr><td>-</td><td>Recipe-gated investment memo</td><td>REVIEW_REQUIRED</td>'
-        '<td class="status-cell not-started">NOT_STARTED</td><td>Approved recipe corpus</td>'
-        '<td>Deferred to Phase 6C</td><td></td><td></td><td>Advanced Workbench</td></tr>'
+        '<tr><td>-</td><td>Preliminary one-page investment recommendation</td><td>REVIEW_REQUIRED</td>'
+        '<td class="status-cell needs-analyst-review">ANALYST_REVIEW_REQUIRED</td><td>Approved recipe corpus</td>'
+        '<td>Generated below when evidence requirements are met</td><td></td><td></td><td>Preliminary Recommendation</td></tr>'
     )
     cards.append(
         '<article class="assembly-slot-card"><div class="slot-card-top"><strong>Final Memo</strong>'
         '<span class="status-cell not-started">NOT_STARTED</span></div>'
-        '<div class="slot-card-meta">REVIEW_REQUIRED | Deferred to Phase 6C</div></article>'
+        '<div class="slot-card-meta">REVIEW_REQUIRED | Preliminary generation below</div></article>'
     )
     st.markdown(
         '<div class="assembly-table-wrap"><table class="assembly-table"><thead><tr>'
@@ -309,7 +391,23 @@ def _upload_action(package: dict, slots: list[dict]) -> None:
     signature = tuple((candidate.original_filename, len(candidate.content)) for candidate in candidates)
     if st.session_state.get("assembly_upload_signature") != signature:
         st.session_state["assembly_upload_signature"] = signature
-        st.session_state["assembly_upload_review"] = prepare_batch_review(package, candidates)
+        reviews = prepare_batch_review(package, candidates)
+        for candidate, row in zip(candidates, reviews, strict=False):
+            suggestion = classify_filename(candidate.original_filename, slots)
+            row["Suggested checklist item"] = suggestion.get("suggested_slot_name") or "Analyst selection required"
+            row["Matched tokens"] = ", ".join(suggestion.get("matched_tokens") or [])
+            row["Slot confidence"] = "High" if float(suggestion.get("confidence") or 0) >= 0.9 else "Low"
+            row["Proposed Cutler filename"] = generate_package_display_filename(
+                ticker=package["ticker"],
+                slot_type=suggestion.get("normalized_slot_type") or "other",
+                document={
+                    "original_filename": candidate.original_filename,
+                    "publication_date": suggestion.get("document_date") or row.get("Document date"),
+                    "source_institution": suggestion.get("source") or row.get("Inferred source"),
+                    "title": Path(candidate.original_filename).stem,
+                },
+            )
+        st.session_state["assembly_upload_review"] = reviews
     reviews = st.session_state["assembly_upload_review"]
     visible_columns = [key for key in reviews[0] if not key.startswith("_")]
     edited = st.data_editor(
@@ -322,14 +420,21 @@ def _upload_action(package: dict, slots: list[dict]) -> None:
     edited_rows = edited.to_dict("records") if hasattr(edited, "to_dict") else edited
     merged = [{**reviews[index], **row} for index, row in enumerate(edited_rows)]
     authorized = st.checkbox("I confirm these files are authorized for internal use.", key="assembly_upload_authorized")
+    bulk_accept = st.checkbox("Bulk-accept all high-confidence checklist suggestions.", key="assembly_upload_bulk_accept")
     if st.button("Store And Suggest Slots", type="primary", disabled=not authorized):
         before = {row["document_id"] for row in database.list_documents_by_package(package["package_id"])}
         summary = store_reviewed_upload_batch(package, candidates, merged, authorization_confirmed=True)
         after = database.list_documents_by_package(package["package_id"])
         created = [row["document_id"] for row in after if row["document_id"] not in before]
         suggestions = suggest_document_assignments(package["package_id"], created, actor=_actor())
+        accepted = 0
+        if bulk_accept:
+            for suggestion in suggestions:
+                if suggestion.get("assignment_id") and float(suggestion.get("confidence") or 0) >= 0.9 and not suggestion.get("requires_review"):
+                    update_assignment(suggestion["assignment_id"], "approve", actor=_actor())
+                    accepted += 1
         st.session_state["assembly_suggestions"] = suggestions
-        st.success(f"Stored {summary['uploaded']} file(s); generated {len(suggestions)} deterministic slot suggestion(s).")
+        st.success(f"Stored {summary['uploaded']} file(s); generated {len(suggestions)} deterministic suggestions and bulk-assigned {accepted}.")
         st.rerun()
 
 
@@ -446,6 +551,86 @@ def _slot_actions(payload: dict) -> None:
             st.info("Approve an assignment before opening or downloading it here.")
 
 
+def _package_contents(payload: dict) -> None:
+    st.subheader("Package Contents")
+    st.caption("Working-package files only. Search history, rejected candidates, hashes, and technical diagnostics remain in Audit Details.")
+    contents = package_contents(payload["package"]["package_id"])
+    if not contents:
+        st.info("No approved downloaded documents are in the working package yet.")
+        return
+    st.dataframe(
+        [{
+            "Display Filename": row["display_filename"], "Checklist Item": row["checklist_item"],
+            "Source": row["source"], "Document Date": row["document_date"], "File Type": row["file_type"],
+            "Status": row["status"], "Size": row["size"], "Highlighted": row["highlighted"],
+        } for row in contents],
+        hide_index=True,
+        use_container_width=True,
+    )
+    cards = "".join(
+        f'<article class="assembly-slot-card"><div class="slot-card-top"><strong>{html.escape(row["display_filename"])}</strong>'
+        f'<span class="status-cell complete">INCLUDED</span></div><div class="slot-card-meta">'
+        f'{html.escape(row["checklist_item"])} | {html.escape(row["source"])}</div></article>'
+        for row in contents
+    )
+    st.markdown(f'<div class="package-contents-mobile">{cards}</div>', unsafe_allow_html=True)
+    selected = st.selectbox("Working-package file", [row["display_filename"] for row in contents], key="working_package_file")
+    row = next(item for item in contents if item["display_filename"] == selected)
+    actions = st.columns(2)
+    path = Path(row.get("local_path") or "")
+    if path.is_file():
+        actions[0].download_button(
+            "Download File", data=path.read_bytes(), file_name=row["display_filename"],
+            mime="application/octet-stream", use_container_width=True,
+        )
+    if row.get("source_url"):
+        actions[1].link_button("Open Official Source", row["source_url"], use_container_width=True)
+
+
+def _preliminary_recommendation(payload: dict) -> None:
+    package_id = payload["package"]["package_id"]
+    st.subheader("Preliminary Recommendation")
+    gate = preliminary_report_gate(package_id)
+    latest = latest_preliminary_report(package_id)
+    status = (latest or {}).get("status") or gate["status"]
+    st.caption(f"Status: {status.replace('_', ' ')}. This is not the final Phase 6C recipe-gated decision.")
+    if gate["errors"]:
+        st.info(" ".join(gate["errors"]))
+    actions = st.columns(2)
+    generate = actions[0].button(
+        "Generate Preliminary One-Page Recommendation",
+        type="primary",
+        disabled=not gate["ready"],
+        use_container_width=True,
+    )
+    retry = actions[1].button(
+        "Retry Recommendation Generation",
+        disabled=not bool(latest and latest.get("status") == "FAILED" and gate["ready"]),
+        use_container_width=True,
+    )
+    if generate or retry:
+        with st.spinner("Running the selected-package evidence and memo-quality workflow..."):
+            generate_preliminary_recommendation(package_id, actor=_actor(), retry=retry)
+        st.rerun()
+    if latest:
+        cols = st.columns(4)
+        cols[0].metric("Recommendation", str(latest.get("recommendation") or "Not generated").replace("_", " "))
+        cols[1].metric("Confidence", latest.get("confidence") or "Not available")
+        quality = __import__("json").loads(latest.get("quality_result_json") or "{}")
+        cols[2].metric("Memo QA", quality.get("status") or "Not run")
+        cols[3].metric("Selected documents", len(__import__("json").loads(latest.get("selected_document_ids_json") or "[]")))
+        generated = preliminary_report_files(latest)
+        downloads = st.columns(2)
+        pdf = Path(generated.get("pdf_path") or "")
+        docx = Path(generated.get("docx_path") or "")
+        if pdf.is_file():
+            downloads[0].download_button("Download PDF", data=pdf.read_bytes(), file_name=pdf.name, mime="application/pdf", use_container_width=True)
+        if docx.is_file():
+            downloads[1].download_button("Download DOCX", data=docx.read_bytes(), file_name=docx.name, mime="application/vnd.openxmlformats-officedocument.wordprocessingml.document", use_container_width=True)
+        if latest.get("safe_error_message"):
+            st.warning(latest["safe_error_message"])
+
+
 def _exports(payload: dict) -> None:
     cols = st.columns(2)
     signature = tuple(
@@ -486,6 +671,8 @@ def main() -> None:
     _discovery_controls(payload)
     _board(payload)
     _slot_actions(payload)
+    _package_contents(payload)
+    _preliminary_recommendation(payload)
     if payload["highlighted"]:
         st.subheader("Highlighted Research")
         st.dataframe([{"Order": next((f"{slot['order_number']}" for slot in payload["slots"] if slot["package_slot_instance_id"] == item["package_slot_instance_id"]), ""), "Document": item.get("document_title") or item["document_id"], "Source": item.get("source_name") or ""} for item in payload["highlighted"]], hide_index=True, use_container_width=True)

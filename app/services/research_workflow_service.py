@@ -430,6 +430,7 @@ def run_research_workflow(
     idempotency_key: str | None = None,
     retry_failed: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
+    preliminary_package_view: bool = False,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     """Build, lock, process, analyze, and draft-report the active package."""
@@ -485,7 +486,11 @@ def run_research_workflow(
     errors: list[str] = []
 
     try:
-        readiness = validate_package_readiness(package, db_path=db_path)
+        readiness = (
+            validate_package_readiness(package, preliminary=True, db_path=db_path)
+            if preliminary_package_view
+            else validate_package_readiness(package, db_path=db_path)
+        )
         if readiness.errors:
             _mark_stage(stage_statuses, "Building package", "Failed")
             return database.update_research_workflow_run(
@@ -515,7 +520,14 @@ def run_research_workflow(
             version = None
         if not version:
             _persist_stage(workflow_id, stage_statuses, "Building package", "Running", db_path=db_path)
-            version = build_package_version(package, notes="Phase 7 workflow build", db_path=db_path)
+            version = (
+                build_package_version(
+                    package, notes="Phase 6B.1 preliminary package build",
+                    preliminary=True, db_path=db_path,
+                )
+                if preliminary_package_view
+                else build_package_version(package, notes="Phase 7 workflow build", db_path=db_path)
+            )
             workflow = database.update_research_workflow_run(
                 workflow_id,
                 {"version_id": version["version_id"]},
@@ -695,6 +707,27 @@ def run_research_workflow(
         _mark_stage(stage_statuses, "Calculating metrics", TIMELINE_WARNINGS if analysis_has_warnings else TIMELINE_COMPLETED)
         _mark_stage(stage_statuses, "Generating recommendation", "Completed")
 
+        if preliminary_package_view:
+            from app.services.package_assembly_service import public_package_summary
+
+            package_status = public_package_summary(package_id, db_path=db_path)
+            selected_count = len(included_documents(package_id, db_path=db_path))
+            if (
+                package_status["public_package"]["missing"] > 0
+                or selected_count < 3
+                or analysis_run.get("reference_price") is None
+            ):
+                database.update_recommendation_decision(
+                    analysis_run["analysis_run_id"],
+                    {"effective_rating": "ANALYST_REVIEW_REQUIRED"},
+                    db_path=db_path,
+                )
+                analysis_run = database.update_analysis_run(
+                    analysis_run["analysis_run_id"],
+                    {"preliminary_recommendation": "ANALYST_REVIEW_REQUIRED"},
+                    db_path=db_path,
+                ) or analysis_run
+
         report = _existing_report(workflow, analysis_run, db_path=db_path)
         report_reused = bool(report)
         memo_generation_failed = False
@@ -702,7 +735,14 @@ def run_research_workflow(
         if not report:
             _persist_stage(workflow_id, stage_statuses, "Creating report", "Running", db_path=db_path)
             try:
-                report = generate_investment_report(analysis_run["analysis_run_id"], final=False, db_path=db_path)
+                report = (
+                    generate_investment_report(
+                        analysis_run["analysis_run_id"], final=False,
+                        preliminary_package_view=True, db_path=db_path,
+                    )
+                    if preliminary_package_view
+                    else generate_investment_report(analysis_run["analysis_run_id"], final=False, db_path=db_path)
+                )
             except MemoGenerationError:
                 memo_generation_failed = True
                 report = None

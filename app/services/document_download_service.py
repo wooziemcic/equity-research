@@ -39,7 +39,7 @@ def _managed_document_path(document: dict, package_id: str) -> Path:
 
 
 def _document_filename(document: dict, path: Path) -> str:
-    candidate = document.get("original_filename") or document.get("local_filename") or path.name
+    candidate = document.get("package_display_filename") or document.get("original_filename") or document.get("local_filename") or path.name
     return sanitize_filename(Path(str(candidate)).name)
 
 

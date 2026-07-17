@@ -55,7 +55,10 @@ def validate_candidate_metadata(
         return CandidateValidation(False, "FAILED", "UNSAFE_URL", "The candidate URL is unsafe or malformed.")
     parsed = urlparse(canonical)
     domain = (parsed.hostname or "").lower().removeprefix("www.")
-    exclusion_text = f"{title} {description} {parsed.path}".lower().replace("_", " ").replace("-", " ")
+    # Legal legends in legitimate investor materials often mention registration
+    # statements and forms. Hard exclusions therefore use the title and URL path,
+    # where an account application or brochure identifies itself directly.
+    exclusion_text = f"{title} {parsed.path}".lower().replace("_", " ").replace("-", " ")
     hard_exclusions = (
         "new account", "account application", "credit application", "customer form", "vendor form",
         "supplier form", "w 9", "banking instructions", "employment application", "careers",
@@ -141,13 +144,17 @@ def fetch_and_validate_candidate(
     *,
     session: requests.Session | None = None,
     max_bytes: int = config.MAX_DOWNLOAD_BYTES,
+    headers: dict[str, str] | None = None,
 ) -> CandidateValidation:
     initial = validate_public_http_url(url)
     if not initial.is_valid:
         return CandidateValidation(False, "FAILED", "UNSAFE_URL", initial.error)
     client = session or requests.Session()
     try:
-        response = client.get(url, timeout=config.HTTP_TIMEOUT_SECONDS, allow_redirects=True, stream=False)
+        response = client.get(
+            url, timeout=config.HTTP_TIMEOUT_SECONDS, allow_redirects=True, stream=False,
+            headers=headers or None,
+        )
     except requests.Timeout:
         return CandidateValidation(False, "FAILED", "TIMEOUT", "The source request timed out.")
     except requests.RequestException:
