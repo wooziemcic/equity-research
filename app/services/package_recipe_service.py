@@ -602,6 +602,9 @@ def assign_document(
            package_id=slot["package_id"], slot_instance_id=slot_instance_id, document_id=document_id,
            details={"assignment_id": assignment_id, "confidence": suggestion.get("confidence"), "override_cap": override_cap, "override_reason": override_reason}, db_path=db_path)
     recalculate_completion(slot["package_id"], actor=actor, db_path=db_path)
+    from app.services.package_artifact_service import sync_package_artifacts
+
+    sync_package_artifacts(slot["package_id"], db_path=db_path)
     return dict(result)
 
 
@@ -634,6 +637,9 @@ def update_assignment(assignment_id: str, action: str, *, actor: str, notes: str
            package_id=row["package_id"], slot_instance_id=row["package_slot_instance_id"], document_id=row["document_id"],
            details={"assignment_id": assignment_id, "action": action}, db_path=db_path)
     recalculate_completion(row["package_id"], actor=actor, db_path=db_path)
+    from app.services.package_artifact_service import sync_package_artifacts
+
+    sync_package_artifacts(row["package_id"], db_path=db_path)
     return dict(refreshed)
 
 
@@ -684,6 +690,9 @@ def replace_assignment(
     _audit("ASSIGNMENT_REPLACED", actor=actor, package_id=old["package_id"], slot_instance_id=old["package_slot_instance_id"],
            document_id=replacement_document_id, details={"replaced_assignment_id": assignment_id, "reason": reason}, db_path=db_path)
     recalculate_completion(old["package_id"], actor=actor, db_path=db_path)
+    from app.services.package_artifact_service import sync_package_artifacts
+
+    sync_package_artifacts(old["package_id"], db_path=db_path)
     return dict(replacement)
 
 

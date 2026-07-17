@@ -7,7 +7,7 @@ import secrets
 from dataclasses import dataclass, field
 from datetime import date
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Literal
 
 from pydantic import BaseModel, Field
 
@@ -85,6 +85,11 @@ class InvestmentMemoDraft(BaseModel):
     risks: list[MemoDraftItem] = Field(default_factory=list)
     missing_information: list[str] = Field(default_factory=list)
     conclusion: str
+
+
+class MemoSentenceRepair(BaseModel):
+    action: Literal["REWRITE", "REMOVE"]
+    rewritten_sentence: str = ""
 
 
 @dataclass
@@ -226,6 +231,136 @@ def select_memo_candidates(
     return selected_supporting[:5], selected_risks[:4]
 
 
+def _draft_failure(
+    draft: InvestmentMemoDraft,
+    supporting: list[MemoEvidenceCandidate],
+    risks: list[MemoEvidenceCandidate],
+) -> dict[str, Any]:
+    selected_quotes = " ".join(item.supporting_quote for item in [*supporting, *risks])
+    for field in ("investment_view", "conclusion"):
+        sentence = str(getattr(draft, field) or "")
+        if not _numeric_tokens(sentence) <= _numeric_tokens(selected_quotes):
+            return {"location": field, "index": None, "sentence": sentence, "reason": "Unsupported numeric content.", "candidate": None}
+    for location, rows, candidates in (
+        ("supporting_facts", draft.supporting_facts, supporting),
+        ("risks", draft.risks, risks),
+    ):
+        candidate_map = {item.candidate_id: item for item in candidates}
+        for index, row in enumerate(rows):
+            candidate = candidate_map.get(row.candidate_id)
+            if not candidate:
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Unknown evidence candidate.", "candidate": None}
+            if not _claim_numbers_supported(row.concise_claim, candidate):
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Unsupported numeric content.", "candidate": candidate}
+            if not _claim_semantically_supported(row.concise_claim, candidate.supporting_quote):
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Unsupported factual interpretation.", "candidate": candidate}
+            if candidate.reporting_period and not _period_supported(row.concise_claim, candidate):
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Missing or unsupported reporting period.", "candidate": candidate}
+            if candidate.unit and not _unit_supported(row.concise_claim, candidate):
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Missing or unsupported unit.", "candidate": candidate}
+            if candidate.currency and not _currency_supported(row.concise_claim, candidate):
+                return {"location": location, "index": index, "sentence": row.concise_claim, "reason": "Missing or unsupported currency.", "candidate": candidate}
+    return {"location": "investment_view", "index": None, "sentence": draft.investment_view, "reason": "Memo validation failed.", "candidate": None}
+
+
+def _apply_sentence_repair(
+    draft: InvestmentMemoDraft,
+    failure: dict[str, Any],
+    repair: MemoSentenceRepair,
+) -> InvestmentMemoDraft:
+    payload = draft.model_dump()
+    replacement = _clean_text(repair.rewritten_sentence)
+    location = failure["location"]
+    index = failure["index"]
+    if location in {"investment_view", "conclusion"}:
+        if repair.action == "REMOVE":
+            sentences = [item for item in re.split(r"(?<=[.!?])\s+", str(payload[location])) if item != failure["sentence"]]
+            payload[location] = " ".join(sentences).strip()
+        else:
+            payload[location] = replacement
+    else:
+        rows = list(payload[location])
+        if repair.action == "REMOVE":
+            rows.pop(int(index))
+        else:
+            rows[int(index)]["concise_claim"] = replacement
+        payload[location] = rows
+    return InvestmentMemoDraft.model_validate(payload)
+
+
+def _remove_unsupported_numeric_sentences(
+    draft: InvestmentMemoDraft,
+    supporting: list[MemoEvidenceCandidate],
+    risks: list[MemoEvidenceCandidate],
+) -> InvestmentMemoDraft:
+    payload = draft.model_dump()
+    selected_quotes = " ".join(item.supporting_quote for item in [*supporting, *risks])
+    allowed_numbers = _numeric_tokens(selected_quotes)
+    for field in ("investment_view", "conclusion"):
+        sentences = re.split(r"(?<=[.!?])\s+", str(payload[field] or ""))
+        payload[field] = " ".join(sentence for sentence in sentences if _numeric_tokens(sentence) <= allowed_numbers).strip()
+    for field, candidates in (("supporting_facts", supporting), ("risks", risks)):
+        candidate_map = {item.candidate_id: item for item in candidates}
+        payload[field] = [
+            row for row in payload[field]
+            if row["candidate_id"] in candidate_map
+            and _claim_numbers_supported(row["concise_claim"], candidate_map[row["candidate_id"]])
+            and _claim_semantically_supported(row["concise_claim"], candidate_map[row["candidate_id"]].supporting_quote)
+        ]
+    if not payload["investment_view"] or not payload["conclusion"]:
+        raise MemoGenerationError("Removing unsupported content would leave an insufficient preliminary memo.")
+    return InvestmentMemoDraft.model_validate(payload)
+
+
+def _remove_failed_content(
+    draft: InvestmentMemoDraft,
+    failure: dict[str, Any],
+    supporting: list[MemoEvidenceCandidate],
+    risks: list[MemoEvidenceCandidate],
+) -> InvestmentMemoDraft:
+    payload = draft.model_dump()
+    location = str(failure["location"])
+    index = failure.get("index")
+    if location in {"supporting_facts", "risks"} and index is not None:
+        rows = list(payload[location])
+        if 0 <= int(index) < len(rows):
+            rows.pop(int(index))
+        payload[location] = rows
+    elif location in {"investment_view", "conclusion"}:
+        failed = str(failure.get("sentence") or "")
+        sentences = re.split(r"(?<=[.!?])\s+", str(payload[location] or ""))
+        payload[location] = " ".join(sentence for sentence in sentences if sentence != failed).strip()
+    stripped = InvestmentMemoDraft.model_validate(payload)
+    return _remove_unsupported_numeric_sentences(stripped, supporting, risks)
+
+
+def _record_repair(
+    analysis_run_id: str,
+    attempt_id: str,
+    failure: dict[str, Any],
+    *,
+    action: str,
+    repaired_sentence: str,
+    qa_result: str,
+    repair_number: int,
+    db_path: Path | str,
+) -> None:
+    candidate = failure.get("candidate")
+    with database.get_connection(db_path) as connection:
+        connection.execute(
+            """INSERT INTO report_repair_audits(
+               repair_audit_id, preliminary_report_id, analysis_run_id, memo_attempt_id,
+               repair_number, failed_sentence, failure_reason, action, repaired_sentence,
+               supporting_evidence_ids_json, qa_result, created_at
+               ) VALUES (?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+            (f"RPA-{secrets.token_hex(8).upper()}", analysis_run_id, attempt_id, repair_number,
+             str(failure["sentence"])[:1000], str(failure["reason"])[:500], action,
+             repaired_sentence[:1000] or None,
+             json.dumps([candidate.evidence_id] if candidate else []), qa_result,
+             database.utc_now_iso()),
+        )
+
+
 def synthesize_memo(
     analysis_run_id: str,
     *,
@@ -304,7 +439,73 @@ def synthesize_memo(
             {"endpoint": endpoint, "draft_json": draft.model_dump_json()},
             db_path=db_path,
         )
-        memo = _validated_memo(draft, selected_supporting, selected_risks, context, run, analysis_run_id, db_path=db_path)
+        try:
+            memo = _validated_memo(
+                draft, selected_supporting, selected_risks, context, run, analysis_run_id, db_path=db_path,
+            )
+        except MemoGenerationError as validation_error:
+            if not config.MEMO_SYNTHESIS_REQUIRED:
+                raise
+            failure = _draft_failure(draft, selected_supporting, selected_risks)
+            support = failure.get("candidate")
+            approved_support = [support.model_payload() | {"exact_excerpt": support.supporting_quote}] if support else [
+                item.model_payload() | {"exact_excerpt": item.supporting_quote}
+                for item in [*selected_supporting, *selected_risks]
+            ]
+            repair_result = structured_parse(
+                system_prompt=(
+                    "Repair only the supplied failed sentence. Use only the approved supporting evidence. "
+                    "Choose REMOVE or rewrite the sentence without inventing replacement numbers, facts, citations, or identifiers."
+                ),
+                user_payload={
+                    "failed_sentence": failure["sentence"],
+                    "failure_reason": str(validation_error),
+                    "approved_supporting_evidence": approved_support,
+                    "instruction": "Remove or rewrite unsupported content; do not invent a replacement number.",
+                },
+                schema=MemoSentenceRepair,
+                client=client,
+                max_output_tokens=min(config.MEMO_MAX_OUTPUT_TOKENS, 500),
+                pipeline_stage="investment_memo_bounded_repair",
+                usage_context={
+                    "analysis_run_id": analysis_run_id,
+                    "processing_run_id": run["processing_run_id"],
+                    "attempt_id": attempt_id,
+                },
+                db_path=str(db_path),
+            )
+            repaired_draft = _apply_sentence_repair(draft, failure, repair_result.parsed)
+            try:
+                memo = _validated_memo(
+                    repaired_draft, selected_supporting, selected_risks, context, run,
+                    analysis_run_id, db_path=db_path,
+                )
+                _record_repair(
+                    analysis_run_id, attempt_id, failure, action=repair_result.parsed.action,
+                    repaired_sentence=repair_result.parsed.rewritten_sentence,
+                    qa_result="REPAIRED", repair_number=1, db_path=db_path,
+                )
+            except MemoGenerationError:
+                try:
+                    stripped_draft = _remove_failed_content(
+                        repaired_draft, failure, selected_supporting, selected_risks,
+                    )
+                    memo = _validated_memo(
+                        stripped_draft, selected_supporting, selected_risks, context, run,
+                        analysis_run_id, db_path=db_path,
+                    )
+                except MemoGenerationError:
+                    _record_repair(
+                        analysis_run_id, attempt_id, failure, action="DETERMINISTIC_REMOVE",
+                        repaired_sentence="", qa_result="FAILED_REVALIDATION",
+                        repair_number=1, db_path=db_path,
+                    )
+                    raise
+                _record_repair(
+                    analysis_run_id, attempt_id, failure, action="DETERMINISTIC_REMOVE",
+                    repaired_sentence="", qa_result="REMOVED_AND_REVALIDATED",
+                    repair_number=1, db_path=db_path,
+                )
         database.update_memo_generation_attempt(
             attempt_id,
             {
@@ -596,6 +797,15 @@ def _validate_draft_items(
             raise MemoGenerationError(f"A {label} claim introduced an unsupported number.")
         if not _claim_semantically_supported(claim, candidate.supporting_quote):
             raise MemoGenerationError(f"A {label} claim introduced an unsupported interpretation.")
+        period_ok = not candidate.reporting_period or _period_supported(claim, candidate)
+        unit_ok = not candidate.unit or _unit_supported(claim, candidate)
+        currency_ok = not candidate.currency or _currency_supported(claim, candidate)
+        if not period_ok:
+            raise MemoGenerationError(f"A {label} claim omitted or changed its reporting period.")
+        if not unit_ok:
+            raise MemoGenerationError(f"A {label} claim omitted or changed its unit.")
+        if not currency_ok:
+            raise MemoGenerationError(f"A {label} claim omitted or changed its currency.")
         seen.add(row.candidate_id)
         output.append(
             {
@@ -604,9 +814,9 @@ def _validate_draft_items(
                 "claim": claim,
                 "citation": candidate.citation,
                 "numeric_validation": numeric_ok,
-                "period_validation": not candidate.reporting_period or _period_supported(claim, candidate),
-                "unit_validation": not candidate.unit or _unit_supported(claim, candidate),
-                "currency_validation": not candidate.currency or _currency_supported(claim, candidate),
+                "period_validation": period_ok,
+                "unit_validation": unit_ok,
+                "currency_validation": currency_ok,
             }
         )
     return output

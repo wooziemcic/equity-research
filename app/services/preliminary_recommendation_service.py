@@ -7,7 +7,9 @@ from pathlib import Path
 from typing import Any
 
 from app import config
+from app.services.analysis_snapshot_service import create_analysis_snapshot, get_analysis_snapshot
 from app.services.package_assembly_service import package_snapshot, public_package_summary, selected_document_ids
+from app.services.package_artifact_service import register_preliminary_report_artifact
 from app.services.package_recipe_service import list_assignments, list_slot_instances
 from app.services.research_workflow_service import run_research_workflow
 from app.utils import database
@@ -68,12 +70,13 @@ def generate_preliminary_recommendation(
     *,
     actor: str,
     retry: bool = False,
+    refresh_snapshot: bool = False,
+    analysis_snapshot_id: str | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     gate = preliminary_report_gate(package_id, db_path=db_path)
     if not gate["ready"]:
         raise ValueError("Preliminary recommendation is not ready: " + " ".join(gate["errors"]))
-    snapshot = package_snapshot(package_id, db_path=db_path)
     previous_report = latest_preliminary_report(package_id, db_path=db_path)
     if retry and (not previous_report or not previous_report.get("analysis_run_id")):
         with database.get_connection(db_path) as connection:
@@ -84,6 +87,18 @@ def generate_preliminary_recommendation(
                 (package_id,),
             ).fetchone()
         previous_report = dict(row) if row else previous_report
+    analysis_snapshot = None
+    if analysis_snapshot_id:
+        analysis_snapshot = get_analysis_snapshot(analysis_snapshot_id, db_path=db_path)
+        if not analysis_snapshot or analysis_snapshot.get("package_id") != package_id:
+            raise ValueError("The selected analysis snapshot does not belong to this package.")
+    if retry and not refresh_snapshot and previous_report and previous_report.get("analysis_snapshot_id"):
+        analysis_snapshot = get_analysis_snapshot(previous_report["analysis_snapshot_id"], db_path=db_path)
+    if not analysis_snapshot:
+        analysis_snapshot = create_analysis_snapshot(package_id, db_path=db_path)
+    snapshot = package_snapshot(package_id, db_path=db_path)
+    snapshot["analysis_snapshot_id"] = analysis_snapshot["snapshot_id"]
+    snapshot["analysis_snapshot_hash"] = analysis_snapshot["snapshot_hash"]
     fingerprint = hashlib.sha256(json.dumps(snapshot, sort_keys=True, default=str).encode()).hexdigest()
     report_id = f"PRPT-{secrets.token_hex(8).upper()}"
     now = database.utc_now_iso()
@@ -103,13 +118,13 @@ def generate_preliminary_recommendation(
             """INSERT INTO preliminary_package_reports(
                 preliminary_report_id, package_id, status, package_snapshot_json,
                 selected_document_ids_json, workflow_run_id, analysis_run_id,
-                requested_by, requested_at, created_at, updated_at
-            ) VALUES (?, ?, 'PRELIMINARY_READY', ?, ?, ?, ?, ?, ?, ?, ?)""",
+                requested_by, requested_at, created_at, updated_at, analysis_snapshot_id
+            ) VALUES (?, ?, 'PRELIMINARY_READY', ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (report_id, package_id, json.dumps(snapshot, sort_keys=True, default=str),
              json.dumps(gate["selected_document_ids"]),
              (previous_report or {}).get("workflow_run_id") if retry else None,
              (previous_report or {}).get("analysis_run_id") if retry else None,
-             actor, now, now, now),
+             actor, now, now, now, analysis_snapshot["snapshot_id"]),
         )
     try:
         if retry and previous_report and previous_report.get("analysis_run_id"):
@@ -130,6 +145,7 @@ def generate_preliminary_recommendation(
                 idempotency_key=f"PHASE6B1-PRELIM-{fingerprint}",
                 retry_failed=retry,
                 preliminary_package_view=True,
+                analysis_snapshot_id=analysis_snapshot["snapshot_id"],
                 db_path=db_path,
             )
             generated = next(
@@ -139,6 +155,11 @@ def generate_preliminary_recommendation(
             ) if workflow.get("analysis_run_id") else None
         decision = database.get_recommendation_decision(workflow.get("analysis_run_id"), db_path=db_path) if workflow.get("analysis_run_id") else None
         quality = database.latest_memo_quality_audit(workflow.get("analysis_run_id"), db_path=db_path) if workflow.get("analysis_run_id") else None
+        with database.get_connection(db_path) as connection:
+            repairs = [dict(row) for row in connection.execute(
+                "SELECT * FROM report_repair_audits WHERE analysis_run_id=? ORDER BY repair_number",
+                (workflow.get("analysis_run_id"),),
+            ).fetchall()] if workflow.get("analysis_run_id") else []
         status = "PRELIMINARY_GENERATED" if generated else "FAILED"
         recommendation = str((decision or {}).get("effective_rating") or "ANALYST_REVIEW_REQUIRED").upper()
         if gate["package_incomplete"]:
@@ -147,12 +168,15 @@ def generate_preliminary_recommendation(
             connection.execute(
                 """UPDATE preliminary_package_reports SET status=?, workflow_run_id=?, analysis_run_id=?,
                    generated_report_id=?, recommendation=?, confidence=?, quality_result_json=?,
-                   safe_error_message=?, completed_at=?, updated_at=? WHERE preliminary_report_id=?""",
+                   repair_result_json=?, safe_error_message=?, completed_at=?, updated_at=? WHERE preliminary_report_id=?""",
                 (status, workflow.get("workflow_run_id"), workflow.get("analysis_run_id"), workflow.get("report_id"),
                  recommendation, (decision or {}).get("confidence"), json.dumps(quality or {}, sort_keys=True),
+                 json.dumps(repairs, sort_keys=True),
                  None if generated else "The existing analysis workflow did not produce a releasable one-page memo.",
                  database.utc_now_iso(), database.utc_now_iso(), report_id),
             )
+        if generated:
+            register_preliminary_report_artifact(package_id, generated, db_path=db_path)
     except Exception as exc:
         with database.get_connection(db_path) as connection:
             connection.execute(

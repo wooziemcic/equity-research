@@ -188,7 +188,7 @@ def test_migration_is_additive_idempotent_and_test_database_isolated(tmp_path: P
     after = database.get_package_by_package_id(legacy["package_id"], db_path=db_path)
     assert before == after
     details = database_audit_details(db_path=db_path)
-    assert details == {"environment": "TEST", "storage": "Temporary", "package_count": 1, "most_recent_package_id": legacy["package_id"], "schema_version": "6B.1"}
+    assert details == {"environment": "TEST", "storage": "Temporary", "package_count": 1, "most_recent_package_id": legacy["package_id"], "schema_version": "6B.2"}
     assert runtime_state == (runtime_path.exists(), runtime_path.stat().st_mtime_ns if runtime_path.exists() else None)
 
 

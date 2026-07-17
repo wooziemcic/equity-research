@@ -10,9 +10,10 @@ from dataclasses import asdict, dataclass
 from datetime import UTC, date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Iterable
-from urllib.parse import urlparse
+from urllib.parse import urljoin, urlparse
 
 import requests
+from bs4 import BeautifulSoup
 
 from app import config
 from app.services.candidate_validation_service import (
@@ -162,7 +163,10 @@ def list_active_search_profiles(*, db_path: Path | str = config.DATABASE_PATH) -
 
 
 class RecipePlannerAgent:
-    def plan(self, package_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> list[SlotDiscoveryPlan]:
+    def plan(
+        self, package_id: str, *, include_satisfied: bool = False,
+        db_path: Path | str = config.DATABASE_PATH,
+    ) -> list[SlotDiscoveryPlan]:
         package = database.get_package_by_package_id(package_id, db_path=db_path)
         if not package:
             raise ValueError("Research package does not exist.")
@@ -178,7 +182,7 @@ class RecipePlannerAgent:
             complete = slot["completion_status"] == "COMPLETE" or selected_counts.get(slot["package_slot_instance_id"], 0) >= slot["maximum_documents"]
             applicable = slot["applicability_status"] not in {"NOT_APPLICABLE"}
             acknowledged_unavailable = bool(slot["analyst_acknowledged"] and slot["completion_status"] == "NOT_AVAILABLE")
-            searchable = bool(profile and applicable and not complete and not acknowledged_unavailable)
+            searchable = bool(profile and applicable and (include_satisfied or not complete) and not acknowledged_unavailable)
             if not applicable:
                 reason = "Slot is not applicable."
             elif complete:
@@ -373,6 +377,12 @@ def discovery_preview(package_id: str, *, db_path: Path | str = config.DATABASE_
 def select_curated_sec_filings(filings: Iterable[FilingCandidate | dict[str, Any]], *, research_cutoff: str) -> dict[str, list[dict[str, Any]]]:
     rows = [dict(item.__dict__) if hasattr(item, "__dict__") else dict(item) for item in filings]
     rows = [row for row in rows if str(row.get("filing_date") or "") <= research_cutoff and not str(row.get("form_type") or "").upper().endswith("/A")]
+    deduplicated: dict[str, dict[str, Any]] = {}
+    for row in rows:
+        accession = str(row.get("accession_number") or "")
+        key = accession or str(row.get("primary_document_url") or "")
+        deduplicated.setdefault(key, row)
+    rows = list(deduplicated.values())
     def latest(forms: set[str]) -> dict[str, Any] | None:
         eligible = [row for row in rows if str(row.get("form_type") or "").upper() in forms]
         return max(eligible, key=lambda row: (str(row.get("report_period") or ""), str(row.get("filing_date") or ""))) if eligible else None
@@ -386,6 +396,50 @@ def select_curated_sec_filings(filings: Iterable[FilingCandidate | dict[str, Any
         "executive_compensation_information": [row for row in (proxy,) if row],
         "latest_earnings_release": [row for row in (earnings,) if row],
     }
+
+
+def discover_earnings_exhibit_99_1(
+    filing: FilingCandidate | dict[str, Any],
+    *,
+    session: requests.Session | None = None,
+) -> list[dict[str, Any]]:
+    """Inspect one authoritative earnings 8-K index for a bounded Exhibit 99.1."""
+    row = dict(filing.__dict__) if hasattr(filing, "__dict__") else dict(filing)
+    if str(row.get("form_type") or "").upper() != "8-K" or "2.02" not in str(row.get("filing_items") or ""):
+        return []
+    index_url = str(row.get("filing_index_url") or "")
+    if not index_url or not (urlparse(index_url).hostname or "").lower().endswith("sec.gov"):
+        return []
+    client = session or requests.Session()
+    response = client.get(index_url, headers=sec_headers(), timeout=config.HTTP_TIMEOUT_SECONDS)
+    response.raise_for_status()
+    soup = BeautifulSoup(response.content[: config.MAX_DOWNLOAD_BYTES], "html.parser")
+    matches: list[dict[str, Any]] = []
+    for table_row in soup.find_all("tr"):
+        text = " ".join(table_row.stripped_strings)
+        normalized = text.casefold()
+        if not (re.search(r"\bex-?99\.1\b", normalized) or ("99.1" in normalized and "earnings" in normalized)):
+            continue
+        link = table_row.find("a", href=True)
+        if not link:
+            continue
+        url = urljoin(index_url, str(link["href"]))
+        if not (urlparse(url).hostname or "").lower().endswith("sec.gov"):
+            continue
+        matches.append({
+            "accession_number": f"{row.get('accession_number')}:EX-99.1",
+            "parent_accession_number": row.get("accession_number"),
+            "form_type": "EX-99.1",
+            "filing_date": row.get("filing_date"),
+            "report_period": row.get("report_period"),
+            "primary_document_url": url,
+            "filing_index_url": index_url,
+            "title": "Earnings Release Exhibit 99.1",
+            "filing_items": "2.02",
+            "selection_reason": "Validated Exhibit 99.1 listed in the authoritative earnings-related 8-K index.",
+        })
+        break
+    return matches
 
 
 def _store_router_decision(run_id: str, package_id: str, plan: SlotDiscoveryPlan, route: SourceRouteDecision, *, db_path: Path | str) -> None:
@@ -723,6 +777,46 @@ def get_earnings_anchor(package_id: str, *, db_path: Path | str = config.DATABAS
     return dict(row) if row else None
 
 
+def backfill_earnings_release_date(
+    package_id: str,
+    *,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any] | None:
+    """Fill a missing release date from the current approved earnings-release document."""
+    anchor = get_earnings_anchor(package_id, db_path=db_path)
+    if not anchor or anchor.get("earnings_release_date") or anchor.get("analyst_override"):
+        return anchor
+    with database.get_connection(db_path) as connection:
+        source = connection.execute(
+            """SELECT d.publication_date, d.document_date
+               FROM slot_document_assignments sda
+               JOIN package_slot_instances psi
+                 ON psi.package_slot_instance_id=sda.package_slot_instance_id
+               JOIN research_slots rs ON rs.slot_id=psi.slot_id
+               JOIN documents d ON d.document_id=sda.document_id
+               WHERE sda.package_id=?
+                 AND rs.normalized_slot_type='latest_earnings_release'
+                 AND sda.assignment_status='APPROVED'
+                 AND sda.selected_for_package=1
+                 AND d.collection_status=?
+               ORDER BY COALESCE(d.publication_date, d.document_date) DESC LIMIT 1""",
+            (package_id, config.DOCUMENT_STATUS_DOWNLOADED),
+        ).fetchone()
+        source_values = dict(source) if source else {}
+        release_date = str(source_values.get("publication_date") or source_values.get("document_date") or "")[:10]
+        if not re.fullmatch(r"20\d{2}-\d{2}-\d{2}", release_date):
+            return anchor
+        existing_summary = str(anchor.get("evidence_summary") or "").strip()
+        addition = "Earnings-release date backfilled from the approved latest earnings-release document."
+        connection.execute(
+            """UPDATE earnings_cycle_anchors
+               SET earnings_release_date=?, updated_at=?, evidence_summary=?
+               WHERE anchor_id=? AND earnings_release_date IS NULL""",
+            (release_date, database.utc_now_iso(), "; ".join(filter(None, (existing_summary, addition))), anchor["anchor_id"]),
+        )
+    return get_earnings_anchor(package_id, db_path=db_path)
+
+
 def refresh_earnings_cycle(
     package_id: str,
     *,
@@ -804,6 +898,7 @@ def run_discovery(
     db_path: Path | str = config.DATABASE_PATH,
     resume_run_id: str | None = None,
     session: requests.Session | None = None,
+    refresh_satisfied: bool = False,
 ) -> dict[str, Any]:
     database.initialize_database(db_path)
     package = database.get_package_by_package_id(package_id, db_path=db_path)
@@ -812,7 +907,12 @@ def run_discovery(
         raise ValueError("Discovery requires a recipe-backed package.")
     search_provider = provider or get_search_provider()
     selected_ids = set(slot_instance_ids or [])
-    plans = [plan for plan in RecipePlannerAgent().plan(package_id, db_path=db_path) if plan.auto_searchable and (not selected_ids or plan.package_slot_instance_id in selected_ids)]
+    plans = [
+        plan for plan in RecipePlannerAgent().plan(
+            package_id, include_satisfied=refresh_satisfied, db_path=db_path,
+        )
+        if plan.auto_searchable and (not selected_ids or plan.package_slot_instance_id in selected_ids)
+    ]
     now = database.utc_now_iso()
     run_id = resume_run_id or _token("DISC")
     with database.get_connection(db_path) as connection:
@@ -903,7 +1003,13 @@ def run_discovery(
                         anchor_model = EarningsAnchorAgent().determine(anchor_sources)
                         _store_anchor(package_id, anchor_model, db_path=db_path)
                 curated = select_curated_sec_filings(sec_inventory or [], research_cutoff=str(package["research_cutoff_date"])[:10])
-                for rank, row in enumerate(curated.get(plan.normalized_slot_type, []), start=1):
+                sec_rows = list(curated.get(plan.normalized_slot_type, []))
+                if plan.normalized_slot_type == "latest_earnings_release" and sec_rows:
+                    try:
+                        sec_rows.extend(discover_earnings_exhibit_99_1(sec_rows[0], session=session))
+                    except requests.RequestException:
+                        slot_warnings.append("SEC_EXHIBIT_99_1_INDEX_UNAVAILABLE")
+                for rank, row in enumerate(sec_rows, start=1):
                     sec_candidate = _upsert_candidate(
                         run_id=run_id, slot_run_id=slot_run_id, package=package, plan=plan, route="SEC", source_provider="SEC",
                         title=str(row.get("title") or f"{package['ticker']} {row.get('form_type')}"), url=str(row.get("primary_document_url") or ""),
@@ -1073,7 +1179,69 @@ def run_discovery(
             "INSERT INTO discovery_usage VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?)",
             (_token("USE"), run_id, search_provider.provider_name, actual_requests, query_stats["cached"], query_stats["results"], estimated, database.utc_now_iso()),
         )
+    from app.services.package_artifact_service import sync_package_artifacts
+    from app.services.public_slot_status_service import sync_public_slot_states
+
+    sync_package_artifacts(package_id, db_path=db_path)
+    sync_public_slot_states(package_id, run_id, db_path=db_path)
     return get_discovery_run(run_id, db_path=db_path) or {}
+
+
+def run_all_public_slots(
+    package_id: str,
+    *,
+    actor: str,
+    provider: SearchProvider | None = None,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    """Run every currently missing public slot and persist all ten terminal states."""
+    from app.services.public_slot_status_service import public_discovery_preview
+
+    preview = public_discovery_preview(package_id, db_path=db_path)
+    result = run_discovery(
+        package_id, slot_instance_ids=preview["slot_instance_ids"], actor=actor,
+        provider=provider, session=session, db_path=db_path,
+    )
+    return {**result, "public_preview": preview}
+
+
+def retry_failed_public_slots(
+    package_id: str,
+    *,
+    actor: str,
+    provider: SearchProvider | None = None,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    from app.services.public_slot_status_service import public_slot_diagnostics
+
+    diagnostics = public_slot_diagnostics(package_id, db_path=db_path)
+    failed = [
+        row["package_slot_instance_id"] for row in diagnostics["rows"]
+        if row["terminal_state"] == "FAILED"
+    ]
+    if not failed:
+        raise ValueError("No failed public slots are available to retry.")
+    return run_discovery(
+        package_id, slot_instance_ids=failed, actor=actor, provider=provider,
+        session=session, db_path=db_path,
+    )
+
+
+def refresh_public_slot(
+    package_id: str,
+    slot_instance_id: str,
+    *,
+    actor: str,
+    provider: SearchProvider | None = None,
+    session: requests.Session | None = None,
+    db_path: Path | str = config.DATABASE_PATH,
+) -> dict[str, Any]:
+    return run_discovery(
+        package_id, slot_instance_ids=[slot_instance_id], actor=actor, provider=provider,
+        session=session, refresh_satisfied=True, db_path=db_path,
+    )
 
 
 def get_discovery_run(run_id: str, *, db_path: Path | str = config.DATABASE_PATH) -> dict[str, Any] | None:
@@ -1303,6 +1471,21 @@ def approve_and_download_candidate(
                 db_path=db_path,
             )
             status = "DOWNLOADED"
+    if candidate.get("source_route") == "SEC":
+        source_metadata = _loads(candidate.get("metadata_json"), {}).get("source_metadata", {})
+        database.update_document_metadata(
+            document["document_id"],
+            {
+                "accession_number": source_metadata.get("accession_number"),
+                "form_type": source_metadata.get("form_type"),
+                "normalized_form_family": source_metadata.get("form_type"),
+                "publication_date": source_metadata.get("filing_date") or candidate.get("publication_date"),
+                "document_date": source_metadata.get("filing_date") or candidate.get("publication_date"),
+                "report_period": source_metadata.get("report_period"),
+            },
+            db_path=db_path,
+        )
+        document = database.get_document_by_document_id(document["document_id"], db_path=db_path) or document
     if replace_assignment_id:
         if not replacement_reason.strip():
             raise ValueError("A replacement reason is required.")

@@ -280,6 +280,7 @@ def create_analysis_run(
     db_path: Path | str = config.DATABASE_PATH,
     progress_callback: Callable[[str, str], None] | None = None,
     force_retry: bool = False,
+    analysis_snapshot_id: str | None = None,
 ) -> dict[str, Any]:
     eligibility = validate_analysis_eligibility(version_id, processing_run_id, db_path=db_path)
     if not eligibility.is_eligible or not eligibility.version or not eligibility.processing_run:
@@ -292,8 +293,15 @@ def create_analysis_run(
     )
     if not force_retry:
         for existing in existing_runs:
-            if existing.get("status") != config.ANALYSIS_STATUS_FAILED:
+            if (
+                existing.get("status") != config.ANALYSIS_STATUS_FAILED
+                and (not analysis_snapshot_id or existing.get("analysis_snapshot_id") == analysis_snapshot_id)
+            ):
                 return existing
+    if analysis_snapshot_id:
+        from app.services.analysis_snapshot_service import validate_snapshot_document_scope
+
+        validate_snapshot_document_scope(analysis_snapshot_id, version_id=version_id, db_path=db_path)
     if config.OPENAI_REQUIRED:
         preflight = preflight_openai()
         if not preflight.connected:
@@ -341,6 +349,7 @@ def create_analysis_run(
             "ai_model": config.OPENAI_MODEL if config.OPENAI_REQUIRED or config.EXTERNAL_LLM_EXTRACTION_ENABLED or config.EXTERNAL_NARRATIVE_MODEL_ENABLED else None,
             "ai_endpoint": preflight.endpoint if preflight else None,
             "openai_diagnostics_json": None,
+            "analysis_snapshot_id": analysis_snapshot_id,
         },
         db_path=db_path,
     )
@@ -428,6 +437,14 @@ def create_analysis_run(
         )
         _record_event(version, "SCORECARD_GENERATED", {"analysis_run_id": run_id, "items": len(scorecard)}, db_path=db_path)
         scenarios = create_scenarios(run_id, db_path=db_path)
+        if analysis_snapshot_id:
+            from app.services.analysis_snapshot_service import finalize_analysis_snapshot, validate_analysis_snapshot
+
+            finalize_analysis_snapshot(
+                analysis_snapshot_id, analysis_run_id=run_id,
+                processing_run_id=processing_run_id, db_path=db_path,
+            )
+            validate_analysis_snapshot(analysis_snapshot_id, db_path=db_path)
         ai_review = None
         if progress_callback:
             progress_callback("Calculating metrics", "Completed")
@@ -656,6 +673,10 @@ def retry_recommendation_generation(
     conflicts = database.list_claim_conflicts(run["processing_run_id"], db_path=db_path)
     if not evidence or not metrics or not scorecard:
         raise ValueError("Recommendation retry cannot rebuild missing evidence, metrics, or scorecard artifacts.")
+    if run.get("analysis_snapshot_id"):
+        from app.services.analysis_snapshot_service import validate_analysis_snapshot
+
+        validate_analysis_snapshot(run["analysis_snapshot_id"], db_path=db_path)
 
     attempt_id = f"RECAT-{secrets.token_hex(8).upper()}"
     original_diagnostics = {}

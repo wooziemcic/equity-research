@@ -59,13 +59,14 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
                 current = probe.execute(
                     "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
                 ).fetchone()
-            if current and current[0] == "6B.1":
+            if current and current[0] == "6B.2":
                 return
         except sqlite3.Error:
             _INITIALIZED_DATABASES.discard(resolved_path)
     ensure_directories()
     _backup_before_phase6a_migration(db_path)
     _backup_before_phase6b_migration(db_path)
+    _backup_before_phase6b2_migration(db_path)
     with get_connection(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -106,6 +107,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase6a_recipe_schema(connection)
         _create_phase6b_discovery_schema(connection)
         _create_phase6b1_assembly_schema(connection)
+        _create_phase6b2_stabilization_schema(connection)
         from app.services.default_recipe_service import bootstrap_default_common_equity_recipe
 
         bootstrap_default_common_equity_recipe(connection)
@@ -161,6 +163,34 @@ def _backup_before_phase6b_migration(db_path: Path | str) -> Path | None:
     if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
         return recent[-1]
     destination = backup_dir / f"cutler_research_pre_phase6b_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
+    shutil.copy2(path, destination)
+    return destination
+
+
+def _backup_before_phase6b2_migration(db_path: Path | str) -> Path | None:
+    """Preserve the committed Phase 6B.1 development database before 6B.2."""
+    path = Path(db_path).resolve()
+    configured = Path(DATABASE_PATH).resolve()
+    if path != configured or config.DATABASE_ENVIRONMENT != "DEVELOPMENT" or not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(path) as probe:
+            has_phase6b1 = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='preliminary_package_reports'"
+            ).fetchone()
+            has_phase6b2 = probe.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='package_artifacts'"
+            ).fetchone()
+        if not has_phase6b1 or has_phase6b2:
+            return None
+    except sqlite3.Error:
+        return None
+    backup_dir = config.MIGRATION_BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    recent = sorted(backup_dir.glob("cutler_research_pre_phase6b2_*.db"), key=lambda item: item.stat().st_mtime)
+    if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
+        return recent[-1]
+    destination = backup_dir / f"cutler_research_pre_phase6b2_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
     shutil.copy2(path, destination)
     return destination
 
@@ -2099,6 +2129,158 @@ def _create_phase6b1_assembly_schema(connection: sqlite3.Connection) -> None:
     )
 
 
+def _create_phase6b2_stabilization_schema(connection: sqlite3.Connection) -> None:
+    """Add Phase 6B.2 logical artifacts, diagnostics, and analysis lineage."""
+    additions = {
+        "slot_discovery_runs": {
+            "terminal_state": "TEXT",
+            "terminal_reason": "TEXT",
+            "missing_reason": "TEXT",
+            "next_recommended_action": "TEXT",
+        },
+        "package_discovery_runs": {
+            "public_slots_total": "INTEGER NOT NULL DEFAULT 0",
+        },
+        "analysis_runs": {
+            "analysis_snapshot_id": "TEXT",
+        },
+        "preliminary_package_reports": {
+            "analysis_snapshot_id": "TEXT",
+            "repair_result_json": "TEXT NOT NULL DEFAULT '{}'",
+        },
+    }
+    for table, columns in additions.items():
+        existing = _table_columns(connection, table)
+        for column, definition in columns.items():
+            if column not in existing:
+                connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS package_artifacts (
+            artifact_id TEXT PRIMARY KEY,
+            source_document_id TEXT,
+            package_id TEXT NOT NULL,
+            slot_instance_id TEXT,
+            assignment_id TEXT,
+            artifact_type TEXT NOT NULL,
+            display_filename TEXT NOT NULL,
+            purpose_label TEXT NOT NULL,
+            source_section TEXT,
+            working_package_inclusion INTEGER NOT NULL DEFAULT 1,
+            audit_package_inclusion INTEGER NOT NULL DEFAULT 1,
+            analysis_eligible INTEGER NOT NULL DEFAULT 1,
+            conversion_status TEXT NOT NULL,
+            artifact_status TEXT NOT NULL DEFAULT 'CURRENT',
+            created_at TEXT NOT NULL,
+            superseded_at TEXT,
+            FOREIGN KEY(source_document_id) REFERENCES documents(document_id),
+            FOREIGN KEY(slot_instance_id) REFERENCES package_slot_instances(package_slot_instance_id),
+            FOREIGN KEY(assignment_id) REFERENCES slot_document_assignments(assignment_id),
+            UNIQUE(package_id, slot_instance_id, source_document_id, artifact_type, purpose_label)
+        );
+        CREATE TABLE IF NOT EXISTS public_slot_states (
+            public_slot_state_id TEXT PRIMARY KEY,
+            discovery_run_id TEXT,
+            package_id TEXT NOT NULL,
+            package_slot_instance_id TEXT NOT NULL,
+            normalized_slot_type TEXT NOT NULL,
+            terminal_state TEXT NOT NULL,
+            terminal_reason TEXT NOT NULL,
+            missing_reason TEXT,
+            next_recommended_action TEXT NOT NULL,
+            selected_route TEXT,
+            queries_executed INTEGER NOT NULL DEFAULT 0,
+            candidates_found INTEGER NOT NULL DEFAULT 0,
+            candidates_rejected INTEGER NOT NULL DEFAULT 0,
+            candidates_awaiting_review INTEGER NOT NULL DEFAULT 0,
+            documents_downloaded INTEGER NOT NULL DEFAULT 0,
+            approved_document_count INTEGER NOT NULL DEFAULT 0,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            UNIQUE(package_id, package_slot_instance_id, discovery_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS analysis_corpus_snapshots (
+            snapshot_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            recipe_instance_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            assignment_ids_json TEXT NOT NULL,
+            artifact_ids_json TEXT NOT NULL,
+            document_ids_json TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            metric_ids_json TEXT NOT NULL DEFAULT '[]',
+            conflict_ids_json TEXT NOT NULL DEFAULT '[]',
+            processing_run_id TEXT,
+            analysis_run_id TEXT,
+            snapshot_hash TEXT NOT NULL,
+            validation_result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS numeric_claims (
+            numeric_claim_id TEXT PRIMARY KEY,
+            snapshot_id TEXT NOT NULL,
+            analysis_run_id TEXT,
+            report_id TEXT,
+            normalized_numeric_value REAL,
+            display_value TEXT NOT NULL,
+            unit TEXT,
+            period TEXT,
+            metric_name TEXT,
+            source_document_id TEXT,
+            source_artifact_id TEXT,
+            evidence_id TEXT,
+            exact_excerpt TEXT NOT NULL,
+            source_locator_json TEXT NOT NULL DEFAULT '{}',
+            claim_type TEXT NOT NULL,
+            derivation_formula TEXT,
+            input_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            validation_status TEXT NOT NULL,
+            validation_reason TEXT,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS report_repair_audits (
+            repair_audit_id TEXT PRIMARY KEY,
+            preliminary_report_id TEXT,
+            analysis_run_id TEXT NOT NULL,
+            memo_attempt_id TEXT,
+            repair_number INTEGER NOT NULL,
+            failed_sentence TEXT NOT NULL,
+            failure_reason TEXT NOT NULL,
+            action TEXT NOT NULL,
+            repaired_sentence TEXT,
+            supporting_evidence_ids_json TEXT NOT NULL DEFAULT '[]',
+            qa_result TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_artifacts_package_status
+        ON package_artifacts(package_id, artifact_status, working_package_inclusion);
+        CREATE INDEX IF NOT EXISTS idx_artifacts_source
+        ON package_artifacts(source_document_id, artifact_type);
+        CREATE INDEX IF NOT EXISTS idx_public_slot_states_package
+        ON public_slot_states(package_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_snapshots_package
+        ON analysis_corpus_snapshots(package_id, created_at);
+        CREATE INDEX IF NOT EXISTS idx_numeric_claims_snapshot
+        ON numeric_claims(snapshot_id, validation_status);
+        CREATE INDEX IF NOT EXISTS idx_report_repairs_analysis
+        ON report_repair_audits(analysis_run_id, repair_number);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_one_memo_repair
+        ON report_repair_audits(analysis_run_id, memo_attempt_id, repair_number);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_current_artifact_filename
+        ON package_artifacts(package_id, display_filename)
+        WHERE artifact_status='CURRENT' AND working_package_inclusion=1;
+        """
+    )
+    connection.execute(
+        """INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
+           VALUES ('database_schema_version', '6B.2', ?)
+           ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at""",
+        (utc_now_iso(),),
+    )
+
+
 def row_to_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
     """Convert a SQLite row to a regular dictionary."""
     return dict(row) if row is not None else None
@@ -3475,6 +3657,9 @@ def update_document_metadata(
         "final_category_code",
         "document_title",
         "normalized_form_family",
+        "accession_number",
+        "form_type",
+        "report_period",
         "parent_accession_number",
         "inferred_source",
         "source_confidence",
@@ -5125,6 +5310,7 @@ def update_analysis_run(
         "openai_diagnostics_json",
         "memo_generation_status",
         "memo_generation_error",
+        "analysis_snapshot_id",
     }
     selected = {key: value for key, value in updates.items() if key in allowed}
     if not selected:

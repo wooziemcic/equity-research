@@ -431,6 +431,7 @@ def run_research_workflow(
     retry_failed: bool = False,
     progress_callback: Callable[[dict[str, Any]], None] | None = None,
     preliminary_package_view: bool = False,
+    analysis_snapshot_id: str | None = None,
     db_path: Path | str = config.DATABASE_PATH,
 ) -> dict[str, Any]:
     """Build, lock, process, analyze, and draft-report the active package."""
@@ -486,6 +487,10 @@ def run_research_workflow(
     errors: list[str] = []
 
     try:
+        if analysis_snapshot_id:
+            from app.services.analysis_snapshot_service import validate_snapshot_document_scope
+
+            validate_snapshot_document_scope(analysis_snapshot_id, db_path=db_path)
         readiness = (
             validate_package_readiness(package, preliminary=True, db_path=db_path)
             if preliminary_package_view
@@ -534,6 +539,12 @@ def run_research_workflow(
                 db_path=db_path,
             ) or workflow
         version_documents = database.list_package_version_documents(version["version_id"], db_path=db_path)
+        if analysis_snapshot_id:
+            from app.services.analysis_snapshot_service import validate_snapshot_document_scope
+
+            validate_snapshot_document_scope(
+                analysis_snapshot_id, version_id=version["version_id"], db_path=db_path,
+            )
         build_timer.finish(
             reused=build_reused,
             files_examined=len(version_documents),
@@ -600,7 +611,13 @@ def run_research_workflow(
         analysis_run = (
             None
             if existing and retry_failed
-            else _existing_analysis_run(workflow, version, processing_run, db_path=db_path)
+            else _existing_analysis_run(
+                workflow,
+                version,
+                processing_run,
+                analysis_snapshot_id=analysis_snapshot_id,
+                db_path=db_path,
+            )
         )
         if not analysis_run:
             _persist_stage(workflow_id, stage_statuses, "Extracting evidence", "Running", db_path=db_path)
@@ -644,6 +661,7 @@ def run_research_workflow(
                 processing_run["processing_run_id"],
                 progress_callback=analysis_progress,
                 force_retry=bool(existing and retry_failed),
+                analysis_snapshot_id=analysis_snapshot_id,
                 db_path=db_path,
             )
             extraction_details = json.loads(analysis_run.get("openai_diagnostics_json") or "{}")
@@ -1196,12 +1214,23 @@ def _existing_analysis_run(
     version: dict[str, Any],
     processing_run: dict[str, Any],
     *,
+    analysis_snapshot_id: str | None = None,
     db_path: Path | str,
 ) -> dict[str, Any] | None:
+    def reusable(run: dict[str, Any] | None) -> bool:
+        return bool(
+            run
+            and run.get("status") != config.ANALYSIS_STATUS_FAILED
+            and (
+                analysis_snapshot_id is None
+                or run.get("analysis_snapshot_id") == analysis_snapshot_id
+            )
+        )
+
     run_id = workflow.get("analysis_run_id")
     if run_id:
         run = database.get_analysis_run(run_id, db_path=db_path)
-        if run and run.get("status") != config.ANALYSIS_STATUS_FAILED:
+        if reusable(run):
             return run
     runs = database.list_analysis_runs(
         version["version_id"],
@@ -1209,7 +1238,7 @@ def _existing_analysis_run(
         db_path=db_path,
     )
     for run in runs:
-        if run.get("status") != config.ANALYSIS_STATUS_FAILED:
+        if reusable(run):
             return run
     return None
 

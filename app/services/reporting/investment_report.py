@@ -119,10 +119,12 @@ def build_compact_memo(analysis_run_id: str, *, db_path: Path | str = config.DAT
 
 
 def memo_to_sections(memo: dict[str, Any]) -> list[dict[str, Any]]:
+    earnings_cycle = str(memo.get("earnings_cycle") or "").strip()
     header = (
         f"Recommendation: {memo['recommendation']}\n"
         f"Confidence: {memo['confidence']}\n"
         f"Research cutoff: {memo['research_cutoff']}"
+        + (f"\nEarnings cycle: {earnings_cycle}" if earnings_cycle else "")
     )
     sections: list[dict[str, Any]] = [
         {
@@ -502,6 +504,13 @@ def generate_investment_report(
     memo, attempt_id, candidates = synthesize_memo(analysis_run_id, client=client, db_path=db_path)
     if preliminary_package_view:
         memo["preliminary_package_view"] = True
+        from app.services.package_discovery_service import get_earnings_anchor
+
+        anchor = get_earnings_anchor(run["package_id"], db_path=db_path) or {}
+        quarter = str(anchor.get("fiscal_quarter") or "").strip()
+        fiscal_year = anchor.get("fiscal_year")
+        if quarter and fiscal_year:
+            memo["earnings_cycle"] = f"{quarter} FY{str(fiscal_year)[-2:]}"
         if not str(memo.get("investment_view") or "").startswith("Preliminary Package View"):
             memo["investment_view"] = f"Preliminary Package View. {memo.get('investment_view') or ''}".strip()
         if "analyst review" not in str(memo.get("conclusion") or "").casefold():
@@ -517,6 +526,19 @@ def generate_investment_report(
             "Memo requires review before release because it did not fit one page.",
             attempt_id=attempt_id,
         ) from exc
+    numeric_validation = None
+    if run.get("analysis_snapshot_id"):
+        from app.services.numeric_claim_service import validate_memo_numeric_claims
+
+        numeric_validation = validate_memo_numeric_claims(
+            memo, candidates, snapshot_id=run["analysis_snapshot_id"],
+            analysis_run_id=analysis_run_id, db_path=db_path,
+        )
+        if numeric_validation["status"] == "FAILED":
+            raise MemoGenerationError(
+                "Memo requires review because one or more numerical statements lack approved evidence lineage.",
+                attempt_id=attempt_id,
+            )
     memo_audit = audit_memo_quality(
         memo, candidates, attempt_id=attempt_id, analysis_run_id=analysis_run_id,
         one_page_fit=True, db_path=db_path,
@@ -558,6 +580,13 @@ def generate_investment_report(
         "created_at": database.utc_now_iso(),
     }
     database.create_generated_report(report, db_path=db_path)
+    if numeric_validation is not None:
+        with database.get_connection(db_path) as connection:
+            connection.execute(
+                """UPDATE numeric_claims SET report_id=?
+                   WHERE snapshot_id=? AND analysis_run_id=? AND report_id IS NULL""",
+                (report["report_id"], run["analysis_snapshot_id"], analysis_run_id),
+            )
     database.create_package_version_event(
         event_id=_event_id(), parent_package_id=run["package_id"], version_id=run["version_id"],
         event_type="REPORT_GENERATED",

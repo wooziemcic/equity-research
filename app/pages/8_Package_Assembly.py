@@ -25,11 +25,15 @@ from app.services.package_discovery_service import (
     list_discovery_candidates,
     override_earnings_anchor,
     refresh_earnings_cycle,
+    refresh_public_slot,
+    retry_failed_public_slots,
     resume_discovery,
+    run_all_public_slots,
     run_discovery,
     stop_discovery,
 )
 from app.services.package_assembly_service import package_contents, public_package_summary
+from app.services.analysis_snapshot_service import create_analysis_snapshot, latest_analysis_snapshot
 from app.services.package_naming_service import generate_package_display_filename
 from app.services.package_recipe_service import (
     add_slot_note,
@@ -55,6 +59,7 @@ from app.services.preliminary_recommendation_service import (
     preliminary_report_gate,
 )
 from app.services.slot_policy_service import effective_document_counts
+from app.services.public_slot_status_service import public_discovery_preview, public_slot_diagnostics
 from app.services.upload_service import UploadCandidate, prepare_batch_review, store_reviewed_upload_batch
 from app.utils import database
 
@@ -122,6 +127,14 @@ def _header(payload: dict) -> None:
           <div><span>Recipe</span><strong>{html.escape(str(recipe.get('recipe_name') or ''))} v{html.escape(str(recipe.get('version') or ''))}</strong></div>
           <div><span>Package ID</span><strong>{html.escape(package['package_id'])}</strong></div>
         </div>
+        <div class="assembly-cycle-strip">
+          <strong>Earnings Cycle</strong>
+          <span>Quarter: {html.escape(str((anchor or {}).get('fiscal_quarter') or 'Not determined'))}</span>
+          <span>Fiscal year: {html.escape(str((anchor or {}).get('fiscal_year') or 'Not determined'))}</span>
+          <span>Period end: {html.escape(str((anchor or {}).get('reporting_period_end') or 'Not determined'))}</span>
+          <span>Release date: {html.escape(str((anchor or {}).get('earnings_release_date') or 'Not determined'))}</span>
+          <span>Confidence: {html.escape(str((anchor or {}).get('confidence') or 'Not determined'))}</span>
+        </div>
         """,
         unsafe_allow_html=True,
     )
@@ -178,13 +191,25 @@ def _summary(payload: dict) -> None:
     package_id = payload["package"]["package_id"]
     summary = public_package_summary(package_id)
     report = latest_preliminary_report(package_id) or {"status": preliminary_report_gate(package_id)["status"]}
-    cols = st.columns(6)
-    cols[0].metric("Public discovery", f"{summary['discovery']['completed']}/{summary['discovery']['planned']}")
-    cols[1].metric("Public package", f"{summary['public_package']['filled']}/{summary['public_package']['total']}")
-    cols[2].metric("Manual / licensed", f"{summary['manual_package']['filled']}/{summary['manual_package']['total']}")
-    cols[3].metric("Downloaded", summary["public_package"]["documents_downloaded"])
-    cols[4].metric("Awaiting review", summary["discovery"]["candidates_requiring_review"])
-    cols[5].metric("Preliminary report", str(report.get("status") or "NOT_READY").replace("_", " "))
+    terminal = summary["public_package"].get("terminal_states") or {}
+    snapshot = latest_analysis_snapshot(package_id)
+    cols = st.columns(4)
+    with cols[0]:
+        st.markdown("**Public Discovery**")
+        st.metric("Searches completed", f"{summary['discovery']['completed']}/{summary['discovery']['planned']}")
+        st.caption(f"{summary['discovery']['failed']} failed | {summary['discovery']['candidates_requiring_review']} candidates awaiting review")
+    with cols[1]:
+        st.markdown("**Public Package**")
+        st.metric("Slots filled", f"{summary['public_package']['filled']}/{summary['public_package']['total']}")
+        st.caption(f"{terminal.get('partially_filled', 0)} partial | {summary['public_package']['missing']} missing | {summary['public_package']['artifacts']} artifacts")
+    with cols[2]:
+        st.markdown("**Manual / Licensed**")
+        st.metric("Slots filled", f"{summary['manual_package']['filled']}/{summary['manual_package']['total']}")
+        st.caption(f"{summary['manual_package']['missing']} missing | {summary['manual_package']['files_awaiting_approval']} files awaiting approval")
+    with cols[3]:
+        st.markdown("**AI Report**")
+        st.metric("Preliminary report", str(report.get("status") or "NOT_READY").replace("_", " "))
+        st.caption(f"Snapshot: {(snapshot or {}).get('status', 'NOT CREATED').replace('_', ' ')} | {(report.get('recommendation') or 'Not generated').replace('_', ' ')}")
     st.markdown(
         f'<div class="guidance-panel"><strong>Public Package Status</strong><span>{summary["public_package"]["required_filled"]} of {summary["public_package"]["required_total"]} required public items filled; {summary["manual_package"]["missing"]} manual or licensed items remain.</span></div>',
         unsafe_allow_html=True,
@@ -201,48 +226,79 @@ def _brave_status() -> str:
 def _discovery_controls(payload: dict) -> None:
     package_id = payload["package"]["package_id"]
     latest = latest_discovery_run(package_id)
+    preview_now = public_discovery_preview(package_id)
+    diagnostics = public_slot_diagnostics(package_id)
     st.subheader("Public Discovery")
     status_cols = st.columns(4)
     status_cols[0].metric("Discovery", (latest or {}).get("status", "NOT STARTED").replace("_", " "))
     status_cols[1].metric("Brave", _brave_status())
     status_cols[2].metric("Queries", int((latest or {}).get("queries_executed") or 0))
     status_cols[3].metric("Review", int((latest or {}).get("candidates_needing_review") or 0))
-    actions = st.columns(5)
-    if actions[0].button("Find All Missing Public Items", type="primary", use_container_width=True):
-        st.session_state["assembly_discovery_preview"] = discovery_preview(package_id)
-    if actions[1].button("Refresh Public Discovery", use_container_width=True):
-        with st.spinner("Refreshing the authoritative earnings-cycle anchor..."):
-            refresh_earnings_cycle(package_id)
-        st.session_state["assembly_discovery_preview"] = discovery_preview(package_id)
-    if actions[2].button("Review All Candidates", use_container_width=True):
+    actions = st.columns(3)
+    if actions[0].button(
+        "Run All Missing Public Slots",
+        help="Find All Missing Public Items",
+        type="primary",
+        use_container_width=True,
+    ):
+        st.session_state["assembly_discovery_preview"] = preview_now
+    if actions[1].button("View Public Slot Diagnostics", use_container_width=True):
+        st.session_state["assembly_show_public_diagnostics"] = not st.session_state.get("assembly_show_public_diagnostics", False)
+    if actions[2].button("Review Candidates", use_container_width=True):
         st.session_state["assembly_review_all_candidates"] = True
+    actions = st.columns(3)
+    failed_available = bool(diagnostics["summary"].get("failed"))
+    if actions[0].button("Retry Failed Public Slots", disabled=not failed_available, use_container_width=True):
+        with st.spinner("Retrying failed public slots..."):
+            retry_failed_public_slots(package_id, actor=_actor())
+        st.rerun()
     resumable = bool(latest and latest["status"] in {"PARTIAL", "FAILED", "INTERRUPTED", "COMPLETED_WITH_WARNINGS"})
-    if actions[3].button("Resume Discovery", disabled=not resumable, use_container_width=True):
+    if actions[1].button("Resume Interrupted Public Run", disabled=not resumable, use_container_width=True):
         with st.spinner("Resuming incomplete discovery slots..."):
             resume_discovery(package_id, actor=_actor())
         st.rerun()
-    if actions[4].button("Stop Discovery", disabled=not bool(latest and latest["status"] in {"PENDING", "RUNNING"}), use_container_width=True):
+    if actions[2].button("Stop Public Run", disabled=not bool(latest and latest["status"] in {"PENDING", "RUNNING"}), use_container_width=True):
         stop_discovery(package_id, actor=_actor())
         st.rerun()
     preview = st.session_state.get("assembly_discovery_preview")
     if preview:
         with st.expander("Discovery Preview", expanded=True):
-            metrics = st.columns(4)
-            metrics[0].metric("Slots to search", len(preview["slots_to_search"]))
-            metrics[1].metric("Slots skipped", len(preview["slots_skipped"]))
-            metrics[2].metric("Maximum Brave queries", preview["maximum_possible_brave_queries"])
-            metrics[3].metric("Manual-only remaining", preview["manual_only_slots_remaining"])
-            st.dataframe(
-                [{"Research item": row["display_name"], "Source priority": " > ".join(row["source_priority"]), "Maximum queries": row["maximum_queries"]} for row in preview["slots_to_search"]],
-                hide_index=True,
-                use_container_width=True,
-            )
+            metrics = st.columns(5)
+            metrics[0].metric("Public slots", preview["total_public_slots"])
+            metrics[1].metric("Satisfied", preview["slots_already_satisfied"])
+            metrics[2].metric("Require discovery", preview["slots_requiring_discovery"])
+            metrics[3].metric("Unavailable / confirm", f"{preview['slots_acknowledged_unavailable']} / {preview['slots_requiring_analyst_confirmation']}")
+            metrics[4].metric("Maximum Brave requests", preview["estimated_maximum_brave_requests"])
             confirmed = st.checkbox("Run bounded discovery for these missing public items.", key="assembly_discovery_confirm")
             if st.button("Confirm Public Discovery", type="primary", disabled=not confirmed):
                 with st.spinner("Discovering authoritative public materials slot by slot..."):
-                    run_discovery(package_id, actor=_actor())
+                    run_all_public_slots(package_id, actor=_actor())
                 st.session_state.pop("assembly_discovery_preview", None)
                 st.rerun()
+    if st.session_state.get("assembly_show_public_diagnostics"):
+        st.markdown("#### Public Slot Diagnostic Matrix")
+        summary = diagnostics["summary"]
+        metric_cols = st.columns(6)
+        for column, (label, key) in zip(metric_cols, (
+            ("Filled", "filled"), ("Partial", "partially_filled"), ("Awaiting review", "awaiting_review"),
+            ("No candidate", "no_candidate_found"), ("Failed", "failed"),
+            ("Unavailable", "acknowledged_unavailable"),
+        ), strict=False):
+            column.metric(label, summary[key])
+        st.dataframe(
+            [{
+                "Checklist Item": row["checklist_item"], "Required": row["required"],
+                "Minimum Documents": row["minimum_documents"], "Current Approved Count": row["current_approved_count"],
+                "Discovery Status": row["discovery_status"], "Selected Route": row.get("selected_route"),
+                "Queries Executed": row["queries_executed"], "Candidates Found": row["candidates_found"],
+                "Candidates Rejected": row["candidates_rejected"],
+                "Candidates Awaiting Review": row["candidates_awaiting_review"],
+                "Documents Downloaded": row["documents_downloaded"], "Missing Reason": row.get("missing_reason"),
+                "Next Recommended Action": row["next_recommended_action"],
+            } for row in diagnostics["rows"]],
+            hide_index=True, use_container_width=True,
+        )
+        st.caption(f"Diagnostic load: {diagnostics['load_ms']} ms")
     if latest:
         st.caption(
             f"Public discovery: {latest.get('slot_count_completed', 0)}/{latest.get('slot_count_requested', 0)} searches completed | "
@@ -446,10 +502,15 @@ def _slot_actions(payload: dict) -> None:
     slot_id = slot["package_slot_instance_id"]
     plans = {plan.package_slot_instance_id: plan for plan in RecipePlannerAgent().plan(payload["package"]["package_id"])}
     plan = plans[slot_id]
-    if plan.auto_searchable:
-        if st.button("Find Automatically", type="primary", use_container_width=True, key=f"find_{slot_id}"):
+    if plan.maximum_candidates > 0:
+        refresh_clicked = (
+            st.button("Refresh One Slot", type="primary", use_container_width=True, key=f"find_{slot_id}")
+            if plan.already_complete
+            else st.button("Find Automatically", type="primary", use_container_width=True, key=f"find_{slot_id}")
+        )
+        if refresh_clicked:
             with st.spinner(f"Finding {slot['display_name_snapshot']}..."):
-                run_discovery(payload["package"]["package_id"], slot_instance_ids=[slot_id], actor=_actor())
+                refresh_public_slot(payload["package"]["package_id"], slot_id, actor=_actor())
             st.rerun()
     else:
         st.caption(f"Manual upload required. {plan.reason}")
@@ -560,9 +621,11 @@ def _package_contents(payload: dict) -> None:
         return
     st.dataframe(
         [{
-            "Display Filename": row["display_filename"], "Checklist Item": row["checklist_item"],
-            "Source": row["source"], "Document Date": row["document_date"], "File Type": row["file_type"],
-            "Status": row["status"], "Size": row["size"], "Highlighted": row["highlighted"],
+            "Display Filename": row["display_filename"], "Artifact Type": row["artifact_type"],
+            "Checklist Item": row["checklist_item"], "Source": row["source"],
+            "Date": row["document_date"], "Status": row["status"], "File Size": row["size"],
+            "Analysis Eligible": row["analysis_eligible"],
+            "Phase 6C Conversion Status": row["conversion_status"],
         } for row in contents],
         hide_index=True,
         use_container_width=True,
@@ -570,7 +633,8 @@ def _package_contents(payload: dict) -> None:
     cards = "".join(
         f'<article class="assembly-slot-card"><div class="slot-card-top"><strong>{html.escape(row["display_filename"])}</strong>'
         f'<span class="status-cell complete">INCLUDED</span></div><div class="slot-card-meta">'
-        f'{html.escape(row["checklist_item"])} | {html.escape(row["source"])}</div></article>'
+        f'{html.escape(row["artifact_type"].replace("_", " "))} | {html.escape(row["checklist_item"])} | '
+        f'{html.escape(row["conversion_status"].replace("_", " "))}</div></article>'
         for row in contents
     )
     st.markdown(f'<div class="package-contents-mobile">{cards}</div>', unsafe_allow_html=True)
@@ -592,26 +656,37 @@ def _preliminary_recommendation(payload: dict) -> None:
     st.subheader("Preliminary Recommendation")
     gate = preliminary_report_gate(package_id)
     latest = latest_preliminary_report(package_id)
+    snapshot = latest_analysis_snapshot(package_id)
     status = (latest or {}).get("status") or gate["status"]
     st.caption(f"Status: {status.replace('_', ' ')}. This is not the final Phase 6C recipe-gated decision.")
     if gate["errors"]:
         st.info(" ".join(gate["errors"]))
-    actions = st.columns(2)
-    generate = actions[0].button(
-        "Generate Preliminary One-Page Recommendation",
+    actions = st.columns(3)
+    refresh = actions[0].button("Refresh Analysis Snapshot", disabled=not gate["ready"], use_container_width=True)
+    generate = actions[1].button(
+        "Generate Preliminary Recommendation",
         type="primary",
         disabled=not gate["ready"],
         use_container_width=True,
     )
-    retry = actions[1].button(
-        "Retry Recommendation Generation",
+    retry = actions[2].button(
+        "Retry Recommendation",
         disabled=not bool(latest and latest.get("status") == "FAILED" and gate["ready"]),
         use_container_width=True,
     )
+    if refresh:
+        refreshed = create_analysis_snapshot(package_id)
+        st.session_state["assembly_analysis_snapshot_id"] = refreshed["snapshot_id"]
+        st.rerun()
     if generate or retry:
         with st.spinner("Running the selected-package evidence and memo-quality workflow..."):
-            generate_preliminary_recommendation(package_id, actor=_actor(), retry=retry)
+            generate_preliminary_recommendation(
+                package_id, actor=_actor(), retry=retry,
+                analysis_snapshot_id=st.session_state.get("assembly_analysis_snapshot_id") if generate else None,
+            )
+        st.session_state.pop("assembly_analysis_snapshot_id", None)
         st.rerun()
+    st.caption(f"Analysis snapshot: {(snapshot or {}).get('status', 'NOT CREATED').replace('_', ' ')}")
     if latest:
         cols = st.columns(4)
         cols[0].metric("Recommendation", str(latest.get("recommendation") or "Not generated").replace("_", " "))
@@ -619,6 +694,9 @@ def _preliminary_recommendation(payload: dict) -> None:
         quality = __import__("json").loads(latest.get("quality_result_json") or "{}")
         cols[2].metric("Memo QA", quality.get("status") or "Not run")
         cols[3].metric("Selected documents", len(__import__("json").loads(latest.get("selected_document_ids_json") or "[]")))
+        repairs = __import__("json").loads(latest.get("repair_result_json") or "[]")
+        if repairs:
+            st.caption(f"Memo repair: {repairs[-1].get('qa_result', 'Recorded').replace('_', ' ')}")
         generated = preliminary_report_files(latest)
         downloads = st.columns(2)
         pdf = Path(generated.get("pdf_path") or "")

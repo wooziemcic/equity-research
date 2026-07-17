@@ -232,7 +232,8 @@ def test_package_contents_contains_only_approved_assignments(
     unassigned = _document(db_path, package, tmp_path, "MDT-Rejected.pdf")
     assign_document(slot["package_slot_instance_id"], approved["document_id"], actor="test", db_path=db_path)
     contents = package_contents(package["package_id"], db_path=db_path)
-    assert [row["document_id"] for row in contents] == [approved["document_id"]]
+    assert [row["document_id"] for row in contents if row["analysis_eligible"]] == [approved["document_id"]]
+    assert any(row["artifact_type"] == "CHECKLIST" for row in contents)
     assert unassigned["document_id"] not in {row["document_id"] for row in contents}
     assert contents[0]["display_filename"].startswith("MDT Earnings Release")
 
@@ -268,7 +269,7 @@ def test_phase6b1_schema_is_additive_and_idempotent(tmp_path: Path) -> None:
     database.initialize_database(db_path)
     database.initialize_database(db_path)
     with database.get_connection(db_path) as connection:
-        assert connection.execute("SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'").fetchone()[0] == "6B.1"
+        assert connection.execute("SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'").fetchone()[0] == "6B.2"
         candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(discovered_candidates)")}
         document_columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
         assert {"review_reason_codes_json", "query_fallback_level", "automatic_selection_reason", "downloaded_document_id"} <= candidate_columns
