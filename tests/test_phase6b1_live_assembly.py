@@ -269,7 +269,7 @@ def test_phase6b1_schema_is_additive_and_idempotent(tmp_path: Path) -> None:
     database.initialize_database(db_path)
     database.initialize_database(db_path)
     with database.get_connection(db_path) as connection:
-        assert connection.execute("SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'").fetchone()[0] == "6B.2"
+        assert connection.execute("SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'").fetchone()[0] == "6C.0"
         candidate_columns = {row[1] for row in connection.execute("PRAGMA table_info(discovered_candidates)")}
         document_columns = {row[1] for row in connection.execute("PRAGMA table_info(documents)")}
         assert {"review_reason_codes_json", "query_fallback_level", "automatic_selection_reason", "downloaded_document_id"} <= candidate_columns

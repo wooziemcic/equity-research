@@ -2,6 +2,7 @@
 streamlit>=1.36
 pytest>=8.0
 requests>=2.32
+beautifulsoup4>=4.12
 python-dotenv>=1.0
 jsonschema>=4.23
 openpyxl>=3.1

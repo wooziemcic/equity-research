@@ -59,7 +59,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
                 current = probe.execute(
                     "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
                 ).fetchone()
-            if current and current[0] == "6B.2":
+            if current and current[0] == "6C.0":
                 return
         except sqlite3.Error:
             _INITIALIZED_DATABASES.discard(resolved_path)
@@ -67,6 +67,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
     _backup_before_phase6a_migration(db_path)
     _backup_before_phase6b_migration(db_path)
     _backup_before_phase6b2_migration(db_path)
+    _backup_before_phase6c_migration(db_path)
     with get_connection(db_path) as connection:
         connection.execute("PRAGMA foreign_keys = ON")
         connection.execute(
@@ -108,6 +109,7 @@ def initialize_database(db_path: Path | str = DATABASE_PATH) -> None:
         _create_phase6b_discovery_schema(connection)
         _create_phase6b1_assembly_schema(connection)
         _create_phase6b2_stabilization_schema(connection)
+        _create_phase6c_finalization_schema(connection)
         from app.services.default_recipe_service import bootstrap_default_common_equity_recipe
 
         bootstrap_default_common_equity_recipe(connection)
@@ -191,6 +193,31 @@ def _backup_before_phase6b2_migration(db_path: Path | str) -> Path | None:
     if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
         return recent[-1]
     destination = backup_dir / f"cutler_research_pre_phase6b2_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
+    shutil.copy2(path, destination)
+    return destination
+
+
+def _backup_before_phase6c_migration(db_path: Path | str) -> Path | None:
+    """Preserve the committed Phase 6B.2 development database before Phase 6C."""
+    path = Path(db_path).resolve()
+    configured = Path(DATABASE_PATH).resolve()
+    if path != configured or config.DATABASE_ENVIRONMENT != "DEVELOPMENT" or not path.is_file():
+        return None
+    try:
+        with sqlite3.connect(path) as probe:
+            version = probe.execute(
+                "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
+            ).fetchone()
+        if not version or version[0] != "6B.2":
+            return None
+    except sqlite3.Error:
+        return None
+    backup_dir = config.MIGRATION_BACKUP_DIR
+    backup_dir.mkdir(parents=True, exist_ok=True)
+    recent = sorted(backup_dir.glob("cutler_research_pre_phase6c_*.db"), key=lambda item: item.stat().st_mtime)
+    if recent and datetime.now(UTC).timestamp() - recent[-1].stat().st_mtime < 24 * 60 * 60:
+        return recent[-1]
+    destination = backup_dir / f"cutler_research_pre_phase6c_{datetime.now(UTC):%Y%m%dT%H%M%SZ}.db"
     shutil.copy2(path, destination)
     return destination
 
@@ -2276,6 +2303,284 @@ def _create_phase6b2_stabilization_schema(connection: sqlite3.Connection) -> Non
     connection.execute(
         """INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
            VALUES ('database_schema_version', '6B.2', ?)
+           ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at""",
+        (utc_now_iso(),),
+    )
+
+
+def _create_phase6c_finalization_schema(connection: sqlite3.Connection) -> None:
+    """Add final document production, deterministic facts, delivery, and locking."""
+    artifact_columns = {
+        "parent_artifact_id": "TEXT",
+        "generated_path": "TEXT",
+        "generated_sha256": "TEXT",
+        "generated_size_bytes": "INTEGER",
+        "page_count": "INTEGER",
+        "qa_status": "TEXT",
+        "qa_result_json": "TEXT NOT NULL DEFAULT '{}'",
+        "source_role": "TEXT",
+        "renderer_version": "TEXT",
+        "extraction_version": "TEXT",
+        "package_version_id": "TEXT",
+    }
+    existing = _table_columns(connection, "package_artifacts")
+    for column, definition in artifact_columns.items():
+        if column not in existing:
+            connection.execute(f"ALTER TABLE package_artifacts ADD COLUMN {column} {definition}")
+
+    connection.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS finalization_runs (
+            finalization_run_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            current_stage TEXT NOT NULL,
+            input_fingerprint TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            completed_at TEXT,
+            UNIQUE(package_id, package_version_id)
+        );
+        CREATE TABLE IF NOT EXISTS finalization_stage_status (
+            stage_status_id TEXT PRIMARY KEY,
+            finalization_run_id TEXT NOT NULL,
+            stage_name TEXT NOT NULL,
+            status TEXT NOT NULL,
+            input_fingerprint TEXT,
+            output_fingerprint TEXT,
+            result_json TEXT NOT NULL DEFAULT '{}',
+            error_message TEXT,
+            started_at TEXT,
+            completed_at TEXT,
+            duration_ms REAL,
+            attempt_count INTEGER NOT NULL DEFAULT 0,
+            UNIQUE(finalization_run_id, stage_name),
+            FOREIGN KEY(finalization_run_id) REFERENCES finalization_runs(finalization_run_id)
+        );
+        CREATE TABLE IF NOT EXISTS analyst_waivers (
+            waiver_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            slot_instance_id TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'ACTIVE',
+            confirmation_status TEXT NOT NULL DEFAULT 'PENDING',
+            confirmed_by TEXT,
+            confirmed_at TEXT,
+            UNIQUE(package_version_id, slot_instance_id, status)
+        );
+        CREATE TABLE IF NOT EXISTS section_extraction_overrides (
+            override_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            source_artifact_id TEXT NOT NULL,
+            section_key TEXT NOT NULL,
+            start_text TEXT NOT NULL,
+            end_text TEXT,
+            reason TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS company_facts_responses (
+            company_facts_response_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            cik TEXT NOT NULL,
+            source_url TEXT NOT NULL,
+            response_sha256 TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            fetched_at TEXT NOT NULL,
+            sec_submission_updated_at TEXT,
+            UNIQUE(package_version_id, response_sha256)
+        );
+        CREATE TABLE IF NOT EXISTS normalized_financial_facts (
+            financial_fact_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            response_id TEXT,
+            taxonomy_concept TEXT NOT NULL,
+            normalized_metric TEXT NOT NULL,
+            value REAL NOT NULL,
+            unit TEXT NOT NULL,
+            period_start TEXT,
+            period_end TEXT NOT NULL,
+            fiscal_year INTEGER,
+            fiscal_quarter TEXT,
+            form TEXT,
+            filing_date TEXT,
+            accession TEXT,
+            source_document_id TEXT,
+            source_artifact_id TEXT,
+            fact_status TEXT NOT NULL,
+            derivation_formula TEXT,
+            source_fact_ids_json TEXT NOT NULL DEFAULT '[]',
+            validation_status TEXT NOT NULL,
+            selected INTEGER NOT NULL DEFAULT 0,
+            selection_reason TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(package_version_id, taxonomy_concept, unit, period_start, period_end, accession, value)
+        );
+        CREATE TABLE IF NOT EXISTS financial_fact_conflicts (
+            fact_conflict_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            normalized_metric TEXT NOT NULL,
+            period_end TEXT NOT NULL,
+            candidate_fact_ids_json TEXT NOT NULL,
+            selected_fact_id TEXT,
+            material INTEGER NOT NULL DEFAULT 0,
+            explanation TEXT NOT NULL,
+            status TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS final_analysis_snapshots (
+            final_snapshot_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            artifact_ids_json TEXT NOT NULL,
+            document_ids_json TEXT NOT NULL,
+            evidence_ids_json TEXT NOT NULL,
+            fact_ids_json TEXT NOT NULL,
+            metric_ids_json TEXT NOT NULL,
+            conflict_ids_json TEXT NOT NULL,
+            waiver_ids_json TEXT NOT NULL,
+            configuration_json TEXT NOT NULL,
+            snapshot_hash TEXT NOT NULL UNIQUE,
+            status TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            finalized_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS final_recommendation_approvals (
+            approval_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            final_snapshot_id TEXT NOT NULL,
+            analysis_run_id TEXT,
+            report_id TEXT,
+            ai_recommendation TEXT NOT NULL,
+            ai_confidence REAL,
+            analyst_recommendation TEXT,
+            status TEXT NOT NULL,
+            qa_status TEXT NOT NULL,
+            qa_result_json TEXT NOT NULL DEFAULT '{}',
+            approved_by TEXT,
+            approved_at TEXT,
+            created_at TEXT NOT NULL,
+            UNIQUE(package_version_id, final_snapshot_id)
+        );
+        CREATE TABLE IF NOT EXISTS analyst_rating_overrides (
+            override_id TEXT PRIMARY KEY,
+            approval_id TEXT NOT NULL,
+            ai_recommendation TEXT NOT NULL,
+            analyst_recommendation TEXT NOT NULL,
+            reason TEXT NOT NULL,
+            created_by TEXT NOT NULL,
+            created_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS final_package_manifests (
+            manifest_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            manifest_type TEXT NOT NULL,
+            manifest_json TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            UNIQUE(package_version_id, manifest_type)
+        );
+        CREATE TABLE IF NOT EXISTS final_zip_outputs (
+            zip_output_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            zip_type TEXT NOT NULL,
+            local_path TEXT NOT NULL,
+            sha256 TEXT NOT NULL,
+            file_size_bytes INTEGER NOT NULL,
+            qa_status TEXT NOT NULL,
+            qa_result_json TEXT NOT NULL DEFAULT '{}',
+            created_at TEXT NOT NULL,
+            UNIQUE(package_version_id, zip_type)
+        );
+        CREATE TABLE IF NOT EXISTS final_qa_results (
+            final_qa_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            status TEXT NOT NULL,
+            checks_json TEXT NOT NULL,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS final_package_locks (
+            lock_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL UNIQUE,
+            package_version_id TEXT NOT NULL UNIQUE,
+            final_snapshot_id TEXT NOT NULL,
+            manifest_sha256 TEXT NOT NULL,
+            working_zip_sha256 TEXT NOT NULL,
+            audit_zip_sha256 TEXT NOT NULL,
+            locked_by TEXT NOT NULL,
+            locked_at TEXT NOT NULL,
+            lock_payload_json TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS delivery_records (
+            delivery_id TEXT PRIMARY KEY,
+            package_id TEXT NOT NULL,
+            package_version_id TEXT NOT NULL,
+            delivered_by TEXT NOT NULL,
+            delivered_at TEXT NOT NULL,
+            working_zip_sha256 TEXT NOT NULL,
+            audit_zip_sha256 TEXT NOT NULL,
+            delivery_note TEXT,
+            UNIQUE(package_version_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_finalization_package ON finalization_runs(package_id, updated_at);
+        CREATE INDEX IF NOT EXISTS idx_final_stages_run ON finalization_stage_status(finalization_run_id, stage_name);
+        CREATE INDEX IF NOT EXISTS idx_facts_package_metric ON normalized_financial_facts(package_version_id, normalized_metric, selected);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_final_manifest_path
+        ON final_package_manifests(package_version_id, local_path);
+
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_assignment_insert
+        BEFORE INSERT ON slot_document_assignments
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=NEW.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_assignment_update
+        BEFORE UPDATE ON slot_document_assignments
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=OLD.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_assignment_delete
+        BEFORE DELETE ON slot_document_assignments
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=OLD.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_slot_update
+        BEFORE UPDATE ON package_slot_instances
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=OLD.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_artifact_insert
+        BEFORE INSERT ON package_artifacts
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=NEW.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        CREATE TRIGGER IF NOT EXISTS prevent_locked_artifact_update
+        BEFORE UPDATE ON package_artifacts
+        WHEN EXISTS (SELECT 1 FROM final_package_locks WHERE package_id=OLD.package_id)
+        BEGIN SELECT RAISE(ABORT, 'Final package is locked; create a new package version.'); END;
+        """
+    )
+    waiver_columns = _table_columns(connection, "analyst_waivers")
+    for column, definition in {
+        "confirmation_status": "TEXT NOT NULL DEFAULT 'PENDING'",
+        "confirmed_by": "TEXT",
+        "confirmed_at": "TEXT",
+    }.items():
+        if column not in waiver_columns:
+            connection.execute(f"ALTER TABLE analyst_waivers ADD COLUMN {column} {definition}")
+    connection.execute(
+        """INSERT INTO schema_metadata(schema_key, schema_value, updated_at)
+           VALUES ('database_schema_version', '6C.0', ?)
            ON CONFLICT(schema_key) DO UPDATE SET schema_value=excluded.schema_value, updated_at=excluded.updated_at""",
         (utc_now_iso(),),
     )

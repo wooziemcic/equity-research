@@ -16,9 +16,11 @@ DERIVED_SECTIONS = {
     "liquidity_and_capital_resources": "Liquidity and Capital Resources",
     "description_of_business_and_risk": "Business and Risk Factors",
     "executive_compensation_information": "Executive Compensation",
+    "financial_statements_from_latest_filing": "Financial Statements",
 }
 FULL_FILING_SLOT = "most_recent_10_q_and_10_k"
 SEC_FORMS = {"10-K", "10-Q", "8-K", "DEF 14A"}
+PHASE6C_GENERATED_TYPES = {"SEC_READER_PDF", "FILING_SECTION_PDF", "FINAL_RECOMMENDATION", "FINAL_CHECKLIST"}
 
 
 def _token(*parts: str) -> str:
@@ -210,13 +212,13 @@ def sync_package_artifacts(
             """UPDATE package_artifacts
                SET display_filename='__sync__' || artifact_id
                WHERE package_id=? AND artifact_status='CURRENT'
-                 AND artifact_type!='PRELIMINARY_RECOMMENDATION'""",
+                 AND artifact_type NOT IN ('PRELIMINARY_RECOMMENDATION','SEC_READER_PDF','FILING_SECTION_PDF','FINAL_RECOMMENDATION','FINAL_CHECKLIST')""",
             (package_id,),
         )
         current = connection.execute(
             """SELECT artifact_id FROM package_artifacts
                WHERE package_id=? AND artifact_status='CURRENT'
-                 AND artifact_type!='PRELIMINARY_RECOMMENDATION'""",
+                 AND artifact_type NOT IN ('PRELIMINARY_RECOMMENDATION','SEC_READER_PDF','FILING_SECTION_PDF','FINAL_RECOMMENDATION','FINAL_CHECKLIST')""",
             (package_id,),
         ).fetchall()
         stale_ids = [row["artifact_id"] for row in current if row["artifact_id"] not in desired_ids]
@@ -251,6 +253,15 @@ def sync_package_artifacts(
                      row["source_section"], row["working_package_inclusion"], row["audit_package_inclusion"],
                      row["analysis_eligible"], row["conversion_status"], now),
                 )
+        connection.execute(
+            """UPDATE package_artifacts SET working_package_inclusion=0, analysis_eligible=0
+               WHERE package_id=? AND artifact_id IN (
+                 SELECT parent_artifact_id FROM package_artifacts
+                 WHERE package_id=? AND artifact_status='CURRENT' AND qa_status='PASSED'
+                   AND artifact_type IN ('SEC_READER_PDF','FILING_SECTION_PDF')
+               )""",
+            (package_id, package_id),
+        )
     return list_package_artifacts(package_id, db_path=db_path)
 
 

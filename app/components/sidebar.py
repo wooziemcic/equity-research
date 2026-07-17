@@ -33,6 +33,7 @@ def render_sidebar() -> None:
         st.markdown('<div class="sidebar-section-title">Primary Workflow</div>', unsafe_allow_html=True)
         _safe_page_link("Home.py", "Search")
         _safe_page_link("pages/8_Package_Assembly.py", "Package Assembly")
+        _safe_page_link("pages/10_Finalize_Package.py", "Finalize Package")
         _safe_page_link("pages/6_Investment_Result.py", "Result")
 
         st.markdown('<div class="sidebar-section-title">Secondary</div>', unsafe_allow_html=True)

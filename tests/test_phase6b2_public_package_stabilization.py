@@ -152,7 +152,7 @@ def test_phase6b2_schema_is_additive_and_idempotent(tmp_path: Path) -> None:
     with database.get_connection(db_path) as connection:
         assert connection.execute(
             "SELECT schema_value FROM schema_metadata WHERE schema_key='database_schema_version'"
-        ).fetchone()[0] == "6B.2"
+        ).fetchone()[0] == "6C.0"
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
     assert {"package_artifacts", "public_slot_states", "analysis_corpus_snapshots", "numeric_claims", "report_repair_audits"} <= tables
 
